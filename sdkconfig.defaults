@@ -1,0 +1,36 @@
+# ============================================================================
+#  sdkconfig.defaults — SMS Forwarder v3.6.4
+#  Arduino-as-component (双框架) 必须项 + USB Host + 我们用的功能开关
+#  pio run 会把这些 merge 进 sdkconfig.esp32-s3-devkitc-1
+# ============================================================================
+
+# --- Arduino 双框架要求 ---
+CONFIG_FREERTOS_HZ=1000
+CONFIG_AUTOSTART_ARDUINO=y
+CONFIG_ARDUINO_RUN_CORE1=y
+CONFIG_ARDUINO_LOOP_CORE1=y
+
+# --- USB Host (4G 模组走 USB CDC + RNDIS) ---
+CONFIG_USB_HOST_ENABLED=y
+
+# --- Flash / 分区 (8MB 板子) ---
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# --- 关 USB Serial JTAG (省得跟 USB Host 抢) ---
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG is not set
+# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED is not set
+
+# --- HTTP client / OTA / mDNS 用到的 ---
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+# v4.0: 走 esp_crt_bundle 让 HTTPS 不用自己塞证书 (pushplus.plus)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# --- 日志 ---
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y

@@ -1,0 +1,6 @@
+## IDF Component Manager 清单 — main 组件 (v4.0)
+## v4.0: 禁用 RNDIS 拨号 (iot_eth 0.1.x stack_input 没接好会 NULL deref)
+## 只用 iot_usbh_cdc 走 AT 命令收短信
+dependencies:
+  espressif/iot_usbh_cdc: "^3.0.0"
+  idf: ">=5.5"
