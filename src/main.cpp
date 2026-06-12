@@ -699,6 +699,49 @@ static bool post_pushplus_raw(const char* payload, size_t len) {
   return false;
 }
 
+// =================== 开机上线通知 ===================
+static void push_boot_notification() {
+  if (WiFi.status() != WL_CONNECTED) {
+    ESP_LOGW(TAG, "WiFi not up, skip boot notification");
+    return;
+  }
+  JsonDocument doc;
+  doc["token"]    = g_cfg.token;
+  doc["title"]    = String("\xE2\x9C\x85 SMS Forwarder 上线 ");   // ✅
+  doc["template"] = "html";
+  String body = "<p>设备已上线</p><ul>"
+                "<li>FW: " FW_VERSION "</li>"
+                "<li>Boot #";
+  body += g_bootCount;
+  body += "</li>";
+  if (g_ml.alive) {
+    body += "<li>4G 模组: OK</li>";
+  } else {
+    body += "<li>4G 模组: 未连接</li>";
+  }
+  body += "<li>IP: ";
+  body += WiFi.localIP().toString();
+  body += "</li></ul>";
+  doc["content"]  = body;
+  if (strlen(g_cfg.topic) > 0) doc["topic"] = g_cfg.topic;
+  String payload; serializeJson(doc, payload);
+
+  esp_http_client_config_t cfg = {};
+  cfg.url               = PUSHPLUS_URL;
+  cfg.method            = HTTP_METHOD_POST;
+  cfg.timeout_ms        = 5000;
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+  if (!cli) { ESP_LOGE(TAG, "boot notify: init failed"); return; }
+  esp_http_client_set_header(cli, "Content-Type", "application/json");
+  esp_http_client_set_post_field(cli, payload.c_str(), payload.length());
+  esp_err_t err = esp_http_client_perform(cli);
+  int code = (err == ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
+  esp_http_client_cleanup(cli);
+  ESP_LOGI(TAG, "Boot notification code=%d", code);
+  if (code == 200) __atomic_add_fetch(&g_pushOk, 1, __ATOMIC_RELAXED);
+}
+
 // =================== NVS push 队列 ===================
 static void nvsQEnqueue(const char* payload, size_t len) {
   Preferences p;
@@ -1262,6 +1305,16 @@ void setup() {
 
   loadConfig();
 
+  // 启动次数 +1 持久化
+  {
+    Preferences p;
+    p.begin("stat", false);
+    g_bootCount = p.getUInt("bootCount", 0) + 1;
+    p.putUInt("bootCount", g_bootCount);
+    p.end();
+  }
+  ESP_LOGI(TAG, "Boot #%u", g_bootCount);
+
   // 没合法配置 → AP 模式 永不返回
   if (!isConfigValid()) {
     ESP_LOGW(TAG, "No valid config, entering AP mode");
@@ -1353,6 +1406,13 @@ void setup() {
       // }
       ESP_LOGI(TAG, "Modem ready (RNDIS disabled in v4.0)");
     }
+  }
+
+  // 启动通知: 推一条 "设备已上线" 到 pushplus
+  if (g_wifiUp) {
+    push_boot_notification();
+  } else {
+    ESP_LOGW(TAG, "WiFi not up, no boot notification");
   }
 }
 
