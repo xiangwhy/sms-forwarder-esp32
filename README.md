@@ -16,7 +16,7 @@ cd sms-forwarder-esp32
 
 # 烧整包 (bootloader + app)
 esptool.py --chip esp32s3 -p /dev/cu.usbserial-XXXX \
-  write_flash 0x0 v4.0.1.factory.bin
+  write_flash 0x0 v4.0.2.factory.bin
 ```
 
 或者用 PIO:
@@ -41,7 +41,8 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 - ✅ **Web OTA** — `/update` 整包烧录
 - ✅ **开机上线通知** — 推一条到 pushplus
 - ✅ **3 LED 状态** — 4G / WiFi / NET
-- ⚠️ **长短信 UDH 拼接** — 字母 sender + 4 段以上仍可能丢段
+- ✅ **长短信 UDH 拼接** — 2 段拼接 (泰文/中文/英文), ref/total/seq 正确解析
+- ✅ **phone 短号显示** — 纯数字短号 (如 10086910) 不再误判 UCS2 hex 乱码
 - ❌ **RNDIS 4G 上网** — v4.1 修
 - ❌ **ArduinoOTA** — 用 web OTA 替代
 
@@ -61,7 +62,8 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 
 | Release | 下载 |
 |---|---|
-| **v4.0.1** (最新) | [v4.0.1.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.1/v4.0.1.factory.bin) |
+| **v4.0.2** (最新) | [v4.0.2.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.2/v4.0.2.factory.bin) |
+| v4.0.1 | [v4.0.1.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.1/v4.0.1.factory.bin) |
 | v4.0 | [v4.0.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0/v4.0.factory.bin) |
 
 ## 贡献
