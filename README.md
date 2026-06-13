@@ -66,6 +66,3 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 | v4.0.1 | [v4.0.1.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.1/v4.0.1.factory.bin) |
 | v4.0 | [v4.0.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0/v4.0.factory.bin) |
 
-## 贡献
-
-私有项目,不接受外部 PR。
