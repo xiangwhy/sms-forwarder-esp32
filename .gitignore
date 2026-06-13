@@ -8,10 +8,14 @@ README_v3.6.md.bak
 sms_forwarder_v3.6.ino
 sms_forwarder_v3.6.ino.bak
 CODE_REVIEW_v3.6.4.md
-managed_components/   # ESP-IDF 缓存,每次 pio run 重新拉
-dependencies.lock    # PIO 自动生成
-setup_components.sh   # v3.6 旧脚本,新版本不需
-src/main.cpp.v4.0    # 临时备份
+# ESP-IDF 缓存,每次 pio run 重新拉
+managed_components/
+# PIO 自动生成
+dependencies.lock
+# v3.6 旧脚本,新版本不需
+setup_components.sh
+# 临时备份
+src/main.cpp.v4.0
 
 # macOS
 .DS_Store
