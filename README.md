@@ -43,13 +43,13 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 - ✅ **3 LED 状态** — 4G / WiFi / NET
 - ✅ **长短信 UDH 拼接** — 2 段拼接 (泰文/中文/英文), ref/total/seq 正确解析
 - ✅ **phone 短号显示** — 纯数字短号 (如 10086910) 不再误判 UCS2 hex 乱码
-- ❌ **RNDIS 4G 上网** — v4.1 修
+- ❌ **RNDIS 4G 上网** — 长期搁置(SDK 栈不稳,仅 SMS 接收)
 - ❌ **ArduinoOTA** — 用 web OTA 替代
 
 ## 文档
 
 - **[README_v4.0.md](README_v4.0.md)** — 详细使用 + 引脚 + 编译步骤 + 已知问题
-- **[ROADMAP.md](ROADMAP.md)** — v4.1+ 后续版本规划
+- **[ROADMAP.md](ROADMAP.md)** — v4.2+ 后续版本规划
 - **[PLATFORMIO_GUIDE.md](PLATFORMIO_GUIDE.md)** — PIO 环境搭建
 
 ## 硬件

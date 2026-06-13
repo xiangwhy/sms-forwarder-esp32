@@ -912,7 +912,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
 
 // =================== RNDIS 4G 拨号 (v4.0 暂禁) ===================
 // 留空: iot_eth 0.1.x 的 stack_input 没填好会 NULL deref panic
-// v4.1 再开. 4G 走 SMS 接收, 推送走 WiFi.
+// 4G 仅作 SMS 接收;推送走 WiFi。RNDIS 拨号长期搁置,SDK 栈不稳。
 static bool rndis_init() { return false; }
 
 // =================== ping 健康 ===================

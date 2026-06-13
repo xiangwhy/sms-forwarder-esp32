@@ -84,7 +84,7 @@ pio device monitor -b 115200 -p /dev/cu.usbserial-XXXX
 | AP 配网 | ✅ | 无密码或默认 `12345678` |
 | LED 状态 | ✅ | 3 灯 |
 | BOOT 长按 5s 清 NVS | ✅ | GPIO0 长按 5s 触发 |
-| RNDIS 4G 上网 | ❌ | v4.1,iot_eth 0.1.x 的 `stack_input` 没接好会 NULL deref panic |
+| RNDIS 4G 上网 | ❌ | 长期搁置,iot_eth 0.1.x 的 `stack_input` 没接好会 NULL deref panic |
 | ArduinoOTA | ❌ | 用 web OTA 替代 |
 | 数据用量统计 | ❌ | 不要 |
 
@@ -118,7 +118,7 @@ esp32-sms/
 2. **Arduino-ESP32 升 3.x** (旧 2.x)
 3. **iot_usbh_cdc 升 3.x** API 重写(register_dev_event_cb + usbh_cdc_port_open)
 4. **代码从 1640 行精简到 ~1320 行** (砍 ArduinoOTA/Dashboard/4G 统计/NVS 推队列/ping 监控等部分 v3.6.4 功能)
-5. **RNDIS 4G 上网禁用** (v4.1 修)
+5. **RNDIS 4G 上网禁用** (长期搁置)
 6. **短信编码从 v3.6.4 big-endian 切到 v4.0 little-endian 又回 big-endian** (调试过程产物,最终 v4.0 是 BE,与短短信工作结果一致)
 
 ## 开发
