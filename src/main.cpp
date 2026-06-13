@@ -380,11 +380,11 @@ static bool parse_udh(const char* line, int& refId, int& total, int& seq) {
     total = tot;
     seq   = sq;
   } else {
-    // 8-bit: IEDL=03 在 p+4..5 应该是 "00", 然后 ref=p+6..7, total=p+8..9, seq=p+10..11
-    if (strncmp(p+4, "00", 2) != 0) return false;
-    int ref = get2(p + 6);
-    int tot = get2(p + 8);
-    int sq  = get2(p + 10);
+    // 8-bit (per 3GPP TS 23.040 §9.2.3.24, no padding after IEDL):
+    //   ref=p+4..5, total=p+6..7, seq=p+8..9
+    int ref = get2(p + 4);
+    int tot = get2(p + 6);
+    int sq  = get2(p + 8);
     refId = ref;
     total = tot;
     seq   = sq;
@@ -417,7 +417,18 @@ static UdhRef* alloc_udh_slot(int refId, int total, const char* phone) {
 
 static void clear_udh_ref(int refId) {
   for (int i = 0; i < MAX_UDH_REFS; i++) {
-    if (g_udhTable[i].refId == refId) g_udhTable[i].received = 0;
+    if (g_udhTable[i].refId == refId) {
+      g_udhTable[i].refId = 0;
+      g_udhTable[i].total = 0;
+      g_udhTable[i].received = 0;
+      g_udhTable[i].firstMs = 0;
+      g_udhTable[i].phone[0] = 0;
+      for (int j = 0; j < MAX_UDH_PARTS; j++) {
+        g_udhTable[i].parts[j].present = false;
+        g_udhTable[i].parts[j].body[0] = 0;
+        g_udhTable[i].parts[j].len = 0;
+      }
+    }
   }
 }
 
@@ -463,8 +474,8 @@ static bool stash_udh_part(const char* phone, const char* body) {
   //   16-bit concat: UDHLEN(1) 08 04 refH refL total seq = 7 字节 = 14 hex
   // body[0] = UDHLEN, body[1] = IEI, body[2..] = IEDL+data
   size_t udhSkip = 0;
-  if (strstr(body, "0804") == body + 1) udhSkip = 14;       // 16-bit concat
-  else if (strstr(body, "0003") == body + 1) udhSkip = 14;  // 8-bit concat
+  if (strstr(body, "0804") == body + 2) udhSkip = 14;       // 16-bit: 7 字节 UDH
+  else if (strstr(body, "0003") == body + 2) udhSkip = 12;  // 8-bit:  6 字节 UDH
   const char* partBody = body + udhSkip;
   if (seq < 1 || seq > MAX_UDH_PARTS) return false;
   if (r->parts[seq-1].present) return false;  // dup
@@ -1281,6 +1292,7 @@ static bool modem_init_at() {
       // 配置 SMS
       send_atcmd("AT+CMGF=1\r\n",         2000);   // 文本模式
       send_atcmd("AT+CSCS=\"UCS2\"\r\n",  2000);   // UCS2 编码
+      send_atcmd("AT+CSDH=1\r\n",         2000);   // 显示 UDH (长短信拼接)
       send_atcmd("AT+CNMI=2,2,0,0,0\r\n", 2000);   // 主动推 +CMT
       ESP_LOGI(TAG, "SMS engine configured");
       return true;
