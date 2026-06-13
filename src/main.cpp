@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- *  SMS Forwarder v4.0  (ESP32-S3 + USB 4G Modem + RNDIS + pushplus)
+ *  SMS Forwarder v4.0.2  (ESP32-S3 + USB 4G Modem + RNDIS + pushplus)
  *  Stack: ESP-IDF 5.5 + Arduino-ESP32 3.x (pioarduino platform)
  *
  *  v3.6.4 (IDF 4.4) 重写, 全面适配 IDF 5.5 API。
@@ -58,7 +58,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder-"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0"
+#define FW_VERSION         "v4.0.2"
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -156,19 +156,17 @@ static String ucs2ToUtf8(const String& hex) {
   return out;
 }
 
-// 解 +CMT phone 字段: ML307 在 UCS2 模式下 body 是 hex, 但 phone 字段(尤其字母数字 sender)可能
-// 是直接 ASCII ("True App")。自动判: 偶数长 + 全 hex 字符 → 解 UCS2;否则当 ASCII。
+// 解 +CMT phone 字段: ML307 实测 phone 字段始终是 ASCII (数字/+/-/空格/字母 sender),
+// 不编码 UCS2 hex (DCS 模式只影响 body)。启发式: 含 phone-safe ASCII 字符 (数字/+/-/空格/字母) → 直接返回;
+// 否则 (理论上不该走到) 才尝试 UCS2 hex。修短号 "10086910" 误判为 hex 解出 ဈ椐 乱码。
 static String decodePhoneField(const String& raw) {
   if (raw.length() == 0) return String();
-  bool allHex = (raw.length() % 2 == 0);
-  for (size_t i = 0; i < raw.length() && allHex; i++) {
+  for (size_t i = 0; i < raw.length(); i++) {
     char c = raw[i];
-    if (!((c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f'))) allHex = false;
+    if ((c>='0'&&c<='9') || c=='+' || c=='-' || c==' ' ||
+        (c>='A'&&c<='Z') || (c>='a'&&c<='z')) return raw;
   }
-  if (allHex && raw.length() >= 4) {
-    return ucs2ToUtf8(raw);
-  }
-  return raw;  // 直接当 ASCII
+  return ucs2ToUtf8(raw);
 }
 
 // ML307 混合输出: 非 ASCII 字符是 UCS2 BE hex, ASCII 字符原样输出
@@ -979,7 +977,7 @@ h1{font-size:20px}.row{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}
 .tag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:12px}
 .tag-ok{background:#dfd;color:#282}.tag-bad{background:#fdd;color:#822}
 </style></head><body>
-<h1>SMS Forwarder <span class=tag>FW v4.0</span></h1>
+<h1>SMS Forwarder <span class=tag>FW v4.0.2</span></h1>
 <div class=row>
   <div class=card><h3>运行</h3>
     <div class=kv><b>Boot</b><span id=boot>0</span></div>
@@ -1166,7 +1164,7 @@ legend{font-size:13px;color:#666;padding:0 6px}
 </fieldset>
 <button>保存并重启</button>
 </form>
-<p><small>v4.0 / 重启后自动连 WiFi</small></p>
+<p><small>v4.0.2 / 重启后自动连 WiFi</small></p>
 </body></html>
 )HTML";
 
