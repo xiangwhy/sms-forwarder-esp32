@@ -28,6 +28,7 @@
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
+#include "pdu_codec.h"  // PDU 解码 (抽到独立文件以便 host test)
 #include <Update.h>
 
 #include <esp_log.h>
@@ -133,81 +134,12 @@ static void wipeConfig() {
   q.end();
 }
 
-// =================== UCS2 hex → UTF-8 ===================
-// ML307 在 UCS2 模式下 body 是 hex 字符, big-endian 字节序
-// 比如 "你" (U+4F60) → 模组吐 "4F60"
-static String ucs2ToUtf8(const String& hex) {
-  String out; out.reserve(hex.length()/2);
-  auto nib = [](char c)->uint8_t {
-    if (c>='0'&&c<='9') return c-'0';
-    if (c>='A'&&c<='F') return c-'A'+10;
-    if (c>='a'&&c<='f') return c-'a'+10;
-    return 0;
-  };
-  for (size_t i=0; i+3<hex.length(); i+=4) {
-    uint16_t u = (nib(hex[i])<<12)|(nib(hex[i+1])<<8)|(nib(hex[i+2])<<4)|nib(hex[i+3]);
-    if (!u) continue;
-    if (u<0x80) out+=(char)u;
-    else if (u<0x800) { out+=(char)(0xC0|(u>>6)); out+=(char)(0x80|(u&0x3F)); }
-    else if (u < 0xD800 || u > 0xDFFF) {
-      out+=(char)(0xE0|(u>>12)); out+=(char)(0x80|((u>>6)&0x3F)); out+=(char)(0x80|(u&0x3F));
-    }
-  }
-  return out;
-}
-
-// 解 +CMT phone 字段: ML307 实测 phone 字段始终是 ASCII (数字/+/-/空格/字母 sender),
-// 不编码 UCS2 hex (DCS 模式只影响 body)。启发式: 含 phone-safe ASCII 字符 (数字/+/-/空格/字母) → 直接返回;
-// 否则 (理论上不该走到) 才尝试 UCS2 hex。修短号 "10086910" 误判为 hex 解出 ဈ椐 乱码。
-static String decodePhoneField(const String& raw) {
-  if (raw.length() == 0) return String();
-  for (size_t i = 0; i < raw.length(); i++) {
-    char c = raw[i];
-    if ((c>='0'&&c<='9') || c=='+' || c=='-' || c==' ' ||
-        (c>='A'&&c<='Z') || (c>='a'&&c<='z')) return raw;
-  }
-  return ucs2ToUtf8(raw);
-}
-
-// ML307 混合输出: 非 ASCII 字符是 UCS2 BE hex, ASCII 字符原样输出
-// 按字符级扫描: 4 个连续 hex 字符解 1 个 UCS2 字符, 其他字符直接保留
-static String decodeBodyField(const String& raw) {
-  if (raw.length() == 0) return String();
-  String out;
-  out.reserve(raw.length());
-  auto isHex = [](char c)->bool {
-    return (c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f');
-  };
-  auto nib = [](char c)->uint8_t {
-    if (c>='0'&&c<='9') return c-'0';
-    if (c>='A'&&c<='F') return c-'A'+10;
-    if (c>='a'&&c<='f') return c-'a'+10;
-    return 0;
-  };
-  for (size_t i = 0; i < raw.length(); ) {
-    if (isHex(raw[i]) && i + 3 < raw.length()
-        && isHex(raw[i+1]) && isHex(raw[i+2]) && isHex(raw[i+3])) {
-      uint16_t u = (nib(raw[i])<<12)|(nib(raw[i+1])<<8)|(nib(raw[i+2])<<4)|nib(raw[i+3]);
-      if (u == 0) {
-        // skip null
-      } else if (u < 0x80) {
-        out += (char)u;
-      } else if (u < 0x800) {
-        out += (char)(0xC0|(u>>6));
-        out += (char)(0x80|(u&0x3F));
-      } else if (u < 0xD800 || u > 0xDFFF) {
-        out += (char)(0xE0|(u>>12));
-        out += (char)(0x80|((u>>6)&0x3F));
-        out += (char)(0x80|(u&0x3F));
-      }
-      i += 4;
-    } else {
-      out += raw[i];
-      i += 1;
-    }
-  }
-  return out;
-}
+// =================== PDU 解码 → 见 pdu_codec.{h,cpp} ===================
+// 4 个解析函数已抽到 src/pdu_codec.cpp (纯 C++, 无 Arduino/IDF 依赖, host 可跑)
+// - pdu::ucs2_hex_to_utf8()
+// - pdu::decode_phone_field()
+// - pdu::decode_body_field()
+// - pdu::parse_udh()
 
 // =================== SmsMsg + 全局 ===================
 struct SmsMsg {
@@ -347,47 +279,7 @@ static void handle_at_line(const char* line) {
 }
 
 // =================== UDH 工具 ===================
-// ML307 实际格式: UDH 头以 0x08 0x04 开头 = 16-bit concat ref
-// 格式: <UDHLEN> 08 04 <refH> <refL> <total> <seq> <body...>
-// hex 字符串: "06 08 04 7E FC 02 01 ..."
-// 字符位置:   0  2  4  6  8  10 12
-// UDHLEN="06"=p[0..1]   IEI="08"=p[2..3]  IEDL="04"=p[4..5]
-// refH="7E"=p[6..7]     refL="FC"=p[8..9]  total="02"=p[10..11]  seq="01"=p[12..13]
-static bool parse_udh(const char* line, int& refId, int& total, int& seq) {
-  // 找 "0804" (16-bit concat IEI+IEDL) 或 "0003" (8-bit concat)
-  const char* p = strstr(line, "0804");
-  bool is16 = (p != NULL);
-  if (!is16) {
-    p = strstr(line, "0003");
-    if (!p) return false;
-  }
-  // p 现在指向 "0804" 或 "0003" 在 line 中的字符位置
-  // 取后续 hex 字符解析 ref/total/seq
-  auto get2 = [](const char* q)->int {
-    char b[3] = { q[0], q[1], 0 };
-    return strtol(b, NULL, 16);
-  };
-  if (is16) {
-    // 16-bit: refH=p[4..5], refL=p[6..7], total=p[8..9], seq=p[10..11]
-    int refH = get2(p + 4);
-    int refL = get2(p + 6);
-    int tot  = get2(p + 8);
-    int sq   = get2(p + 10);
-    refId = (refH << 8) | refL;
-    total = tot;
-    seq   = sq;
-  } else {
-    // 8-bit (per 3GPP TS 23.040 §9.2.3.24, no padding after IEDL):
-    //   ref=p+4..5, total=p+6..7, seq=p+8..9
-    int ref = get2(p + 4);
-    int tot = get2(p + 6);
-    int sq  = get2(p + 8);
-    refId = ref;
-    total = tot;
-    seq   = sq;
-  }
-  return total >= 2 && total <= 8 && seq >= 1 && seq <= total;
-}
+// parse_udh 已抽到 pdu::parse_udh (src/pdu_codec.cpp)
 
 static UdhRef* find_udh_slot(int refId) {
   for (int i = 0; i < MAX_UDH_REFS; i++) {
@@ -457,7 +349,7 @@ static void check_udh_timeouts() {
 
 static bool stash_udh_part(const char* phone, const char* body) {
   int refId, total, seq;
-  if (!parse_udh(body, refId, total, seq)) return false;
+  if (!pdu::parse_udh(body, refId, total, seq)) return false;
   ESP_LOGW(TAG, "stash_udh: refId=%d total=%d seq=%d", refId, total, seq);
   UdhRef* r = find_udh_slot(refId);
   if (!r) r = alloc_udh_slot(refId, total, phone);
@@ -818,8 +710,13 @@ static void sms_task(void* /*param*/) {
         ESP_LOGI(TAG, "SMS UDH part stashed");
         continue;
       }
-      String phoneUtf8 = decodePhoneField(String(msg.phone_hex));
-      String bodyUtf8  = decodeBodyField(String(msg.body_hex));
+      char phoneBuf[64], bodyBuf[AT_LINE_BUF];
+      size_t phoneN = pdu::decode_phone_field(msg.phone_hex, strnlen(msg.phone_hex, sizeof(msg.phone_hex)),
+                                              phoneBuf, sizeof(phoneBuf));
+      size_t bodyN  = pdu::decode_body_field(msg.body_hex, strnlen(msg.body_hex, sizeof(msg.body_hex)),
+                                              bodyBuf, sizeof(bodyBuf));
+      String phoneUtf8(phoneBuf, phoneN);
+      String bodyUtf8(bodyBuf, bodyN);
       g_lastSmsMs = millis();
       ESP_LOGI(TAG, "SMS: phone=%s body=%.120s", phoneUtf8.c_str(), bodyUtf8.c_str());
       ESP_LOGI(TAG, "SMS: body_raw=%.200s body_len=%u", msg.body_hex, (unsigned)strlen(msg.body_hex));

@@ -8,7 +8,7 @@
 ## - PRIV_REQUIRES: 直接 #include 的 ESP-IDF 组件
 ## - USB CDC 通过 idf_component.yml 拉 espressif/iot_usbh_cdc
 idf_component_register(
-    SRCS "main.cpp"
+    SRCS "main.cpp" "pdu_codec.cpp"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_event
