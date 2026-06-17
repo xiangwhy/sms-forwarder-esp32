@@ -126,4 +126,82 @@ bool parse_udh(const char* line, int& refId, int& total, int& seq) {
   return total >= 2 && total <= 8 && seq >= 1 && seq <= total;
 }
 
+// GSM 03.38 §6.2.1 default alphabet → Unicode BMP code point
+// 0x00-0x7F 单字节查表; basic = 0x00-0x7F, 用 U+0040 起避免和 ASCII 控制符冲突
+// 注: 这个表不包含希腊扩展 (0x10-0x1F 部分是希腊字母), 简化到够用即可
+static const uint16_t gsm7_default_to_unicode[128] = {
+  0x0040, 0x00A3, 0x0024, 0x00A5, 0x00E8, 0x00E9, 0x00F9, 0x00EC,  // @£$¥èéùì
+  0x00F2, 0x00C7, 0x000A, 0x00D8, 0x00F8, 0x000D, 0x00C5, 0x00E5,  // òÇLFØøCRÅå
+  0x0394, 0x005F, 0x03A6, 0x0393, 0x039B, 0x03A9, 0x03A0, 0x03A8,  // Δ_ΦΓΛΩΠΨ
+  0x03A3, 0x0398, 0x03A9, 0x039E, 0x001B, 0x00C6, 0x00E6, 0x00DF,  // ΣΘΩΞESCÆæß
+  0x0020, 0x0021, 0x0022, 0x0023, 0x00A4, 0x0025, 0x0026, 0x0027,  // sp !"#¤%&'
+  0x0028, 0x0029, 0x002A, 0x002B, 0x002C, 0x002D, 0x002E, 0x002F,  // ()*+,-./
+  0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,  // 01234567
+  0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F,  // 89:;<=>?
+  0x00A1, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,  // ¡ABCDEFG
+  0x0048, 0x0049, 0x004A, 0x004B, 0x004C, 0x004D, 0x004E, 0x004F,  // HIJKLMNO
+  0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,  // PQRSTUVW
+  0x0058, 0x0059, 0x005A, 0x00C4, 0x00D6, 0x00D1, 0x00DC, 0x00A7,  // XYZÄÖÑÜ§
+  0x00BF, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,  // ¿abcdefg
+  0x0068, 0x0069, 0x006A, 0x006B, 0x006C, 0x006D, 0x006E, 0x006F,  // hijklmno
+  0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,  // pqrstuvw
+  0x0078, 0x0079, 0x007A, 0x00E4, 0x00F6, 0x00F1, 0x00FC, 0x00E0,  // xyzäöñüà
+};
+
+size_t decode_7bit_packed(const char* hex, size_t hexLen, size_t numChars,
+                         char* out, size_t outLen) {
+  // 1) hex → 原始字节
+  size_t byteCount = hexLen / 2;
+  if (byteCount == 0 || numChars == 0) return 0;
+  uint8_t buf[1024];
+  if (byteCount > sizeof(buf)) return 0;
+  for (size_t i = 0; i < byteCount; i++) {
+    buf[i] = (nib(hex[i*2]) << 4) | nib(hex[i*2 + 1]);
+  }
+  // 2) 7-bit unpack (LSB first, MSB of each byte 是下一个 char 的高位)
+  size_t pos = 0;
+  size_t bitOffset = 0;
+  for (size_t i = 0; i < numChars; i++) {
+    size_t byteIdx = bitOffset / 8;
+    if (byteIdx >= byteCount) break;
+    int bitShift = bitOffset % 8;
+    uint16_t ch = buf[byteIdx] >> bitShift;
+    if (bitShift > 1 && byteIdx + 1 < byteCount) {
+      ch |= (uint16_t)buf[byteIdx + 1] << (8 - bitShift);
+    }
+    ch &= 0x7F;
+    if (ch < 128) {
+      uint16_t u = gsm7_default_to_unicode[ch];
+      size_t wrote = put_codepoint(u, out, outLen, pos);
+      if (wrote == 0) return pos;
+      pos += wrote;
+    }
+    bitOffset += 7;
+  }
+  return pos;
+}
+
+bool is_valid_7bit(const char* hex, size_t hexLen, size_t numChars) {
+  // 解一次, 看结果的 char 分布
+  char buf[1024];
+  size_t n = decode_7bit_packed(hex, hexLen, numChars, buf, sizeof(buf) - 1);
+  if (n == 0) return false;
+  // 0 结尾保证 sniff 安全
+  if (n < sizeof(buf)) buf[n] = 0;
+  int suspicious = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t c = (uint8_t)buf[i];
+    if (c == 0) {
+      suspicious++;            // NUL: 7-bit 表里只有 0x00='@' (合法), 多次连续 NUL 高度可疑
+    } else if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') {
+      suspicious++;            // 其他控制字符 (除常见空白)
+    } else if (c >= 0x80 && c < 0xC0) {
+      suspicious++;            // UTF-8 续字节 (0x80-0xBF) 单独出现, 不是合法 lead
+    }
+  }
+  // 容差 25% — 短消息 "OTP 123456" 全可打印 = 0% 可疑;
+  // 误把 UCS-2 当 7-bit 通常 50%+ 可疑 (大量 NUL + 控制字符)
+  return suspicious * 4 < (int)n;
+}
+
 }  // namespace pdu

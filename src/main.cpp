@@ -55,7 +55,8 @@ static const char* TAG_USB = "USBH";
 
 #define G4_PWR_GPIO        8
 #define BOOT_BUTTON_PIN    0
-#define BOOT_HOLD_MS       5000
+#define BOOT_HOLD_MS       15000   // 长按 15s 才 wipe (避免 5s 误触)
+#define BOOT_GRACE_MS      30000   // 启动后 30s 不响应 BOOT (避开 GPIO0 strapping 抖动)
 
 #define AP_SSID_PREFIX     "SMS-Forwarder-"
 #define AP_PASSWORD        "12345678"
@@ -90,7 +91,16 @@ struct Config {
   char otaUser[32];
   char otaPass[32];
 };
-static Config g_cfg = {};
+// 硬编码默认配置 (v4.0.4 patch, 烧板/重启后直接可用, 避免反复进 AP 配网)
+// NVS 优先, NVS 为空时回落到这里的默认值
+static Config g_cfg = {
+  "REDACTED_SSID",                          // ssid
+  "REDACTED_WIFI_PASS",                          // pass
+  "49b6fce94afe49c2b5cf7cb59873800f",  // token
+  "",                                  // topic (空 = 个人推送)
+  "admin",                             // otaUser
+  "Admin@123"                          // otaPass
+};
 
 static void loadConfig() {
   Preferences p;
@@ -145,6 +155,8 @@ static void wipeConfig() {
 struct SmsMsg {
   char phone_hex[64];     // UCS2 hex 原文
   char body_hex[AT_LINE_BUF];
+  uint16_t cmt_length;    // CMT head length field (septs for GSM 7-bit, codepoints for UCS-2)
+  uint16_t dcs;           // 0/4/5/F5=7-bit, 8=UCS-2, 0xFF=unknown
   uint32_t ts;            // millis()
 };
 
@@ -200,7 +212,7 @@ static void ap_mode_set(bool on) { taskENTER_CRITICAL(&s_apMux); g_apModeActive 
 static bool ap_mode_get()        { taskENTER_CRITICAL(&s_apMux); bool r = g_apModeActive; taskEXIT_CRITICAL(&s_apMux); return r; }
 
 // UDH 长短信
-struct UdhPart { char body[AT_LINE_BUF]; size_t len; bool present; };
+struct UdhPart { char body[AT_LINE_BUF]; size_t len; uint16_t cmt_length; bool present; };
 struct UdhRef {
   bool in_use;
   int refId;
@@ -229,11 +241,58 @@ static void handle_at_line(const char* line) {
       if (q1 && q2 && (q2 - q1 - 1) < (int)sizeof(phoneHex)) {
         strncpy(phoneHex, q1+1, q2 - q1 - 1);
       }
+      // 解 CMT head: 跳引号段数 ',' 找 dcs (field[6]) + length (field[9])
+      // 格式: +CMT: oa,alpha,scts,tooa,fo,pid,dcs,sca,tosca,length
+      // 兼容 oa/sca/tosca 不带引号的固件 (按 3GPP 27.005 它们是字符串)
+      uint16_t dcs = 0xFF, cmtLen = 0;
+      {
+        const char* p = g_cmtHeader;
+        int fieldIdx = 0;
+        const char* field[10] = {0};
+        const char* fieldEnd[10] = {0};
+        while (*p && fieldIdx < 10) {
+          // 跳引号段
+          if (*p == '"') {
+            field[fieldIdx] = p;
+            const char* end = strchr(p + 1, '"');
+            if (!end) break;
+            fieldEnd[fieldIdx] = end;
+            fieldIdx++;
+            p = end + 1;
+            // 吞一个分隔逗号
+            if (*p == ',') p++;
+            continue;
+          }
+          // 非引号 field
+          field[fieldIdx] = p;
+          const char* comma = strchr(p, ',');
+          fieldEnd[fieldIdx] = comma ? comma : p + strlen(p);
+          fieldIdx++;
+          if (!comma) break;
+          p = comma + 1;
+        }
+        if (fieldIdx >= 7 && field[6]) {
+          char tmp[8] = {0};
+          size_t n = fieldEnd[6] - field[6];
+          if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+          memcpy(tmp, field[6], n);
+          dcs = (uint16_t)atoi(tmp);
+        }
+        if (fieldIdx >= 10 && field[9]) {
+          char tmp[8] = {0};
+          size_t n = fieldEnd[9] - field[9];
+          if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+          memcpy(tmp, field[9], n);
+          cmtLen = (uint16_t)atoi(tmp);
+        }
+      }
       SmsMsg msg = {};
       strncpy(msg.phone_hex, phoneHex, sizeof(msg.phone_hex)-1);
       strncpy(msg.body_hex, line, sizeof(msg.body_hex)-1);
+      msg.cmt_length = cmtLen;
+      msg.dcs = dcs;
       msg.ts = millis();
-      ESP_LOGW(TAG, "RAW +CMT BODY: %s", line);  // 诊断: 看 body 实际字节
+      ESP_LOGW(TAG, "RAW +CMT BODY: %s (dcs=%u len=%u)", line, dcs, cmtLen);
       if (xQueueSend(g_smsQ, &msg, 0) != pdTRUE) {
         ESP_LOGW(TAG, "SmsQueue full, drop SMS from %s", phoneHex);
       } else {
@@ -283,7 +342,9 @@ static void handle_at_line(const char* line) {
 
 static UdhRef* find_udh_slot(int refId) {
   for (int i = 0; i < MAX_UDH_REFS; i++) {
-    if (g_udhTable[i].refId == refId) return &g_udhTable[i];
+    // in_use 守 refId=0 碰撞: clear_udh_ref 把 refId 置 0 但 in_use 仍 true
+    // 直到下次 alloc_udh_slot 重置 — 不守的话 refId=0 长短信会命中已清空槽
+    if (g_udhTable[i].in_use && g_udhTable[i].refId == refId) return &g_udhTable[i];
   }
   return NULL;
 }
@@ -347,44 +408,63 @@ static void check_udh_timeouts() {
   }
 }
 
-static bool stash_udh_part(const char* phone, const char* body) {
+static bool stash_udh_part(const SmsMsg* msg) {
   int refId, total, seq;
-  if (!pdu::parse_udh(body, refId, total, seq)) return false;
-  ESP_LOGW(TAG, "stash_udh: refId=%d total=%d seq=%d", refId, total, seq);
+  if (!pdu::parse_udh(msg->body_hex, refId, total, seq)) return false;
+  ESP_LOGW(TAG, "stash_udh: refId=%d total=%d seq=%d (cmt_len=%u dcs=%u)",
+           refId, total, seq, msg->cmt_length, msg->dcs);
   UdhRef* r = find_udh_slot(refId);
-  if (!r) r = alloc_udh_slot(refId, total, phone);
+  if (!r) r = alloc_udh_slot(refId, total, msg->phone_hex);
   if (!r) return false;
-  if (strcmp(r->phone, phone) != 0) {
+  if (strcmp(r->phone, msg->phone_hex) != 0) {
     // phone mismatch, 重新建
     clear_udh_ref(refId);
-    r = alloc_udh_slot(refId, total, phone);
+    r = alloc_udh_slot(refId, total, msg->phone_hex);
     if (!r) return false;
   }
   // UDH 头长度:
-  //   8-bit concat:  UDHLEN(1) 00 03 00 ref total seq  = 7 字节 = 14 hex
-  //   16-bit concat: UDHLEN(1) 08 04 refH refL total seq = 7 字节 = 14 hex
-  // body[0] = UDHLEN, body[1] = IEI, body[2..] = IEDL+data
+  //   8-bit concat:  IEI(1) 03 ref total seq  = 5 字节 = 10 hex
+  //   16-bit concat: IEI(1) 04 refH refL total seq = 6 字节 = 12 hex
+  // ML307 标准格式: body[0..1] = UDHLEN(1 byte hex), body[2..] = IE
+  //   16-bit: "06 08 04 ..." → "0804" 在 body+2 → skip 14
+  //   8-bit:  "05 00 03 ..." → "0003" 在 body+2 → skip 12
+  // ML307 剥 UDHL (实测踩过): body[0..] 直接 IE
+  //   16-bit: "08 04 ..." → "0804" 在 body+0 → skip 12
+  //   8-bit:  "00 03 ..." → "0003" 在 body+0 → skip 10
   size_t udhSkip = 0;
-  if (strstr(body, "0804") == body + 2) udhSkip = 14;       // 16-bit: 7 字节 UDH
-  else if (strstr(body, "0003") == body + 2) udhSkip = 12;  // 8-bit:  6 字节 UDH
-  const char* partBody = body + udhSkip;
+  const char* p16 = strstr(msg->body_hex, "0804");
+  const char* p8  = strstr(msg->body_hex, "0003");
+  if (p16 != NULL && p16 <= msg->body_hex + 2) {
+    udhSkip = (p16 == msg->body_hex + 2) ? 14 : 12;
+  } else if (p8 != NULL && p8 <= msg->body_hex + 2) {
+    udhSkip = (p8 == msg->body_hex + 2) ? 12 : 10;
+  }
+  const char* partBody = msg->body_hex + udhSkip;
   if (seq < 1 || seq > MAX_UDH_PARTS) return false;
   if (r->parts[seq-1].present) return false;  // dup
   strncpy(r->parts[seq-1].body, partBody, sizeof(r->parts[seq-1].body)-1);
-  r->parts[seq-1].len   = strlen(partBody);
-  r->parts[seq-1].present = true;
+  r->parts[seq-1].len        = strlen(partBody);
+  r->parts[seq-1].cmt_length = msg->cmt_length;  // per-part septet count
+  r->parts[seq-1].present    = true;
   r->received++;
   if (r->received == r->total) {
     // 齐了, 拼接
     SmsMsg m = {};
     strncpy(m.phone_hex, r->phone, sizeof(m.phone_hex)-1);
     m.body_hex[0] = 0;
+    uint32_t totalSeptets = 0;
     for (int j = 0; j < MAX_UDH_PARTS; j++) {
       if (r->parts[j].present) {
         strncat(m.body_hex, r->parts[j].body, sizeof(m.body_hex)-strlen(m.body_hex)-1);
+        totalSeptets += r->parts[j].cmt_length;  // sum per-part
       }
     }
     m.ts = millis();
+    m.dcs = msg->dcs;
+    // 7-bit concat: total septets 包含每个 part 的 UDH overhead (7 septets per part)
+    // user_chars = totalSeptets - 7*total
+    // 简化: 编码检测 sms_task 里完成, 这里把 raw totalSeptets 传过去
+    m.cmt_length = (uint16_t)totalSeptets;
     xQueueSend(g_smsQ, &m, 0);
     clear_udh_ref(refId);
   }
@@ -706,15 +786,79 @@ static void sms_task(void* /*param*/) {
     SmsMsg msg;
     if (xQueueReceive(g_smsQ, &msg, pdMS_TO_TICKS(500)) == pdTRUE) {
       // 先试 UDH 拼接 (如果 body 含 0003...)
-      if (stash_udh_part(msg.phone_hex, msg.body_hex)) {
+      if (stash_udh_part(&msg)) {
         ESP_LOGI(TAG, "SMS UDH part stashed");
         continue;
       }
       char phoneBuf[64], bodyBuf[AT_LINE_BUF];
       size_t phoneN = pdu::decode_phone_field(msg.phone_hex, strnlen(msg.phone_hex, sizeof(msg.phone_hex)),
                                               phoneBuf, sizeof(phoneBuf));
-      size_t bodyN  = pdu::decode_body_field(msg.body_hex, strnlen(msg.body_hex, sizeof(msg.body_hex)),
-                                              bodyBuf, sizeof(bodyBuf));
+      // 编码自动检测: DCS 优先 (3GPP TS 23.038 §4), 缺失时按 cmt_length vs bodyBytes 启发
+      // - DCS 0 / 4 / 5 / 0x10 / 0xF0..0xF3 / 0xF5: GSM 7-bit packed
+      // - DCS 1 / 0xF4 / 0xF6: 8-bit data (raw bytes, 非文本)
+      // - DCS 8 / 0xF8: UCS-2 (BE)
+      // - DCS 0x1F (mobile-determined) 或 0xFF (未知): 启发
+      size_t bodyHexLen = strnlen(msg.body_hex, sizeof(msg.body_hex));
+      size_t bodyBytes  = bodyHexLen / 2;
+      bool is7bit = false;
+      bool is8bitData = false;
+      if (msg.dcs == 8 || msg.dcs == 0xF8) {
+        is7bit = false;
+      } else if (msg.dcs == 0  || msg.dcs == 4 || msg.dcs == 5 ||
+                 msg.dcs == 16 || msg.dcs == 0xF0 || msg.dcs == 0xF1 ||
+                 msg.dcs == 0xF2 || msg.dcs == 0xF3 || msg.dcs == 0xF5) {
+        is7bit = true;
+      } else if (msg.dcs == 1 || msg.dcs == 0xF4 || msg.dcs == 0xF6) {
+        is8bitData = true;  // 8-bit raw, 走 decode_body_field 字符级扫描当 hex 原样输出
+      } else {
+        // DCS=0xFF (未知) / 0x1F (mobile-determined) → 启发
+        if (msg.cmt_length > 0 && msg.cmt_length * 2 == bodyBytes) {
+          is7bit = false;  // bodyBytes == cmt_len*2 → UCS-2
+        } else if (msg.cmt_length > 0) {
+          // 7-bit 时 bodyBytes ≈ cmt_len*7/8; ±2 容差 (UDH overhead)
+          size_t expect = (msg.cmt_length * 7 + 7) / 8;
+          is7bit = (bodyBytes >= expect - 2 && bodyBytes <= expect + 2);
+        } else {
+          is7bit = false;  // 没线索默认 UCS-2 (旧行为)
+        }
+      }
+      size_t bodyN = 0;
+      if (is7bit) {
+        // 7-bit: numChars (user septets) 推导
+        //   单 part (msg 直接从 queue 来的, body 含 UDH 头): user = cmt_length - 7
+        //     (UDHL=6/5 → 6 octets = 48 bits = 7 septets overhead)
+        //   stash 出来的 concat msg: cmt_length = sum(per_part), 已是 user septets, 直接用
+        //   cmt_length=0 (不可信): 用 bodyBytes 倒推
+        size_t numChars = 0;
+        if (msg.cmt_length > 0) {
+          numChars = msg.cmt_length;
+          // body 头部还含 UDH 标志 (单 part 没被 stash 吃) → 减 7 overhead
+          if (strstr(msg.body_hex, "0804") || strstr(msg.body_hex, "0003")) {
+            if (numChars > 7) numChars -= 7;
+          }
+        }
+        if (numChars == 0) numChars = (bodyBytes * 8) / 7;
+        bodyN = pdu::decode_7bit_packed(msg.body_hex, bodyHexLen, numChars,
+                                        bodyBuf, sizeof(bodyBuf));
+        ESP_LOGI(TAG, "SMS: 7-bit decode (dcs=%u cmt_len=%u bodyBytes=%u → numChars=%u bodyN=%u)",
+                 msg.dcs, msg.cmt_length, (unsigned)bodyBytes, (unsigned)numChars, (unsigned)bodyN);
+        // sniff: 解码结果含过多 NUL/控制字符/孤立 UTF-8 续字节 → 大概率不是 7-bit, fallback UCS-2
+        if (bodyN > 0 && !pdu::is_valid_7bit(msg.body_hex, bodyHexLen, numChars)) {
+          ESP_LOGW(TAG, "SMS: 7-bit decode looks invalid, fallback UCS-2");
+          bodyN = pdu::decode_body_field(msg.body_hex, bodyHexLen, bodyBuf, sizeof(bodyBuf));
+          is7bit = false;
+        }
+      } else if (is8bitData) {
+        // 8-bit raw (DCS=1): 把 hex 当 raw bytes 写出, 不当 UCS-2 解
+        ESP_LOGI(TAG, "SMS: 8-bit data (dcs=%u cmt_len=%u bodyBytes=%u)", msg.dcs, msg.cmt_length, (unsigned)bodyBytes);
+        bodyN = 0;
+        for (size_t i = 0; i + 1 < bodyHexLen && bodyN < sizeof(bodyBuf) - 1; i += 2) {
+          char h[3] = { msg.body_hex[i], msg.body_hex[i+1], 0 };
+          bodyBuf[bodyN++] = (char)strtol(h, nullptr, 16);
+        }
+      } else {
+        bodyN = pdu::decode_body_field(msg.body_hex, bodyHexLen, bodyBuf, sizeof(bodyBuf));
+      }
       String phoneUtf8(phoneBuf, phoneN);
       String bodyUtf8(bodyBuf, bodyN);
       g_lastSmsMs = millis();
@@ -1143,6 +1287,11 @@ static void start_ap_mode() {
 }
 
 // =================== BOOT 按钮长按 → 清 NVS ===================
+// 防误触策略 (v4.0.4 patch):
+//   1. 启动后 30s grace: 忽略 BOOT (避开 ESP32-S3 GPIO0 strapping 抖动)
+//   2. 长按 15s: 5s 太容易误触 (USB 插拔 / 静电 / 浮空) 触发 wipe
+//   3. 二次确认: 按到 7s 时 LED 快闪 1s, 提示用户再继续按才算 wipe
+//   4. cfg 已空: 不重复 wipe (避免无意义 reboot loop)
 static void boot_button_task(void* /*param*/) {
   gpio_config_t io = { .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
                        .mode = GPIO_MODE_INPUT,
@@ -1150,18 +1299,39 @@ static void boot_button_task(void* /*param*/) {
                        .pull_down_en = GPIO_PULLDOWN_DISABLE,
                        .intr_type = GPIO_INTR_DISABLE };
   gpio_config(&io);
+  const uint32_t started = millis();
   uint32_t pressedAt = 0;
+  bool warnedAt7s = false;  // LED 闪一下
   for (;;) {
-    if (gpio_get_level((gpio_num_t)BOOT_BUTTON_PIN) == 0) {
-      if (pressedAt == 0) pressedAt = millis();
-      else if (millis() - pressedAt >= BOOT_HOLD_MS) {
-        ESP_LOGW(TAG, "BOOT held %ums — wiping NVS & rebooting", BOOT_HOLD_MS);
-        wipeConfig();
+    bool low = (gpio_get_level((gpio_num_t)BOOT_BUTTON_PIN) == 0);
+    if (millis() - started < BOOT_GRACE_MS) {
+      pressedAt = 0;  // grace 内不计时
+      warnedAt7s = false;
+    } else if (low) {
+      if (pressedAt == 0) {
+        pressedAt = millis();
+        warnedAt7s = false;
+      }
+      uint32_t held = millis() - pressedAt;
+      // 7s 闪一下提示用户 (二次确认点)
+      if (!warnedAt7s && held >= 7000) {
+        warnedAt7s = true;
+        g_ledNet.flashTrig = true;  // 复用 NET LED 闪一下
+        ESP_LOGW(TAG, "BOOT held 7s — keep holding to wipe (or release to cancel)");
+      }
+      if (held >= BOOT_HOLD_MS) {
+        if (strlen(g_cfg.ssid) == 0) {
+          ESP_LOGW(TAG, "BOOT held %ums but cfg already empty — skip wipe, restart only", BOOT_HOLD_MS);
+        } else {
+          ESP_LOGW(TAG, "BOOT held %ums — wiping NVS & rebooting", BOOT_HOLD_MS);
+          wipeConfig();
+        }
         delay(200);
         ESP.restart();
       }
     } else {
       pressedAt = 0;
+      warnedAt7s = false;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
