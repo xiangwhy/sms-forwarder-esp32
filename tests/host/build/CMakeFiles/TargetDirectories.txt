@@ -1,0 +1,3 @@
+/Users/xiang/Claude/Projects/esp32-sms/tests/host/build/CMakeFiles/test_pdu_codec.dir
+/Users/xiang/Claude/Projects/esp32-sms/tests/host/build/CMakeFiles/edit_cache.dir
+/Users/xiang/Claude/Projects/esp32-sms/tests/host/build/CMakeFiles/rebuild_cache.dir

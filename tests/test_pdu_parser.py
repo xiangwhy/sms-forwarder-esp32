@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-PDU 解析器单元测试 (Python 模拟)
+PDU 解析器单元测试 (Python 模拟) — DEPRECATED
 
-参考 C++ 代码:
+⚠️ 此测试与生产代码不同源, v4.0.3 起改用 C++ host test:
+   tests/host/test_pdu_codec.cpp
+   (跑生产代码 src/pdu_codec.cpp, 真实行为验证)
+
+保留作为 v4.1 parser API 的参考实现 (gsm7bit_unpack / ucs2_bytes_to_utf8
+/ parse_pdu_sms_deliver 是 v4.1 PDU 方案, v4.0 不使用), 仅供查阅。
+
+参考 C++ 代码 (v4.1 已弃用):
   gsm7bit_unpack(const uint8_t* in, int in_bytes, int septet_count, char* out, int out_max)
   ucs2_bytes_to_utf8(const uint8_t* in, int in_bytes, char* out, int out_max)
-  parse_pdu_sms_deliver(pdu_hex, SmsMsg* msg)  // v4.1: 直接填 SmsMsg, 字段:
-                                              //   phone_utf8, body_utf8,
-                                              //   concat_ref, concat_total, concat_seq
-
-翔哥用这个先在本地确认 PDU 解析器逻辑对, 然后再烧 v4.1.1 板子。
+  parse_pdu_sms_deliver(pdu_hex, SmsMsg* msg)
 """
 
 import sys

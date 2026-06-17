@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/xiang/Claude/Projects/esp32-sms/tests/host/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

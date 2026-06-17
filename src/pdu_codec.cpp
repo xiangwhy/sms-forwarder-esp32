@@ -3,6 +3,7 @@
 
 #include "pdu_codec.h"
 
+#include <stdlib.h>  // strtol (host 上 Arduino.h 不存在, 必须显式 include)
 #include <string.h>
 
 namespace pdu {
