@@ -661,28 +661,29 @@ static inline void push_success_inc() {
   g_lastPushOkMs = millis();
 }
 
-// =================== post_pushplus_raw (从 PushItem payload 推) ===================
-static bool post_pushplus_raw(const char* payload, size_t len) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-
+// 通用 HTTPS POST JSON, 返回 HTTP code (-1 = 网络错 / init 失败)
+// 调用方负责 guard 前置条件(WiFi up 等)
+static int http_post_json(const char* url, const char* payload, size_t len, uint32_t timeout_ms) {
   esp_http_client_config_t cfg = {};
-  cfg.url = PUSHPLUS_URL;
-  cfg.method = HTTP_METHOD_POST;
-  cfg.timeout_ms = 5000;
+  cfg.url               = url;
+  cfg.method            = HTTP_METHOD_POST;
+  cfg.timeout_ms        = timeout_ms;
   cfg.crt_bundle_attach = esp_crt_bundle_attach;
   esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-  if (!cli) return false;
+  if (!cli) return -1;
   esp_http_client_set_header(cli, "Content-Type", "application/json");
   esp_http_client_set_post_field(cli, payload, len);
   esp_err_t err = esp_http_client_perform(cli);
   int code = (err == ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
-  char resp[256] = {0};
-  if (err == ESP_OK) {
-    int r = esp_http_client_read_response(cli, resp, sizeof(resp)-1);
-    if (r > 0) resp[r] = 0;
-  }
   esp_http_client_cleanup(cli);
-  ESP_LOGI(TAG, "Push(WiFi) code=%d resp=%.120s", code, resp);
+  return code;
+}
+
+// =================== post_pushplus_raw (从 PushItem payload 推) ===================
+static bool post_pushplus_raw(const char* payload, size_t len) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  int code = http_post_json(PUSHPLUS_URL, payload, len, 5000);
+  ESP_LOGI(TAG, "Push(WiFi) code=%d", code);
   return (code == 200);
 }
 
@@ -713,18 +714,7 @@ static void push_boot_notification() {
   if (strlen(g_cfg.topic) > 0) doc["topic"] = g_cfg.topic;
   String payload; serializeJson(doc, payload);
 
-  esp_http_client_config_t cfg = {};
-  cfg.url               = PUSHPLUS_URL;
-  cfg.method            = HTTP_METHOD_POST;
-  cfg.timeout_ms        = 5000;
-  cfg.crt_bundle_attach = esp_crt_bundle_attach;
-  esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-  if (!cli) { ESP_LOGE(TAG, "boot notify: init failed"); return; }
-  esp_http_client_set_header(cli, "Content-Type", "application/json");
-  esp_http_client_set_post_field(cli, payload.c_str(), payload.length());
-  esp_err_t err = esp_http_client_perform(cli);
-  int code = (err == ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
-  esp_http_client_cleanup(cli);
+  int code = http_post_json(PUSHPLUS_URL, payload.c_str(), payload.length(), 5000);
   ESP_LOGI(TAG, "Boot notification code=%d", code);
   if (code == 200) push_success_inc();
 }
@@ -780,6 +770,41 @@ static int nvsQDrain() {
   }
   if (drained > 0) ESP_LOGI(TAG, "PushQueue drained %d items", drained);
   return drained;
+}
+
+// 启动自检: head/count/key 三者不一致会腐烂 (nvsQEnqueue 写到 key 后没 ++ count 时掉电)
+// 扫描 p0..p(N-1) 实际非空数, 与 count 对比, 不一致就修
+static void nvsQSanityCheck() {
+  Preferences p;
+  p.begin("pqueue", true);
+  uint8_t head = p.getUChar("head", 0);
+  uint8_t count = p.getUChar("count", 0);
+  p.end();
+
+  if (head >= NVS_QUEUE_LEN) {
+    ESP_LOGW(TAG, "NVS queue head=%u OOR, reset", head);
+    p.begin("pqueue", false);
+    p.putUChar("head", 0);
+    p.putUChar("count", 0);
+    p.end();
+    return;
+  }
+
+  uint8_t actual = 0;
+  for (int i = 0; i < NVS_QUEUE_LEN; i++) {
+    char key[8]; snprintf(key, sizeof(key), "p%d", i);
+    p.begin("pqueue", true);
+    String s = p.getString(key, "");
+    p.end();
+    if (s.length() > 0) actual++;
+  }
+
+  if (actual != count || count > NVS_QUEUE_LEN) {
+    ESP_LOGW(TAG, "NVS queue count=%u actual=%u, fixing", count, actual);
+    p.begin("pqueue", false);
+    p.putUChar("count", actual);
+    p.end();
+  }
 }
 
 // =================== SmsTask ===================
@@ -1309,6 +1334,7 @@ void setup() {
   xTaskCreate(led_task, "led", 2048, NULL, 3, NULL);
 
   loadConfig();
+  nvsQSanityCheck();
 
   // 启动次数 +1 持久化
   {

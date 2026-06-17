@@ -67,7 +67,37 @@ pio device monitor -b 115200 -p /dev/cu.usbserial-XXXX
 |---|---|
 | `/` | 跳转到 dashboard |
 | `/dashboard` | 状态总览(30s 自动刷新) |
-| `/api/status` | JSON 状态 (推送成功/失败/队列数) |
+| `/api/status` | JSON 状态 (字段表见下) |
+
+### `/api/status` 字段表
+
+| 字段 | 类型 | 单位/含义 | 备注 |
+|---|---|---|---|
+| `boot` | int | 启动次数 (从 NVS `stat.bootCount` 累计) | 长按 GPIO0 5s 不重置 |
+| `pushOk` | int | 推送成功累计 (atomic) | 推一条 pushplus 200 即 +1 |
+| `pushFail` | int | 推送失败累计 (atomic) | 包含 WiFi down + HTTP 4xx/5xx |
+| `qLen` | int | NVS 待推队列长度 (0–32) | pushQ 满时落 NVS,WiFi 恢复后 drain |
+| `wifi` | bool | WiFi STA 是否连上 | 关联到 IP_EVENT_STA_GOT_IP |
+| `wifiRssi` | int | WiFi RSSI (dBm),wifi off 时 0 | 调试信号强度用 |
+| `freeHeap` | int | 当前空闲 heap (字节) | `esp_get_free_heap_size()` |
+| `minFreeHeap` | int | 启动以来最小空闲 heap | `esp_get_minimum_free_heap_size()`,排查泄漏关键 |
+| `lastSmsMs` | int | 上次收短信时间 (millis 上电后) | 0 表示从未收过;前端要换算成"X 秒前"需自己减 `Date.now()` |
+| `lastPushOkMs` | int | 上次推送成功时间 (millis) | 同上 |
+| `mlAlive` | bool | 4G 模组 (ML307) 是否 alive | setup 后置 true,watchdog 未实现 |
+| `udhActive` | int | 当前活跃 UDH 长短信拼接槽 (0–4) | 长时间 >0 表示有 slot 卡死 |
+| `fw` | str | 固件版本号 | 例 "v4.0.3" |
+
+**示例**:
+```json
+{
+  "boot": 42, "pushOk": 138, "pushFail": 2, "qLen": 0,
+  "wifi": true, "wifiRssi": -58,
+  "freeHeap": 87344, "minFreeHeap": 81200,
+  "lastSmsMs": 3842100, "lastPushOkMs": 3842150,
+  "mlAlive": true, "udhActive": 0,
+  "fw": "v4.0.3"
+}
+```
 | `/update` | OTA 烧录 (弹窗输 OTA 用户密码) |
 
 ## 功能清单
