@@ -1,12 +1,12 @@
 /*
  * ============================================================================
- *  SMS Forwarder v4.0.2  (ESP32-S3 + USB 4G Modem + RNDIS + pushplus)
+ *  SMS Forwarder v4.0.3  (ESP32-S3 + USB 4G Modem + pushplus)
  *  Stack: ESP-IDF 5.5 + Arduino-ESP32 3.x (pioarduino platform)
  *
  *  v3.6.4 (IDF 4.4) 重写, 全面适配 IDF 5.5 API。
+ *  v4.0.3 删除 RNDIS 死代码 (SDK 栈不稳, iot_eth 0.1.x stack_input 会 NULL deref)
  *  功能:
  *   - USB CDC 接 ML307 4G 模组 AT 通道 (iot_usbh_cdc 3.x API)
- *   - RNDIS 4G 拨号上网 (iot_usbh_rndis 0.3.x + iot_eth 0.1.x)
  *   - 收 +CMT 短信 (UCS2 hex) → 推送 pushplus
  *   - UDH 长短信自动拼接
  *   - 推失败落 NVS 队列, 重连重发
@@ -15,7 +15,7 @@
  *   - 首次没配置 → AP 模式 192.168.4.1 表单配网
  *   - GPIO0 长按 5s → 清 NVS 重启
  *   - 3 个 LED 状态: GPIO7=4G / GPIO15=WIFI / GPIO6=NET
- *   - esp_ping 健康监控, RNDIS 熔断 30s 自恢复
+ *   - esp_ping 健康监控
  *   - 推送失败率 5s 重试
  *
  *  已砍: ArduinoOTA (用 web OTA 替代), 数据用量统计
@@ -58,7 +58,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder-"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.2"
+#define FW_VERSION         "v4.0.3"
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -244,11 +244,11 @@ static LedState g_ledNet = {LED_OFF, false, 0, 0, false};
 
 // 网络/业务状态
 static volatile bool g_wifiUp     = false;
-static volatile bool g_rndisUp    = false;
-static volatile int  g_rndisFails = 0;
 static volatile int  g_pushOk     = 0;
 static volatile int  g_pushFail   = 0;
 static volatile uint32_t g_bootCount = 0;
+static volatile uint32_t g_lastSmsMs    = 0;  // 上次收短信时间 (millis)
+static volatile uint32_t g_lastPushOkMs = 0;  // 上次推送成功时间 (millis)
 
 // 4G 模组健康
 typedef struct {
@@ -261,9 +261,6 @@ typedef struct {
 } modem_lifecycle_t;
 static modem_lifecycle_t g_ml = {false, 0, 0, false, false, 0};
 
-// RNDIS (v4.0 暂禁, 全局变量保留作占位)
-static esp_netif_t*            g_ethNetif  = NULL;
-
 // AP 模式
 static volatile bool g_apModeActive = false;
 static portMUX_TYPE  s_apMux = portMUX_INITIALIZER_UNLOCKED;
@@ -273,6 +270,7 @@ static bool ap_mode_get()        { taskENTER_CRITICAL(&s_apMux); bool r = g_apMo
 // UDH 长短信
 struct UdhPart { char body[AT_LINE_BUF]; size_t len; bool present; };
 struct UdhRef {
+  bool in_use;
   int refId;
   int total;
   int received;
@@ -335,13 +333,14 @@ static void handle_at_line(const char* line) {
     return;
   }
 
-  // 普通行 → 累加到 reply
+  // 普通行 → 累加到 reply (行末加 '\n' 方便多行响应排错)
   size_t l = strlen(line);
-  if (g_atReplyLen + l + 2 < sizeof(g_atReply)) {
-    memcpy(g_atReply + g_atReplyLen, line, l);
-    g_atReplyLen += l;
-    g_atReply[g_atReplyLen++] = '\n';
-    g_atReply[g_atReplyLen]   = 0;
+  size_t oldLen = g_atReplyLen;
+  if (oldLen + l + 2 < sizeof(g_atReply)) {
+    memcpy(g_atReply + oldLen, line, l);
+    g_atReply[oldLen + l] = '\n';
+    g_atReplyLen = oldLen + l + 1;
+    g_atReply[g_atReplyLen] = 0;
   }
   if (!strcmp(line, "OK"))    { g_atResult = 0;  xSemaphoreGive(g_atDone); }
   else if (!strcmp(line, "ERROR")) { g_atResult = -1; xSemaphoreGive(g_atDone); }
@@ -400,11 +399,12 @@ static UdhRef* find_udh_slot(int refId) {
 static UdhRef* alloc_udh_slot(int refId, int total, const char* phone) {
   // 先找空槽
   for (int i = 0; i < MAX_UDH_REFS; i++) {
-    if (g_udhTable[i].received == 0) {
-      g_udhTable[i].refId = refId;
-      g_udhTable[i].total = total;
+    if (!g_udhTable[i].in_use) {
+      g_udhTable[i].in_use   = true;
+      g_udhTable[i].refId    = refId;
+      g_udhTable[i].total    = total;
       g_udhTable[i].received = 0;
-      g_udhTable[i].firstMs = millis();
+      g_udhTable[i].firstMs  = millis();
       strncpy(g_udhTable[i].phone, phone, sizeof(g_udhTable[i].phone)-1);
       for (int j = 0; j < MAX_UDH_PARTS; j++) g_udhTable[i].parts[j].present = false;
       return &g_udhTable[i];
@@ -416,6 +416,7 @@ static UdhRef* alloc_udh_slot(int refId, int total, const char* phone) {
 static void clear_udh_ref(int refId) {
   for (int i = 0; i < MAX_UDH_REFS; i++) {
     if (g_udhTable[i].refId == refId) {
+      g_udhTable[i].in_use = false;
       g_udhTable[i].refId = 0;
       g_udhTable[i].total = 0;
       g_udhTable[i].received = 0;
@@ -432,7 +433,7 @@ static void clear_udh_ref(int refId) {
 
 static void check_udh_timeouts() {
   for (int i = 0; i < MAX_UDH_REFS; i++) {
-    if (g_udhTable[i].received > 0 &&
+    if (g_udhTable[i].in_use &&
         millis() - g_udhTable[i].firstMs > UDH_TIMEOUT_MS) {
       // 超时: 把已收部分拼好入队
       ESP_LOGW(TAG, "UDH ref=%d timeout, push partial %d/%d parts",
@@ -644,68 +645,45 @@ static size_t build_push_payload(const String& phoneUtf8, const String& bodyUtf8
   doc["content"]  = String("<p>") + esc + "</p>";
   if (strlen(g_cfg.topic) > 0) doc["topic"] = g_cfg.topic;
   String s; serializeJson(doc, s);
-  if (s.length() >= outLen) s = s.substring(0, outLen - 1);
+  if (s.length() >= outLen) {
+    // 不截断 — 截断会破坏 JSON, pushplus 返 4xx → 坏 payload 进 NVS 队列死循环
+    ESP_LOGW(TAG, "Push payload %u >= %u, drop", (unsigned)s.length(), (unsigned)outLen);
+    return 0;
+  }
   strncpy(out, s.c_str(), outLen - 1);
   out[outLen - 1] = 0;
   return s.length();
 }
 
+// 推送成功计数 + 时间戳统一更新(boot 通知 / net_task 共用)
+static inline void push_success_inc() {
+  __atomic_add_fetch(&g_pushOk, 1, __ATOMIC_RELAXED);
+  g_lastPushOkMs = millis();
+}
+
 // =================== post_pushplus_raw (从 PushItem payload 推) ===================
 static bool post_pushplus_raw(const char* payload, size_t len) {
-  bool wifiOk = (WiFi.status() == WL_CONNECTED);
-  bool ethOk  = (g_rndisUp && g_ethNetif != NULL);
+  if (WiFi.status() != WL_CONNECTED) return false;
 
-  if (wifiOk) {
-    esp_http_client_config_t cfg = {};
-    cfg.url = PUSHPLUS_URL;
-    cfg.method = HTTP_METHOD_POST;
-    cfg.timeout_ms = 5000;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-    if (!cli) return false;
-    esp_http_client_set_header(cli, "Content-Type", "application/json");
-    esp_http_client_set_post_field(cli, payload, len);
-    esp_err_t err = esp_http_client_perform(cli);
-    int code = (err == ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
-    char resp[256] = {0};
-    if (err == ESP_OK) {
-      int r = esp_http_client_read_response(cli, resp, sizeof(resp)-1);
-      if (r > 0) resp[r] = 0;
-    }
-    esp_http_client_cleanup(cli);
-    ESP_LOGI(TAG, "Push(WiFi) code=%d resp=%.120s", code, resp);
-    if (code == 200) return true;
+  esp_http_client_config_t cfg = {};
+  cfg.url = PUSHPLUS_URL;
+  cfg.method = HTTP_METHOD_POST;
+  cfg.timeout_ms = 5000;
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+  if (!cli) return false;
+  esp_http_client_set_header(cli, "Content-Type", "application/json");
+  esp_http_client_set_post_field(cli, payload, len);
+  esp_err_t err = esp_http_client_perform(cli);
+  int code = (err == ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
+  char resp[256] = {0};
+  if (err == ESP_OK) {
+    int r = esp_http_client_read_response(cli, resp, sizeof(resp)-1);
+    if (r > 0) resp[r] = 0;
   }
-
-  if (ethOk) {
-    // RNDIS 推送: 4G 已经 dial up, 系统走 default route 出去
-    // 简化: 不绑 if_name, 走 default route 让 lwip 选
-    esp_http_client_config_t cfg = {};
-    cfg.url = PUSHPLUS_URL;
-    cfg.method = HTTP_METHOD_POST;
-    cfg.timeout_ms = 8000;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-    if (!cli) { g_rndisFails++; return false; }
-    esp_http_client_set_header(cli, "Content-Type", "application/json");
-    esp_http_client_set_post_field(cli, payload, len);
-    esp_err_t err = esp_http_client_perform(cli);
-    int code = (err == ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
-    char resp[256] = {0};
-    if (err == ESP_OK) {
-      int r = esp_http_client_read_response(cli, resp, sizeof(resp)-1);
-      if (r > 0) resp[r] = 0;
-    }
-    esp_http_client_cleanup(cli);
-    ESP_LOGI(TAG, "Push(4G) code=%d resp=%.120s", code, resp);
-    if (code == 200) {
-      g_rndisFails = 0;
-      return true;
-    }
-    g_rndisFails++;
-  }
-
-  return false;
+  esp_http_client_cleanup(cli);
+  ESP_LOGI(TAG, "Push(WiFi) code=%d resp=%.120s", code, resp);
+  return (code == 200);
 }
 
 // =================== 开机上线通知 ===================
@@ -748,7 +726,7 @@ static void push_boot_notification() {
   int code = (err == ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
   esp_http_client_cleanup(cli);
   ESP_LOGI(TAG, "Boot notification code=%d", code);
-  if (code == 200) __atomic_add_fetch(&g_pushOk, 1, __ATOMIC_RELAXED);
+  if (code == 200) push_success_inc();
 }
 
 // =================== NVS push 队列 ===================
@@ -817,6 +795,7 @@ static void sms_task(void* /*param*/) {
       }
       String phoneUtf8 = decodePhoneField(String(msg.phone_hex));
       String bodyUtf8  = decodeBodyField(String(msg.body_hex));
+      g_lastSmsMs = millis();
       ESP_LOGI(TAG, "SMS: phone=%s body=%.120s", phoneUtf8.c_str(), bodyUtf8.c_str());
       ESP_LOGI(TAG, "SMS: body_raw=%.200s body_len=%u", msg.body_hex, (unsigned)strlen(msg.body_hex));
       // 诊断: 把解码出的每个字符的 codepoint 列出来
@@ -910,11 +889,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
   }
 }
 
-// =================== RNDIS 4G 拨号 (v4.0 暂禁) ===================
-// 留空: iot_eth 0.1.x 的 stack_input 没填好会 NULL deref panic
-// 4G 仅作 SMS 接收;推送走 WiFi。RNDIS 拨号长期搁置,SDK 栈不稳。
-static bool rndis_init() { return false; }
-
 // =================== ping 健康 ===================
 struct PingCtx { SemaphoreHandle_t done; bool ok; };
 static void ping_on_end(esp_ping_handle_t hdl, void* args) {
@@ -977,24 +951,37 @@ h1{font-size:20px}.row{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}
 .tag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:12px}
 .tag-ok{background:#dfd;color:#282}.tag-bad{background:#fdd;color:#822}
 </style></head><body>
-<h1>SMS Forwarder <span class=tag>FW v4.0.2</span></h1>
+<h1>SMS Forwarder <span class=tag>FW v4.0.3</span></h1>
 <div class=row>
   <div class=card><h3>运行</h3>
     <div class=kv><b>Boot</b><span id=boot>0</span></div>
-    <div class=kv><b>WiFi</b><span id=wifi class=tag-bad>off</span></div>
-    <div class=kv><b>4G</b><span id=rndis class=tag-bad>off</span></div>
-    <div class=kv><b>4G 失败</b><span id=rnf>0</span></div>
+    <div class=kv><b>WiFi</b><span id=wifi class=tag-bad>off</span><span id=rssi></span></div>
+    <div class=kv><b>4G</b><span id=ml class=tag-bad>off</span></div>
+    <div class=kv><b>UDH</b><span id=udh>0</span></div>
   </div>
   <div class=card><h3>推送</h3>
     <div class=kv><b>成功</b><span id=ok>0</span></div>
     <div class=kv><b>失败</b><span id=fal>0</span></div>
     <div class=kv><b>队列</b><span id=q>0</span></div>
+    <div class=kv><b>上次推</b><span id=lp>-</span></div>
+    <div class=kv><b>上次信</b><span id=ls>-</span></div>
+  </div>
+  <div class=card><h3>系统</h3>
+    <div class=kv><b>Heap</b><span id=heap>0</span></div>
+    <div class=kv><b>Min</b><span id=heapMin>0</span></div>
   </div>
 </div>
 <a class=btn href=/update>OTA 升级</a>
 <a class=btn href=/restart style=background:#888>重启</a>
 <p><small>30s 自动刷新</small></p>
 <script>
+function ago(ms) {
+  if (!ms) return '-';
+  let s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm';
+  return Math.floor(s/3600) + 'h';
+}
 async function poll() {
   let r = await fetch('/api/status'); if (!r.ok) return;
   let j = await r.json();
@@ -1002,11 +989,16 @@ async function poll() {
   ok.textContent = j.pushOk;
   fal.textContent = j.pushFail;
   q.textContent = j.qLen;
-  rnf.textContent = j.rndisFails;
   wifi.textContent = j.wifi ? 'on' : 'off';
   wifi.className = 'tag ' + (j.wifi ? 'tag-ok' : 'tag-bad');
-  rndis.textContent = j.rndis ? 'on' : 'off';
-  rndis.className = 'tag ' + (j.rndis ? 'tag-ok' : 'tag-bad');
+  rssi.textContent = j.wifi && j.wifiRssi ? ' (' + j.wifiRssi + 'dBm)' : '';
+  ml.textContent = j.mlAlive ? 'on' : 'off';
+  ml.className = 'tag ' + (j.mlAlive ? 'tag-ok' : 'tag-bad');
+  udh.textContent = j.udhActive + '/4';
+  lp.textContent = ago(j.lastPushOkMs) + '前';
+  ls.textContent = ago(j.lastSmsMs) + '前';
+  heap.textContent = Math.round(j.freeHeap/1024) + 'K';
+  heapMin.textContent = Math.round(j.minFreeHeap/1024) + 'K';
 }
 poll(); setInterval(poll, 30000);
 </script></body></html>
@@ -1017,14 +1009,22 @@ static void handleApiStatus(AsyncWebServerRequest* r) {
   p.begin("pqueue", true);
   uint8_t count = p.getUChar("count", 0);
   p.end();
+  // 活跃 UDH slot 数
+  int udhActive = 0;
+  for (int i = 0; i < MAX_UDH_REFS; i++) if (g_udhTable[i].in_use) udhActive++;
   JsonDocument doc;
   doc["boot"]        = g_bootCount;
   doc["pushOk"]      = g_pushOk;
   doc["pushFail"]    = g_pushFail;
   doc["qLen"]        = count;
   doc["wifi"]        = g_wifiUp;
-  doc["rndis"]       = g_rndisUp;
-  doc["rndisFails"]  = g_rndisFails;
+  doc["wifiRssi"]    = g_wifiUp ? WiFi.RSSI() : 0;
+  doc["freeHeap"]    = esp_get_free_heap_size();
+  doc["minFreeHeap"] = esp_get_minimum_free_heap_size();
+  doc["lastSmsMs"]   = g_lastSmsMs;
+  doc["lastPushOkMs"]= g_lastPushOkMs;
+  doc["mlAlive"]     = g_ml.alive;
+  doc["udhActive"]   = udhActive;
   doc["fw"]          = FW_VERSION;
   String out; serializeJson(doc, out);
   r->send(200, "application/json", out);
@@ -1108,7 +1108,7 @@ static void net_task(void* /*param*/) {
     if (xQueueReceive(g_pushQ, &item, pdMS_TO_TICKS(1000)) == pdTRUE) {
       if (ap_mode_get()) continue;
       if (post_pushplus_raw(item.payload, item.len)) {
-        __atomic_add_fetch(&g_pushOk, 1, __ATOMIC_RELAXED);
+        push_success_inc();
       } else {
         __atomic_add_fetch(&g_pushFail, 1, __ATOMIC_RELAXED);
         nvsQEnqueue(item.payload, item.len);
@@ -1119,13 +1119,8 @@ static void net_task(void* /*param*/) {
       lastDrain = millis();
     }
     if (millis() - lastPing > (g_wifiUp ? 5000 : 30000)) {
-      if (g_wifiUp || g_rndisUp) {
-        if (g_rndisFails > 3) {
-          g_rndisUp = false;
-          ESP_LOGW(TAG, "RNDIS melt — cooldown 30s");
-        } else {
-          ping_target("223.5.5.5", 2000);
-        }
+      if (g_wifiUp) {
+        ping_target("223.5.5.5", 2000);
       }
       lastPing = millis();
     }
@@ -1410,11 +1405,7 @@ void setup() {
       ESP_LOGE(TAG, "Modem AT init failed");
     } else {
       g_ml.alive = true;
-      // v4.0: 暂不启用 RNDIS (iot_eth 0.1.x stack_input 没接好会 NULL deref)
-      // if (rndis_init()) {
-      //   ESP_LOGI(TAG, "4G netif up — push will fall back to 4G if WiFi down");
-      // }
-      ESP_LOGI(TAG, "Modem ready (RNDIS disabled in v4.0)");
+      ESP_LOGI(TAG, "Modem ready (4G for SMS only, push over WiFi)");
     }
   }
 

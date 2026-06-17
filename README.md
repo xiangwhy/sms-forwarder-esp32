@@ -43,7 +43,7 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 - ✅ **3 LED 状态** — 4G / WiFi / NET
 - ✅ **长短信 UDH 拼接** — 2 段拼接 (泰文/中文/英文), ref/total/seq 正确解析
 - ✅ **phone 短号显示** — 纯数字短号 (如 10086910) 不再误判 UCS2 hex 乱码
-- ❌ **RNDIS 4G 上网** — 长期搁置(SDK 栈不稳,仅 SMS 接收)
+- ❌ **RNDIS 4G 上网** — v4.0.3 已移除死代码(SDK 栈不稳,iot_eth 0.1.x stack_input NULL deref)。4G 仍接 USB CDC 用于收 SMS,推送只走 WiFi
 - ❌ **ArduinoOTA** — 用 web OTA 替代
 
 ## 文档
@@ -55,7 +55,7 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 ## 硬件
 
 - ESP32-S3 DevKitC-1 (8MB flash)
-- ML307 4G 模组 (USB CDC + RNDIS)
+- ML307 4G 模组 (USB CDC,仅 SMS 接收)
 - USB 线一条
 
 ## 烧录下载

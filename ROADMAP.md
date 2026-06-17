@@ -26,7 +26,7 @@ v4.0.2 已发布 (2026-06-13)。
 ## 翔哥立刻能做的
 
 v4.0.2 长短信够用, **不用急开新版本**。如果某天:
-- WiFi 挂想用 4G 推送 → 提 issue (但 RNDIS SDK 仍不稳,大概率要换 esp_eth)
+- WiFi 挂想用 4G 推送 → 提 issue。v4.0.3 已删 RNDIS 死路径,**走 esp_eth 重做 RNDIS** 或换模组(WiFi 永断场景才能补)
 - 收到 4 段以上长短信仍异常 → 提 issue, 我们查 UDH slot
 - 想要其他 push 通道 / 关键词过滤 / MQTT → 提 issue, 我们加
 
