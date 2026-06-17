@@ -181,27 +181,4 @@ size_t decode_7bit_packed(const char* hex, size_t hexLen, size_t numChars,
   return pos;
 }
 
-bool is_valid_7bit(const char* hex, size_t hexLen, size_t numChars) {
-  // 解一次, 看结果的 char 分布
-  char buf[1024];
-  size_t n = decode_7bit_packed(hex, hexLen, numChars, buf, sizeof(buf) - 1);
-  if (n == 0) return false;
-  // 0 结尾保证 sniff 安全
-  if (n < sizeof(buf)) buf[n] = 0;
-  int suspicious = 0;
-  for (size_t i = 0; i < n; i++) {
-    uint8_t c = (uint8_t)buf[i];
-    if (c == 0) {
-      suspicious++;            // NUL: 7-bit 表里只有 0x00='@' (合法), 多次连续 NUL 高度可疑
-    } else if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') {
-      suspicious++;            // 其他控制字符 (除常见空白)
-    } else if (c >= 0x80 && c < 0xC0) {
-      suspicious++;            // UTF-8 续字节 (0x80-0xBF) 单独出现, 不是合法 lead
-    }
-  }
-  // 容差 25% — 短消息 "OTP 123456" 全可打印 = 0% 可疑;
-  // 误把 UCS-2 当 7-bit 通常 50%+ 可疑 (大量 NUL + 控制字符)
-  return suspicious * 4 < (int)n;
-}
-
 }  // namespace pdu

@@ -793,40 +793,36 @@ static void sms_task(void* /*param*/) {
       char phoneBuf[64], bodyBuf[AT_LINE_BUF];
       size_t phoneN = pdu::decode_phone_field(msg.phone_hex, strnlen(msg.phone_hex, sizeof(msg.phone_hex)),
                                               phoneBuf, sizeof(phoneBuf));
-      // 编码自动检测: DCS 优先 (3GPP TS 23.038 §4), 缺失时按 cmt_length vs bodyBytes 启发
-      // - DCS 0 / 4 / 5 / 0x10 / 0xF0..0xF3 / 0xF5: GSM 7-bit packed
-      // - DCS 1 / 0xF4 / 0xF6: 8-bit data (raw bytes, 非文本)
-      // - DCS 8 / 0xF8: UCS-2 (BE)
-      // - DCS 0x1F (mobile-determined) 或 0xFF (未知): 启发
+      // 编码自动检测: DCS 优先 (3GPP TS 23.038 §4 + Wikipedia Data Coding Scheme)
+      // 7-bit (含 flash/ME/SIM/TE class): 0x00-0x03, 0x10-0x13, 0xF0-0xF3, 0xF8-0xFB
+      // 8-bit raw:                          0x04-0x07, 0x14-0x17, 0xF4-0xF7, 0xFC-0xFF
+      // UCS-2:                              0x08-0x0B, 0x18-0x1B
+      // reserved (启发):                    0x0C-0x0F, 0x1C-0x1F
+      // 启发原则: 严格匹配 → 7-bit (bodyBytes ≈ cmt_len*7/8 ±2), 其他默认 UCS-2
+      //   默认 UCS-2 防止 DCS=0xFF/未知 + 中英混排短信被误判 7-bit → 乱码
       size_t bodyHexLen = strnlen(msg.body_hex, sizeof(msg.body_hex));
       size_t bodyBytes  = bodyHexLen / 2;
-      bool is7bit = false;
-      bool is8bitData = false;
-      if (msg.dcs == 8 || msg.dcs == 0xF8) {
-        is7bit = false;
-      } else if (msg.dcs == 0  || msg.dcs == 4 || msg.dcs == 5 ||
-                 msg.dcs == 16 || msg.dcs == 0xF0 || msg.dcs == 0xF1 ||
-                 msg.dcs == 0xF2 || msg.dcs == 0xF3 || msg.dcs == 0xF5) {
-        is7bit = true;
-      } else if (msg.dcs == 1 || msg.dcs == 0xF4 || msg.dcs == 0xF6) {
-        is8bitData = true;  // 8-bit raw, 走 decode_body_field 字符级扫描当 hex 原样输出
-      } else {
-        // DCS=0xFF (未知) / 0x1F (mobile-determined) → 启发
-        if (msg.cmt_length > 0 && msg.cmt_length * 2 == bodyBytes) {
-          is7bit = false;  // bodyBytes == cmt_len*2 → UCS-2
-        } else if (msg.cmt_length > 0) {
-          // 7-bit 时 bodyBytes ≈ cmt_len*7/8; ±2 容差 (UDH overhead)
+      auto dcs7 = [](uint16_t d){
+        return (d<=0x03) || (d>=0x10&&d<=0x13) || (d>=0xF0&&d<=0xF3) || (d>=0xF8&&d<=0xFB);
+      };
+      auto dcs8 = [](uint16_t d){
+        return (d>=0x04&&d<=0x07) || (d>=0x14&&d<=0x17) || (d>=0xF4&&d<=0xF7) || (d>=0xFC&&d<=0xFF);
+      };
+      bool is7bit = dcs7(msg.dcs);
+      bool is8bitData = !is7bit && dcs8(msg.dcs);
+      if (!is7bit && !is8bitData) {
+        // UCS-2 / reserved / 未知 → 启发, 默认 UCS-2 (更安全)
+        if (msg.cmt_length > 0) {
+          // 7-bit: bodyBytes ≈ cmt_len*7/8 ±2
           size_t expect = (msg.cmt_length * 7 + 7) / 8;
           is7bit = (bodyBytes >= expect - 2 && bodyBytes <= expect + 2);
-        } else {
-          is7bit = false;  // 没线索默认 UCS-2 (旧行为)
         }
+        // else: cmt_length 不可信, 默认 UCS-2
       }
       size_t bodyN = 0;
       if (is7bit) {
         // 7-bit: numChars (user septets) 推导
         //   单 part (msg 直接从 queue 来的, body 含 UDH 头): user = cmt_length - 7
-        //     (UDHL=6/5 → 6 octets = 48 bits = 7 septets overhead)
         //   stash 出来的 concat msg: cmt_length = sum(per_part), 已是 user septets, 直接用
         //   cmt_length=0 (不可信): 用 bodyBytes 倒推
         size_t numChars = 0;
@@ -842,19 +838,20 @@ static void sms_task(void* /*param*/) {
                                         bodyBuf, sizeof(bodyBuf));
         ESP_LOGI(TAG, "SMS: 7-bit decode (dcs=%u cmt_len=%u bodyBytes=%u → numChars=%u bodyN=%u)",
                  msg.dcs, msg.cmt_length, (unsigned)bodyBytes, (unsigned)numChars, (unsigned)bodyN);
-        // sniff: 解码结果含过多 NUL/控制字符/孤立 UTF-8 续字节 → 大概率不是 7-bit, fallback UCS-2
-        if (bodyN > 0 && !pdu::is_valid_7bit(msg.body_hex, bodyHexLen, numChars)) {
-          ESP_LOGW(TAG, "SMS: 7-bit decode looks invalid, fallback UCS-2");
-          bodyN = pdu::decode_body_field(msg.body_hex, bodyHexLen, bodyBuf, sizeof(bodyBuf));
-          is7bit = false;
-        }
       } else if (is8bitData) {
-        // 8-bit raw (DCS=1): 把 hex 当 raw bytes 写出, 不当 UCS-2 解
+        // 8-bit raw: hex → raw bytes, 跳过非 hex 字符
         ESP_LOGI(TAG, "SMS: 8-bit data (dcs=%u cmt_len=%u bodyBytes=%u)", msg.dcs, msg.cmt_length, (unsigned)bodyBytes);
         bodyN = 0;
         for (size_t i = 0; i + 1 < bodyHexLen && bodyN < sizeof(bodyBuf) - 1; i += 2) {
-          char h[3] = { msg.body_hex[i], msg.body_hex[i+1], 0 };
-          bodyBuf[bodyN++] = (char)strtol(h, nullptr, 16);
+          char h0 = msg.body_hex[i], h1 = msg.body_hex[i+1];
+          auto isH = [](char c){
+            return (c>='0'&&c<='9')||(c>='A'&&c<='F')||(c>='a'&&c<='f');
+          };
+          if (!isH(h0) || !isH(h1)) continue;  // 非 hex 跳过 (防 CR/LF/空段污染)
+          auto v = [](char c)->uint8_t{
+            return (c<='9')?(c-'0'):((c<='F')?(c-'A'+10):(c-'a'+10));
+          };
+          bodyBuf[bodyN++] = (char)((v(h0) << 4) | v(h1));
         }
       } else {
         bodyN = pdu::decode_body_field(msg.body_hex, bodyHexLen, bodyBuf, sizeof(bodyBuf));

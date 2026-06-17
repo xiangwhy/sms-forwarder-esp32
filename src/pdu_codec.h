@@ -42,10 +42,4 @@ bool parse_udh(const char* line, int& refId, int& total, int& seq);
 size_t decode_7bit_packed(const char* hex, size_t hexLen, size_t numChars,
                          char* out, size_t outLen);
 
-// 7-bit 解码合理性 sniff (避免误把 UCS-2 当 7-bit 解出乱码)
-// 解一次 7-bit, 看结果是否含过多 NUL / 异常控制字符 / 非法 UTF-8 lead
-//   可疑: NUL (0x00), 控制字符 (除 \n \r \t), 0x80-0xBF 单独出现 (UTF-8 续字节当 lead)
-// 返回 true = 结果像是合法 7-bit packed, false = 大概率不是 7-bit, 应 fallback UCS-2
-bool is_valid_7bit(const char* hex, size_t hexLen, size_t numChars);
-
 }  // namespace pdu

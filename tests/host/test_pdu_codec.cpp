@@ -199,27 +199,6 @@ static void test_7bit_user_real_long_msg() {
   CHECK_EQ_STR(std::string(buf, n), expected);
 }
 
-static void test_is_valid_7bit_true() {
-  g_current = "is_valid_7bit: 真 7-bit 'Test123' → true (sniff 通过)";
-  // 复用 test_7bit_multichar 的数据, 期望 sniff 认为合法
-  CHECK(pdu::is_valid_7bit("D4F29C1E93CD00", 14, 7));
-}
-
-static void test_is_valid_7bit_false_ucs2_as_7bit() {
-  g_current = "is_valid_7bit: UCS-2 hex 当 7-bit 解 → false (触发 fallback UCS-2)";
-  // 模拟用户新短 SMS (UCS-2 编码 "宇\n..."): hex 含 0x00 0x0A 等控制字符
-  //   "5B87 000A" = "宇\n" 真实 UCS-2; 当 7-bit 解 (6 septets) 会出控制字符
-  //   期望 sniff fail, 主流程降级走 UCS-2 解码
-  CHECK(!pdu::is_valid_7bit("5B87000A0011", 12, 6));
-}
-
-static void test_is_valid_7bit_false_dense_controls() {
-  g_current = "is_valid_7bit: 全 0x01 hex → false (解出 £ 等控制区字符过多)";
-  // 0x01 septet (GSM7 table[1] = £, [2] = $, [0x0A] = LF 等), 4 字节全 0x01 时
-  //   bit 7 上溢会产生孤立 0x80-0xBF → sniff 标为可疑
-  CHECK(!pdu::is_valid_7bit("01010101", 8, 4));
-}
-
 int main() {
   std::printf("============================================================\n");
   std::printf("pdu_codec host test\n");
@@ -248,11 +227,6 @@ int main() {
   test_7bit_ascii_roundtrip();
   test_7bit_multichar();
   test_7bit_user_real_long_msg();
-
-  // 7-bit sniff (误判 UCS-2 当 7-bit → fallback)
-  test_is_valid_7bit_true();
-  test_is_valid_7bit_false_ucs2_as_7bit();
-  test_is_valid_7bit_false_dense_controls();
 
   std::printf("============================================================\n");
   std::printf("Result: %d passed, %d failed\n", g_pass, g_fail);
