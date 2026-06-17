@@ -173,6 +173,34 @@ static void test_7bit_multichar() {
   CHECK_EQ_STR(std::string(buf, n), "Test123");
 }
 
+static void test_is_strict_utf8_true_ascii() {
+  g_current = "is_strict_utf8: 纯 ASCII 'Hello' → true";
+  CHECK(pdu::is_strict_utf8("Hello", 5));
+}
+
+static void test_is_strict_utf8_true_gsm7_extended() {
+  g_current = "is_strict_utf8: GSM7 扩展 (ÄÖü 都是 2-byte UTF-8) → true";
+  // "Test123" 全 ASCII, decode 出来都是 1-byte → 合法
+  char buf[16];
+  size_t n = pdu::decode_7bit_packed("D4F29C1E93CD00", 14, 7, buf, sizeof(buf));
+  CHECK(pdu::is_strict_utf8(buf, n));
+}
+
+static void test_is_strict_utf8_false_lone_continuation() {
+  g_current = "is_strict_utf8: lone continuation (0x80 0x41) → false";
+  // 0x80 是 lone UTF-8 continuation byte, 后面 0x41 是 ASCII
+  // 严格校验应拒绝
+  char buf[2] = { (char)0x80, 'A' };
+  CHECK(!pdu::is_strict_utf8(buf, 2));
+}
+
+static void test_is_strict_utf8_false_4byte_lead() {
+  g_current = "is_strict_utf8: 4-byte UTF-8 lead (0xF0) → false (UCS-2 不应出)";
+  // 0xF0 是 4-byte UTF-8 lead (UCS-4 / emoji), UCS-2 不应有
+  char buf[4] = { (char)0xF0, (char)0x90, (char)0x80, (char)0x80 };
+  CHECK(!pdu::is_strict_utf8(buf, 4));
+}
+
 static void test_7bit_user_real_long_msg() {
   g_current = "decode_7bit_packed: 用户真车长 OTP (138 字节 / 158 septets) → 'Keep this code...23:20.'";
   // Part 1 UDH-stripped body (119 字节) + Part 2 UDH-stripped body (20 字节) = 139 字节
@@ -227,6 +255,12 @@ int main() {
   test_7bit_ascii_roundtrip();
   test_7bit_multichar();
   test_7bit_user_real_long_msg();
+
+  // UTF-8 strict (DCS=0 但实际 UCS-2 的兜底)
+  test_is_strict_utf8_true_ascii();
+  test_is_strict_utf8_true_gsm7_extended();
+  test_is_strict_utf8_false_lone_continuation();
+  test_is_strict_utf8_false_4byte_lead();
 
   std::printf("============================================================\n");
   std::printf("Result: %d passed, %d failed\n", g_pass, g_fail);

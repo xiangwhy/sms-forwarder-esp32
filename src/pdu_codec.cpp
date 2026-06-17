@@ -181,4 +181,24 @@ size_t decode_7bit_packed(const char* hex, size_t hexLen, size_t numChars,
   return pos;
 }
 
+bool is_strict_utf8(const char* buf, size_t n) {
+  size_t i = 0;
+  while (i < n) {
+    uint8_t c = (uint8_t)buf[i];
+    int extra = 0;
+    if (c < 0x80)       { extra = 0; }                     // 1-byte ASCII
+    else if (c < 0xC0)  { return false; }                 // lone continuation
+    else if (c < 0xE0)  { extra = 1; }                    // 2-byte (BMP 0x80-0x7FF)
+    else if (c < 0xF0)  { extra = 2; }                    // 3-byte (BMP 0x800-0xFFFF)
+    else                { return false; }                 // 4+ byte (UCS-2 不应出现)
+    i++;
+    while (extra-- > 0) {
+      if (i >= n) return false;
+      if (((uint8_t)buf[i] & 0xC0) != 0x80) return false;
+      i++;
+    }
+  }
+  return true;
+}
+
 }  // namespace pdu

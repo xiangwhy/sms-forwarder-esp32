@@ -42,4 +42,9 @@ bool parse_udh(const char* line, int& refId, int& total, int& seq);
 size_t decode_7bit_packed(const char* hex, size_t hexLen, size_t numChars,
                          char* out, size_t outLen);
 
+// 严格 UTF-8 校验 — 合法 GSM7 decode 输出必合法 UTF-8
+// DCS=0 但实际是 UCS-2 (gateway 标错, 如泰文 0E23...) 当 7-bit 解会出无效 UTF-8
+// 返回 true = buf 是合法 UTF-8, false = 大概率不是合法 7-bit 输出, 应 fallback UCS-2
+bool is_strict_utf8(const char* buf, size_t n);
+
 }  // namespace pdu

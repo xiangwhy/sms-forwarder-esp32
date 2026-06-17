@@ -55,8 +55,9 @@ static const char* TAG_USB = "USBH";
 
 #define G4_PWR_GPIO        8
 #define BOOT_BUTTON_PIN    0
-#define BOOT_HOLD_MS       15000   // 长按 15s 才 wipe (避免 5s 误触)
+#define BOOT_HOLD_MS       60000   // 长按 60s 才 wipe (避免 GPIO0 抖动 / 浮空误触发)
 #define BOOT_GRACE_MS      30000   // 启动后 30s 不响应 BOOT (避开 GPIO0 strapping 抖动)
+#define BOOT_DEBOUNCE_N    5       // 连续 5 个 100ms 采样 = 500ms 才算真按下
 
 #define AP_SSID_PREFIX     "SMS-Forwarder-"
 #define AP_PASSWORD        "12345678"
@@ -838,6 +839,14 @@ static void sms_task(void* /*param*/) {
                                         bodyBuf, sizeof(bodyBuf));
         ESP_LOGI(TAG, "SMS: 7-bit decode (dcs=%u cmt_len=%u bodyBytes=%u → numChars=%u bodyN=%u)",
                  msg.dcs, msg.cmt_length, (unsigned)bodyBytes, (unsigned)numChars, (unsigned)bodyN);
+        // 兜底: GSM7 decode 输出必须是合法 UTF-8
+        // DCS=0 但实际 UCS-2 (gateway 标错, 泰文 0E23...) 当 7-bit 解会出无效 UTF-8
+        // (含 lone continuation / 4+ byte sequence) → fallback UCS-2
+        if (bodyN > 0 && !pdu::is_strict_utf8(bodyBuf, bodyN)) {
+          ESP_LOGW(TAG, "SMS: 7-bit decode not strict UTF-8, fallback UCS-2");
+          bodyN = pdu::decode_body_field(msg.body_hex, bodyHexLen, bodyBuf, sizeof(bodyBuf));
+          is7bit = false;
+        }
       } else if (is8bitData) {
         // 8-bit raw: hex → raw bytes, 跳过非 hex 字符
         ESP_LOGI(TAG, "SMS: 8-bit data (dcs=%u cmt_len=%u bodyBytes=%u)", msg.dcs, msg.cmt_length, (unsigned)bodyBytes);
@@ -1284,11 +1293,13 @@ static void start_ap_mode() {
 }
 
 // =================== BOOT 按钮长按 → 清 NVS ===================
-// 防误触策略 (v4.0.4 patch):
+// 防误触策略 (v4.0.4 patch, v4.0.5 调严):
 //   1. 启动后 30s grace: 忽略 BOOT (避开 ESP32-S3 GPIO0 strapping 抖动)
-//   2. 长按 15s: 5s 太容易误触 (USB 插拔 / 静电 / 浮空) 触发 wipe
-//   3. 二次确认: 按到 7s 时 LED 快闪 1s, 提示用户再继续按才算 wipe
-//   4. cfg 已空: 不重复 wipe (避免无意义 reboot loop)
+//   2. 防抖 BOOT_DEBOUNCE_N=5: 连续 5 个 100ms 采样 = 500ms 才算按下
+//      (v4.0.4 实测有 GPIO0 持续低情况 → 15s hold 触发 → 死循环, 60s + 防抖后才稳定)
+//   3. 长按 60s: 旧 5s 太容易误触, 旧 15s 仍会被 GPIO0 抖动触发, 60s 给足够余量
+//   4. cfg 是 hardcoded 默认值 → 完全 disable BOOT 检测 (避免 GPIO0 卡死循环)
+//      用户通过 web 改 cfg → 重启后 BOOT 检测自动恢复
 static void boot_button_task(void* /*param*/) {
   gpio_config_t io = { .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
                        .mode = GPIO_MODE_INPUT,
@@ -1299,8 +1310,28 @@ static void boot_button_task(void* /*param*/) {
   const uint32_t started = millis();
   uint32_t pressedAt = 0;
   bool warnedAt7s = false;  // LED 闪一下
+  int lowCount = 0;          // 防抖计数器
+  static bool bootDisabled = false;  // cfg hardcoded 时禁用 BOOT
   for (;;) {
-    bool low = (gpio_get_level((gpio_num_t)BOOT_BUTTON_PIN) == 0);
+    // 检测 cfg 是否仍是 hardcoded 默认值, 是则禁用 BOOT 防死循环
+    bool cfgIsHardcoded = (strcmp(g_cfg.ssid, "REDACTED_SSID") == 0 &&
+                           strcmp(g_cfg.otaUser, "admin") == 0);
+    if (cfgIsHardcoded) {
+      if (!bootDisabled) {
+        ESP_LOGW(TAG, "BOOT disabled: cfg matches hardcoded default (avoid GPIO0 卡死 loop)");
+        bootDisabled = true;
+      }
+      pressedAt = 0;
+      lowCount = 0;
+      warnedAt7s = false;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+    bootDisabled = false;  // cfg 改了, 重新启用 BOOT 检测
+    bool rawLow = (gpio_get_level((gpio_num_t)BOOT_BUTTON_PIN) == 0);
+    if (rawLow) lowCount++;
+    else        lowCount = 0;
+    bool low = (lowCount >= BOOT_DEBOUNCE_N);  // 真按下: 连续 500ms 低
     if (millis() - started < BOOT_GRACE_MS) {
       pressedAt = 0;  // grace 内不计时
       warnedAt7s = false;
@@ -1308,6 +1339,7 @@ static void boot_button_task(void* /*param*/) {
       if (pressedAt == 0) {
         pressedAt = millis();
         warnedAt7s = false;
+        ESP_LOGW(TAG, "BOOT pressed (debounced), start counting to %ums", BOOT_HOLD_MS);
       }
       uint32_t held = millis() - pressedAt;
       // 7s 闪一下提示用户 (二次确认点)
@@ -1318,7 +1350,7 @@ static void boot_button_task(void* /*param*/) {
       }
       if (held >= BOOT_HOLD_MS) {
         if (strlen(g_cfg.ssid) == 0) {
-          ESP_LOGW(TAG, "BOOT held %ums but cfg already empty — skip wipe, restart only", BOOT_HOLD_MS);
+          ESP_LOGW(TAG, "BOOT held %ums but cfg empty — skip wipe, restart only", BOOT_HOLD_MS);
         } else {
           ESP_LOGW(TAG, "BOOT held %ums — wiping NVS & rebooting", BOOT_HOLD_MS);
           wipeConfig();
