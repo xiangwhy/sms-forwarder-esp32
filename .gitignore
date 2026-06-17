@@ -20,3 +20,6 @@ src/main.cpp.v4.0
 # macOS
 .DS_Store
 *.swp
+
+# host test CMake build (tests/host/ 源码在, build 重新生成)
+tests/host/build/
