@@ -1,6 +1,10 @@
 # Name,   Type, SubType, Offset,  Size,    Flags
-# 8MB flash, dual-OTA. v4.0 不用 spiffs / coredump, 留小容量占位
-nvs,      data, nvs,     ,        0x6000,
-otadata,  data, ota,     ,        0x2000,
-app0,     app,  ota_0,   0x20000, 0x3D0000,
-app1,     app,  ota_1,   ,        0x3D0000,
+# v4.0.7 救砖 (真相): 板子是 ESP32-S3 + 8MB flash (efuse)
+#   esptool flash_id: "Detected flash size: 8MB"
+#   esptool chip_id : "ESP32-S3 (QFN56) + PSRAM 2MB"
+# 之前 8MB 自定义双 OTA 用 --flash_size 4MB 烧, bootloader 报 4MB 越界
+# 用 ESP32 官方 8MB 双 OTA 布局 (app0+app1 各 3.3MB)
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x330000,
+app1,     app,  ota_1,   0x340000,0x330000,

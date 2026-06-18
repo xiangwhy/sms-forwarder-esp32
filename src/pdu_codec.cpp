@@ -244,6 +244,166 @@ bool looks_like_ucs2_be(const char* hex, size_t hexLen) {
   return pairHits >= 4 && (hiHits * 100 / pairHits) >= 80;
 }
 
+// 从完整 PDU hex 跳过头部 (SCA + FO + OA + PID + DCS + SCTS + UDL), 返回 UD 起始 (hex 偏移)
+// *outUdByteLen: UD 字节数 (7-bit 按 ceil(UDL*7/8) 算, 8-bit/UCS-2 按 UDL 算)
+// 返回 0 = PDU 太短/格式错 (caller 兜底用全 body 当 UD)
+// 配套 sms_task 在 CMT 路径: msg.body_hex 是整条 PDU, decode 函数只该吃 UD
+size_t pdu_ud_offset(const char* hex, size_t hexLen, bool is7bit, size_t* outUdByteLen) {
+  if (outUdByteLen) *outUdByteLen = 0;
+  if (!hex || hexLen < 4 || !outUdByteLen) return 0;
+
+  auto isH = [](char c) -> bool {
+    return (c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f');
+  };
+  auto nib = [](char c) -> int {
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='A'&&c<='F') return c-'A'+10;
+    if (c>='a'&&c<='f') return c-'a'+10;
+    return -1;
+  };
+  // 读 1 byte (2 hex chars), 越界/非法 hex → -1
+  auto byte = [&](size_t pos) -> int {
+    if (pos + 2 > hexLen) return -1;
+    if (!isH(hex[pos]) || !isH(hex[pos+1])) return -1;
+    int hi = nib(hex[pos]), lo = nib(hex[pos+1]);
+    return (hi<<4) | lo;
+  };
+
+  // SCA length (1 byte) + SCA 数据 (scaLen bytes, 0..12)
+  int scaLen = byte(0);
+  if (scaLen < 0 || scaLen > 12) return 0;
+  size_t pos = 2 + (size_t)scaLen * 2;
+
+  // FO (1 byte)
+  if (byte(pos) < 0) return 0;
+  pos += 2;
+
+  // OA length (1 byte, in digits) + type (1 byte) + BCD (ceil(N/2) bytes)
+  int oaLen = byte(pos);
+  if (oaLen < 0 || oaLen > 20) return 0;
+  pos += 2;                              // length byte
+  pos += 2;                              // type byte
+  pos += ((oaLen + 1) / 2) * 2;         // BCD bytes, rounded up to hex char
+
+  // PID (1 byte) + DCS (1 byte) + SCTS (7 bytes)
+  if (pos + 2 + 2 + 14 > hexLen) return 0;
+  pos += 2;  // PID
+  pos += 2;  // DCS
+  pos += 14; // SCTS
+
+  // UDL (1 byte)
+  int udl = byte(pos);
+  if (udl < 0 || udl > 255) return 0;
+  pos += 2;
+
+  // UD 字节数
+  if (is7bit) {
+    *outUdByteLen = ((size_t)udl * 7 + 7) / 8;  // ceil(udl*7/8)
+  } else {
+    *outUdByteLen = (size_t)udl;
+  }
+
+  if (pos + *outUdByteLen * 2 > hexLen) return 0;  // UD 越界
+  return pos;
+}
+
+// 从完整 PDU hex 跳过 SCA + FO, 返回 OA 起始 (hex 偏移)
+// *outIsAlpha: true=TON=alphanumeric (GSM7 packed), false=numeric (BCD nibble swap)
+// *outValueOctets: OA value 段 octet 数
+// 返回 0 = PDU 太短/格式错
+size_t pdu_oa_offset(const char* hex, size_t hexLen, bool* outIsAlpha, size_t* outValueOctets) {
+  if (outIsAlpha) *outIsAlpha = false;
+  if (outValueOctets) *outValueOctets = 0;
+  if (!hex || hexLen < 4 || !outIsAlpha || !outValueOctets) return 0;
+
+  auto isH = [](char c) -> bool {
+    return (c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f');
+  };
+  auto nib = [](char c) -> int {
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='A'&&c<='F') return c-'A'+10;
+    if (c>='a'&&c<='f') return c-'a'+10;
+    return -1;
+  };
+  auto byte = [&](size_t pos) -> int {
+    if (pos + 2 > hexLen) return -1;
+    if (!isH(hex[pos]) || !isH(hex[pos+1])) return -1;
+    int hi = nib(hex[pos]), lo = nib(hex[pos+1]);
+    return (hi<<4) | lo;
+  };
+
+  // SCA length (1 byte) + SCA 数据 (scaLen bytes)
+  int scaLen = byte(0);
+  if (scaLen < 0 || scaLen > 12) return 0;
+  size_t pos = 2 + (size_t)scaLen * 2;
+
+  // FO (1 byte)
+  if (byte(pos) < 0) return 0;
+  pos += 2;
+
+  // OA length (1 byte, in digits/chars) + ToA (1 byte) + value (ceil(N/2) octets)
+  int oaLen = byte(pos);
+  if (oaLen < 0 || oaLen > 20) return 0;
+  pos += 2;  // length byte
+  int toa = byte(pos);
+  if (toa < 0) return 0;
+  pos += 2;  // ToA byte
+  size_t valueOctets = ((size_t)oaLen + 1) / 2;
+  if (pos + valueOctets * 2 > hexLen) return 0;
+  pos += valueOctets * 2;  // value
+
+  // 3GPP TS 23.040 §9.1.2.5 + 23.038 §4: TON bits = (toa >> 4) & 0x07
+  // 0b101 = alphanumeric (7-bit packed) — DTAC/AIS/Verify
+  // 其它 = numeric BCD nibble swap
+  *outIsAlpha = ((toa >> 4) & 0x07) == 0x05;
+  *outValueOctets = valueOctets;
+  return valueOctets > 0 ? pos - valueOctets * 2 : pos;  // 指向 OA value 起点 (skip length+ToA)
+}
+
+// GSM 7-bit packed (LSB-first) → UTF-8, 用于 OA alphanumeric sender
+// 不处理 0x1B escape extension (单字符 sender 通常不用, DTAC/AIS/Verify 都是 basic set)
+// 解出 nchars 个字符后, 自动 trim 末尾 GSM7 '@' (0x00 septet) — padding bits 必然为 0,
+// 真业务名 (DTAC/AIS/TRUE/Verify 等) 从不以 '@' 结尾, trim 安全
+size_t decode_gsm7_alpha_oa(const char* octets, size_t octetCount, size_t nchars,
+                            char* out, size_t outLen) {
+  if (!octets || !out || outLen == 0) return 0;
+  size_t pos = 0;
+  for (size_t i = 0; i < nchars; i++) {
+    // LSB-first 7-bit unpack: char i 占 bit 范围 [i*7, i*7+6]
+    uint8_t val = 0;
+    for (int b = 0; b < 7; b++) {
+      size_t bitPos = i * 7 + b;
+      size_t byteIdx = bitPos / 8;
+      if (byteIdx >= octetCount) break;  // 越界, 不读 (octets 是 raw bytes, 不能用 0 当哨兵)
+      size_t bitInByte = bitPos % 8;
+      uint8_t bit = (uint8_t)((octets[byteIdx] >> bitInByte) & 1);
+      val |= (uint8_t)(bit << b);
+    }
+    if (val == 0x1B) continue;  // extension escape — basic-only 简化跳过
+    if (val >= 128) continue;  // 越界 septet
+    uint16_t u = gsm7_default_to_unicode[val];
+    if (u == 0) continue;  // null
+    // write UTF-8
+    if (u < 0x80) {
+      if (pos + 1 > outLen) return pos;
+      out[pos++] = (char)u;
+    } else if (u < 0x800) {
+      if (pos + 2 > outLen) return pos;
+      out[pos++] = (char)(0xC0 | (u >> 6));
+      out[pos++] = (char)(0x80 | (u & 0x3F));
+    } else {
+      if (pos + 3 > outLen) return pos;
+      out[pos++] = (char)(0xE0 | (u >> 12));
+      out[pos++] = (char)(0x80 | ((u >> 6) & 0x3F));
+      out[pos++] = (char)(0x80 | (u & 0x3F));
+    }
+  }
+  // Trim 末尾 GSM7 '@' (0x40 = 0x00 septet) — padding bits=0 必然解出 '@', 业务名不会以 '@' 结尾
+  // 但保留至少 1 char, 避免 0 解
+  while (pos > 1 && pos < outLen && out[pos-1] == '@') pos--;
+  return pos;
+}
+
 // =================== 发送侧 (v4.0.6+) ===================
 
 int ucs2_encode(const char* utf8, char* ucs2_hex_out, size_t out_cap) {

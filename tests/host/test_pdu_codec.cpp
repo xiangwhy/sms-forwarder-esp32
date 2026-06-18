@@ -478,6 +478,559 @@ static void test_7bit_user_real_long_msg() {
   CHECK_EQ_STR(std::string(buf, n), expected);
 }
 
+// =================== v4.0.7 扩展: 常用解码边界 + roundtrip ===================
+// 目标: 把 11 个 public 函数的边界 (empty / 越界 / 特殊字符) 都覆盖一次
+// 烧板前 regression net
+
+// --- decode_phone_field 边界 ---
+static void test_phone_plus_prefix() {
+  g_current = "decode_phone_field: '+86138077107' → 原样 (+ 前缀, 12 字符)";
+  char buf[64];
+  size_t n = pdu::decode_phone_field("+86138077107", 12, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 12);
+  CHECK_EQ_STR(std::string(buf, n), "+86138077107");
+}
+
+static void test_phone_with_dash() {
+  g_current = "decode_phone_field: '138-0013-8000' → 原样 (含 -, 13 字符)";
+  char buf[64];
+  size_t n = pdu::decode_phone_field("138-0013-8000", 13, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 13);
+  CHECK_EQ_STR(std::string(buf, n), "138-0013-8000");
+}
+
+static void test_phone_pure_hex_returned_as_is() {
+  g_current = "decode_phone_field: 纯 hex '4F60597D' → 原样 (ASCII-safe 启发: 数字/字母都当原文, 不强行 UCS2 解)";
+  // 注意: 当前生产逻辑: 任一字符 ASCII-safe → 整段原文返回 (防短号 "10086910" 误判)
+  // 副作用: 纯 hex phone (网关错编码) 也会被当原文返回 (8 bytes), 不解 UCS2
+  // 这是已知 trade-off, 不算 bug
+  char buf[64];
+  size_t n = pdu::decode_phone_field("4F60597D", 8, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 8);
+  CHECK_EQ_STR(std::string(buf, n), "4F60597D");
+}
+
+static void test_phone_empty() {
+  g_current = "decode_phone_field: empty → 0 bytes";
+  char buf[64];
+  size_t n = pdu::decode_phone_field("", 0, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 0);
+}
+
+// --- decode_body_field 边界 ---
+static void test_body_pure_ascii() {
+  g_current = "decode_body_field: 纯 ASCII 'Hello World' → 原样 11 bytes (无 hex 触发)";
+  char buf[64];
+  size_t n = pdu::decode_body_field("Hello World", 11, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 11);
+  CHECK_EQ_STR(std::string(buf, n), "Hello World");
+}
+
+static void test_body_pure_ucs2() {
+  g_current = "decode_body_field: 纯 hex '4F60597D' → '你好' 6 bytes (4 hex × 2 codepoint → 2×3 UTF-8)";
+  char buf[64];
+  size_t n = pdu::decode_body_field("4F60597D", 8, buf, sizeof(buf));
+  const char exp[] = { (char)0xE4, (char)0xBD, (char)0xA0,
+                       (char)0xE5, (char)0xA5, (char)0xBD, 0 };
+  CHECK_EQ_INT(n, 6);
+  CHECK_EQ_STR(std::string(buf, n), std::string(exp));
+}
+
+static void test_body_5hex_odd_boundary() {
+  g_current = "decode_body_field: '4F605' (5 hex, 4+1 odd) → '你'(3) + '5'(1) = 4 bytes";
+  char buf[64];
+  size_t n = pdu::decode_body_field("4F605", 5, buf, sizeof(buf));
+  const char exp[] = { (char)0xE4, (char)0xBD, (char)0xA0, '5', 0 };
+  CHECK_EQ_INT(n, 4);
+  CHECK_EQ_STR(std::string(buf, n), std::string(exp));
+}
+
+static void test_body_empty() {
+  g_current = "decode_body_field: empty → 0 bytes";
+  char buf[64];
+  size_t n = pdu::decode_body_field("", 0, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 0);
+}
+
+// --- decode_7bit_packed 边界 ---
+static void test_7bit_special_chars() {
+  g_current = "decode_7bit_packed: '@£$' (GSM7 0x00 0x01 0x02) → '@'+U+00A3+'$' = 4 UTF-8 bytes";
+  // 7-bit packed LSB first: 0x80 0x80 0x00
+  // @=0x00=0000000, £=0x01=1000000 (LSB first), $=0x02=0100000
+  // byte 0 = s0(7) | s1[0] = 0|0|0|0|0|0|0 | 1 = 10000000 = 0x80
+  // byte 1 = s1[1..6] | s2[0..1] = 0|0|0|0|0|0 | 0|1 = 10000000 = 0x80
+  // byte 2 = s2[2..6] | pad = 0|0|0|0|0 | 0|0|0 = 0x00
+  char buf[16];
+  size_t n = pdu::decode_7bit_packed("808000", 6, 3, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 4);  // @(1) + £(2) + $(1)
+  const char exp[] = { '@', (char)0xC2, (char)0xA3, '$', 0 };
+  CHECK_EQ_STR(std::string(buf, n), std::string(exp));
+}
+
+static void test_7bit_extended_chars() {
+  g_current = "decode_7bit_packed: 'ÄÖÑ' (GSM7 0x5B 0x5C 0x5D) → 2-byte UTF-8 each (6 bytes)";
+  // GSM7: 0x5B=Ä(U+00C4→C3 84), 0x5C=Ö(U+00D6→C3 96), 0x5D=Ñ(U+00D1→C3 91)
+  // 7-bit packed (LSB first per septet):
+  //   s0=0x5B (binary 01011011) → LSB first: 1101101
+  //   s1=0x5C (binary 01011100) → LSB first: 0011101
+  //   s2=0x5D (binary 01011101) → LSB first: 1011101
+  // byte 0: s0(7 bits) + s1[0] = 1101101|0 = 0x5B
+  // byte 1: s1[1..6] + s2[0..1] = 0011101|1|0 = 0b01101110 = 0x6E
+  // byte 2: s2[2..6] + pad(3) = 10111|000 = 0b00010111 = 0x17
+  char buf[16];
+  size_t n = pdu::decode_7bit_packed("5B6E17", 6, 3, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 6);  // 3 chars × 2 bytes UTF-8
+  const char exp[] = { (char)0xC3, (char)0x84,
+                       (char)0xC3, (char)0x96,
+                       (char)0xC3, (char)0x91, 0 };
+  CHECK_EQ_STR(std::string(buf, n), std::string(exp));
+}
+
+// --- ucs2_hex_to_utf8 边界 ---
+static void test_ucs2_empty() {
+  g_current = "ucs2_hex_to_utf8: empty → 0 bytes";
+  char buf[16];
+  size_t n = pdu::ucs2_hex_to_utf8("", 0, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 0);
+}
+
+static void test_ucs2_single_codepoint() {
+  g_current = "ucs2_hex_to_utf8: '4F60' (单 codepoint 你) → 3 bytes E4 BD A0";
+  char buf[16];
+  size_t n = pdu::ucs2_hex_to_utf8("4F60", 4, buf, sizeof(buf));
+  const char exp[] = { (char)0xE4, (char)0xBD, (char)0xA0, 0 };
+  CHECK_EQ_INT(n, 3);
+  CHECK_EQ_STR(std::string(buf, n), std::string(exp));
+}
+
+static void test_ucs2_latin1_supplement() {
+  g_current = "ucs2_hex_to_utf8: '00E9' (Latin-1 é) → 2 bytes C3 A9";
+  char buf[16];
+  size_t n = pdu::ucs2_hex_to_utf8("00E9", 4, buf, sizeof(buf));
+  const char exp[] = { (char)0xC3, (char)0xA9, 0 };
+  CHECK_EQ_INT(n, 2);
+  CHECK_EQ_STR(std::string(buf, n), std::string(exp));
+}
+
+// --- parse_udh 边界 ---
+static void test_udh_empty() {
+  g_current = "parse_udh: empty → false";
+  int ref = 0, tot = 0, seq = 0;
+  CHECK(!pdu::parse_udh("", ref, tot, seq));
+}
+
+static void test_udh_invalid_total_zero() {
+  g_current = "parse_udh: total=0 (合法 [2,8]) → false";
+  int ref = 0, tot = 0, seq = 0;
+  // "05 00 03 2A 00 01" — total=0
+  CHECK(!pdu::parse_udh("0500032A0001", ref, tot, seq));
+}
+
+static void test_udh_invalid_total_nine() {
+  g_current = "parse_udh: total=9 (合法 [2,8]) → false";
+  int ref = 0, tot = 0, seq = 0;
+  // "05 00 03 2A 09 01" — total=9
+  CHECK(!pdu::parse_udh("0500032A0901", ref, tot, seq));
+}
+
+static void test_udh_invalid_seq_overflow() {
+  g_current = "parse_udh: seq=3, total=2 (seq > total) → false";
+  int ref = 0, tot = 0, seq = 0;
+  // "05 00 03 2A 02 03" — total=2, seq=3
+  CHECK(!pdu::parse_udh("0500032A0203", ref, tot, seq));
+}
+
+// --- is_strict_utf8 边界 ---
+static void test_is_strict_utf8_empty() {
+  g_current = "is_strict_utf8: empty → true (vacuous valid)";
+  CHECK(pdu::is_strict_utf8("", 0));
+}
+
+static void test_is_strict_utf8_cjk_3byte() {
+  g_current = "is_strict_utf8: CJK 3-byte UTF-8 (你 = E4 BD A0) → true";
+  char buf[3] = { (char)0xE4, (char)0xBD, (char)0xA0 };
+  CHECK(pdu::is_strict_utf8(buf, 3));
+}
+
+static void test_is_strict_utf8_euro_3byte() {
+  g_current = "is_strict_utf8: € 3-byte UTF-8 (E2 82 AC) → true";
+  char buf[3] = { (char)0xE2, (char)0x82, (char)0xAC };
+  CHECK(pdu::is_strict_utf8(buf, 3));
+}
+
+static void test_is_strict_utf8_truncated_2byte() {
+  g_current = "is_strict_utf8: 2-byte lead 缺 continuation (C3 41) → false";
+  char buf[2] = { (char)0xC3, 'A' };  // 0xC3 expects 1 continuation, got ASCII
+  CHECK(!pdu::is_strict_utf8(buf, 2));
+}
+
+// --- looks_like_ucs2_be 边界 ---
+static void test_looks_like_ucs2_odd_hex() {
+  g_current = "looks_like_ucs2_be: 奇数长度 hex (9) → false (UCS-2 必须偶字节)";
+  CHECK(!pdu::looks_like_ucs2_be("0E230E2B0E", 9));
+}
+
+static void test_looks_like_ucs2_single_pair() {
+  g_current = "looks_like_ucs2_be: 单 pair (1 UCS-2 char) → false (≥ 2 pairs 才算)";
+  CHECK(!pdu::looks_like_ucs2_be("0E230E2B", 8));
+}
+
+// --- ucs2_encode 边界 ---
+static void test_ucs2_encode_empty() {
+  g_current = "ucs2_encode: empty → 0 hex chars";
+  char out[16];
+  int n = pdu::ucs2_encode("", out, sizeof(out));
+  CHECK_EQ_INT(n, 0);
+  CHECK_EQ_STR(std::string(out), "");
+}
+
+static void test_ucs2_encode_single_ascii() {
+  g_current = "ucs2_encode: 'A' → '0041'";
+  char out[16];
+  int n = pdu::ucs2_encode("A", out, sizeof(out));
+  CHECK_EQ_INT(n, 4);
+  CHECK_EQ_STR(std::string(out), "0041");
+}
+
+// --- sms_split_for_send 边界 ---
+static void test_split_exactly_255() {
+  g_current = "sms_split_for_send: 70×255 chars → 255 (GSM 上限正好, 不超)";
+  pdu::SmsPart parts[300];
+  int n = pdu::sms_split_for_send(70 * 255, 70, parts, 300);
+  CHECK_EQ_INT(n, 255);
+  CHECK_EQ_INT(parts[0].len_chars, 70);
+  CHECK_EQ_INT(parts[254].offset_chars, 70 * 254);
+  CHECK_EQ_INT(parts[254].len_chars, 70);
+}
+
+// --- bcd_encode_phone 边界 ---
+static void test_bcd_encode_phone_20digit_max() {
+  g_current = "bcd_encode_phone: 20 位 (GSM max) → 返回 20";
+  char buf[64];
+  int n = pdu::bcd_encode_phone("12345678901234567890", buf, sizeof(buf));
+  CHECK_EQ_INT(n, 20);
+}
+
+static void test_bcd_encode_phone_21digit_overflow() {
+  g_current = "bcd_encode_phone: 21 位 (超 20) → -1";
+  char buf[64];
+  int n = pdu::bcd_encode_phone("123456789012345678901", buf, sizeof(buf));
+  CHECK_EQ_INT(n, -1);
+}
+
+static void test_bcd_encode_phone_empty() {
+  g_current = "bcd_encode_phone: empty → -1";
+  char buf[64];
+  int n = pdu::bcd_encode_phone("", buf, sizeof(buf));
+  CHECK_EQ_INT(n, -1);
+}
+
+// --- cmgs_build_pdu 边界 ---
+static void test_cmgs_build_pdu_phone_with_dash() {
+  g_current = "cmgs_build_pdu: phone 含 '-' (138-0000-1234) → 静默剥, DA length=11 (chars 4-5)";
+  char pdu[256];
+  int n = pdu::cmgs_build_pdu("138-0000-1234", "Hi", -1, nullptr, 0, 0, pdu, sizeof(pdu));
+  // PDU 布局: PDU-type(2) MR(2) DA-len(2) ToA(2) DA(12) PID(2) DCS(2) VP(2) UDL(2) UD(8) = 36 hex
+  //   DCS=0x08 (UCS-2) → "Hi" = 2 chars × 2 bytes = 4 bytes = 8 hex
+  //   char  0-1: PDU-type "11"
+  //   char  2-3: MR "00"
+  //   char  4-5: DA-len "0B" (=11 decimal digit count, 不是 22 hex chars)
+  //   char  6-7: ToA "81"
+  //   char  8-19: DA digits BCD "3108001032F4" (12 hex)
+  //   char 20-21: PID "00"
+  //   char 22-23: DCS "08"
+  //   char 24-25: VP "AA"
+  //   char 26-27: UDL "04" (4 bytes)
+  //   char 28-35: UD "00480069" ("Hi" UCS-2)
+  CHECK_EQ_INT(n, 36);
+  CHECK_EQ_STR(std::string(pdu).substr(4, 2), "0B");
+}
+
+// --- roundtrip (encode → decode, 确保对称性) ---
+static void test_ucs2_roundtrip_chinese() {
+  g_current = "ucs2 encode↔decode roundtrip: '你好世界' (4 CJK) → '你好世界'";
+  const char* original = "你好世界";
+  char hex[64];
+  int n_enc = pdu::ucs2_encode(original, hex, sizeof(hex));
+  CHECK_EQ_INT(n_enc, 16);  // 4 chars × 4 hex
+  char utf8[32];
+  size_t n_dec = pdu::ucs2_hex_to_utf8(hex, n_enc, utf8, sizeof(utf8));
+  CHECK_EQ_INT(n_dec, 12);  // 4 CJK × 3 bytes UTF-8
+  CHECK_EQ_STR(std::string(utf8, n_dec), original);
+}
+
+static void test_ucs2_roundtrip_thai() {
+  g_current = "ucs2 encode↔decode roundtrip: 'สวัสดี' (6 Thai) → 'สวัสดี'";
+  const char* original = "สวัสดี";
+  char hex[64];
+  int n_enc = pdu::ucs2_encode(original, hex, sizeof(hex));
+  CHECK_EQ_INT(n_enc, 24);  // 6 chars × 4 hex
+  char utf8[32];
+  size_t n_dec = pdu::ucs2_hex_to_utf8(hex, n_enc, utf8, sizeof(utf8));
+  CHECK_EQ_INT(n_dec, 18);  // 6 Thai × 3 bytes UTF-8
+  CHECK_EQ_STR(std::string(utf8, n_dec), original);
+}
+
+static void test_ucs2_roundtrip_japanese() {
+  g_current = "ucs2 encode↔decode roundtrip: 'こんにちは' (5 JP) → 'こんにちは'";
+  const char* original = "こんにちは";
+  char hex[64];
+  int n_enc = pdu::ucs2_encode(original, hex, sizeof(hex));
+  CHECK_EQ_INT(n_enc, 20);  // 5 chars × 4 hex
+  char utf8[32];
+  size_t n_dec = pdu::ucs2_hex_to_utf8(hex, n_enc, utf8, sizeof(utf8));
+  CHECK_EQ_INT(n_dec, 15);  // 5 JP × 3 bytes UTF-8
+  CHECK_EQ_STR(std::string(utf8, n_dec), original);
+}
+
+// =================== v4.0.7: pdu_ud_offset + 泰文 PDU 端到端 ===================
+
+// 实际 6/19 泰文短信 CMT body (DCS=08 UCS-2, 73 bytes 含 SCA):
+// SCA=07 91 66 39 08 11 00 F3
+// FO=24 OA=0B D0 D6 B2 3C 6D CE 03 (11 digits)
+// PID=00 DCS=08 SCTS=62 60 91 20 50 60 82
+// UDL=2E (46 bytes) UD=0E23 0E2B 0E31 ... 0E13 003A 0035 ... 0039
+// 期望: pdu_ud_offset 返回 54 (hex chars), udBytes=46
+static void test_pdu_ud_offset_thai_ucs2() {
+  // 实际从 device log 抓的 body_hex
+  const char* body = "07916639081100F3240bd0d6b23c6dce030008626091205060822e0e230e2b0e310e2a0e220e370e190e220e310e190e020e2d0e070e040e380e13003a003500350039003600320039";
+  size_t bodyLen = std::strlen(body);
+  size_t udBytes = 0;
+  size_t udOff = pdu::pdu_ud_offset(body, bodyLen, /*is7bit=*/false, &udBytes);
+  CHECK_EQ_INT(udOff, 54);    // hex 偏移 (SCA 16 + FO 2 + OA 16 + PID 2 + DCS 2 + SCTS 14 = 52, +UDL 2 = 54)
+  CHECK_EQ_INT(udBytes, 46);  // UDL=0x2E, UCS-2 按 byte
+  // 切出来的 UD hex 应是 "0e23..." 开头 (注意: log 里 hex 是小写)
+  CHECK_EQ_INT(std::strncmp(body + udOff, "0e23", 4), 0);
+}
+
+// 7-bit 短短信 PDU: SCA=07 ... FO=04 OA=0B ... PID=00 DCS=00 SCTS=...
+// UDL=09 (9 septets), UD packed 7-bit = 8 bytes (ceil(9*7/8)=8)
+static void test_pdu_ud_offset_7bit() {
+  // 7-bit ASCII "Hello123" (9 chars) 的标准 PDU
+  // SCA 07 91 66 39 08 11 00 F3  FO 04  OA 0B 81 86 09 14 00 09 00
+  // PID 00  DCS 00  SCTS 62 60 91 20 50 60 82  UDL 09
+  // UD 9 septets packed: C8 32 9B FD 46 97 D9 EC (8 bytes)
+  // 7-bit ASCII "Hello123" (9 chars) 的标准 PDU
+  // SCA 07 91 66 39 08 11 00 F3  FO 04  OA 0B 81 86 09 14 00 09 00
+  // PID 00  DCS 00  SCTS 62 60 91 20 50 60 82  UDL 09
+  // UD 9 septets packed: C8 32 9B FD 46 97 D9 EC (8 bytes)
+  // 拼接 = 16+2+16+2+2+14+2+16 = 70 hex chars
+  const char* body =
+      "07916639081100F3"  // SCA
+      "04"               // FO
+      "0B81860914000900" // OA (oaLen=0B=11, type=81, BCD 6 bytes)
+      "00"               // PID
+      "00"               // DCS (7-bit)
+      "62609120506082"   // SCTS (7 bytes)
+      "09"               // UDL (9 septets)
+      "C8329BFD4697D9EC";// UD (8 bytes packed 7-bit)
+  size_t bodyLen = std::strlen(body);
+  size_t udBytes = 0;
+  size_t udOff = pdu::pdu_ud_offset(body, bodyLen, /*is7bit=*/true, &udBytes);
+  CHECK_EQ_INT(udOff, 54);    // SCA 16 + FO 2 + OA 16 + PID 2 + DCS 2 + SCTS 14 + UDL 2 = 54
+  CHECK_EQ_INT(udBytes, 8);   // ceil(9*7/8) = 8
+  // 切出来的 UD 应是 7-bit packed 8 bytes
+  CHECK_EQ_INT(std::strncmp(body + udOff, "C8329BFD4697D9EC", 16), 0);
+}
+
+// PDU 太短 / 无效 → 返回 0, udBytes=0
+static void test_pdu_ud_offset_invalid() {
+  size_t udBytes = 99;  // 验证会被清零
+  size_t udOff = pdu::pdu_ud_offset("", 0, false, &udBytes);
+  CHECK_EQ_INT(udOff, 0);
+  CHECK_EQ_INT(udBytes, 0);
+
+  udBytes = 99;
+  udOff = pdu::pdu_ud_offset("07", 2, false, &udBytes);  // 太短
+  CHECK_EQ_INT(udOff, 0);
+  CHECK_EQ_INT(udBytes, 0);
+
+  udBytes = 99;
+  udOff = pdu::pdu_ud_offset("ZZ", 2, false, &udBytes);  // 非 hex
+  CHECK_EQ_INT(udOff, 0);
+  CHECK_EQ_INT(udBytes, 0);
+}
+
+// 端到端: 切 UD → decode_body_field → UTF-8
+// 泰文短信期望: "ขอหมายเลขบัญชี:55629629" (15 codepoints, 实际字节数看 UTF-8 编码)
+static void test_pdu_ud_offset_e2e_thai() {
+  const char* body = "07916639081100F3240bd0d6b23c6dce030008626091205060822e0e230e2b0e310e2a0e220e370e190e220e310e190e020e2d0e070e040e380e13003a003500350039003600320039";
+  size_t bodyLen = std::strlen(body);
+  size_t udBytes = 0;
+  size_t udOff = pdu::pdu_ud_offset(body, bodyLen, false, &udBytes);
+  CHECK(udOff > 0);
+
+  char bodyBuf[256];
+  size_t n = pdu::decode_body_field(body + udOff, udBytes * 2, bodyBuf, sizeof(bodyBuf));
+  // 23 codepoints: 16 Thai (3 bytes UTF-8 each) + 7 ASCII (":559629") = 48 + 7 = 55 bytes
+  std::string out(bodyBuf, n);
+  // 关键校验: 含泰文 "ข" (U+0E02) — 这是 SCA 切干净的特征 (SCA 没有 0E0x 字节)
+  CHECK(out.find("\xE0\xB8\x82") != std::string::npos);  // ข
+  // 含 ":"  (ASCII, 0x3A)
+  CHECK(out.find(':') != std::string::npos);
+  // 含 "559629" (实际短信是 6 位, 不是 8 位)
+  CHECK(out.find("559629") != std::string::npos);
+  // 不应含 SCA 的 "0791" 残留
+  CHECK(out.find("0791") == std::string::npos);
+}
+
+// =================== v4.0.7.1: alphanumeric sender (DTAC/AIS/Verify) ===================
+
+// 6 octets GSM7 packed → 6 chars (floor(48/7)=6), LSB-first
+// 双向验证: pack("Verify") = D6B23C6DCE03, unpack 回 "Verify"
+static void test_alpha_sender_verify() {
+  // octets 是 raw bytes, 不用 hex string
+  const uint8_t raw[6] = { 0xD6, 0xB2, 0x3C, 0x6D, 0xCE, 0x03 };
+  char buf[32];
+  size_t n = pdu::decode_gsm7_alpha_oa((const char*)raw, 6, 6, buf, sizeof(buf));
+  std::string out(buf, n);
+  CHECK_EQ_INT(n, 6);
+  CHECK(out == "Verify");
+}
+
+static void test_alpha_sender_dtac() {
+  // pack("DTAC") = 446A7008
+  const uint8_t raw[4] = { 0x44, 0x6A, 0x70, 0x08 };
+  char buf[32];
+  size_t n = pdu::decode_gsm7_alpha_oa((const char*)raw, 4, 4, buf, sizeof(buf));
+  std::string out(buf, n);
+  CHECK_EQ_INT(n, 4);
+  CHECK(out == "DTAC");
+}
+
+static void test_alpha_sender_ais() {
+  // pack("AIS") = C1E414
+  const uint8_t raw[3] = { 0xC1, 0xE4, 0x14 };
+  char buf[32];
+  size_t n = pdu::decode_gsm7_alpha_oa((const char*)raw, 3, 3, buf, sizeof(buf));
+  std::string out(buf, n);
+  CHECK_EQ_INT(n, 3);
+  CHECK(out == "AIS");
+}
+
+static void test_alpha_sender_true() {
+  // pack("TRUE") = 5469B508
+  const uint8_t raw[4] = { 0x54, 0x69, 0xB5, 0x08 };
+  char buf[32];
+  size_t n = pdu::decode_gsm7_alpha_oa((const char*)raw, 4, 4, buf, sizeof(buf));
+  std::string out(buf, n);
+  CHECK_EQ_INT(n, 4);
+  CHECK(out == "TRUE");
+}
+
+static void test_alpha_sender_kbank() {
+  // pack("KBANK") = 4B61D0B904
+  const uint8_t raw[5] = { 0x4B, 0x61, 0xD0, 0xB9, 0x04 };
+  char buf[32];
+  size_t n = pdu::decode_gsm7_alpha_oa((const char*)raw, 5, 5, buf, sizeof(buf));
+  std::string out(buf, n);
+  CHECK_EQ_INT(n, 5);
+  CHECK(out == "KBANK");
+}
+
+// pdu_oa_offset: 切出 OA 段, 判 alphanumeric
+// 实测样本: oaLen=0B, ToA=D0 (alphanumeric), 6 octets, value=D6B23C6DCE03
+static void test_pdu_oa_offset_alpha() {
+  const char* body = "07916639081100F3240bd0d6b23c6dce030008626091200323822e0e230e2b0e310e2a0e220e370e190e220e310e190e020e2d0e070e040e380e13003a003500350039003600320039";
+  size_t bodyLen = std::strlen(body);
+  bool isAlpha = false;
+  size_t valueOctets = 0;
+  // pdu_oa_offset 返回 OA value 起点 (hex 偏移), 跳过 length+ToA+value
+  size_t oaOff = pdu::pdu_oa_offset(body, bodyLen, &isAlpha, &valueOctets);
+  CHECK(oaOff > 0);
+  CHECK(isAlpha);
+  CHECK_EQ_INT(valueOctets, 6);  // ceil(11/2) = 6 (oaLen 字段不可信, 但 octets 数对)
+  // OA value 起点 hex 偏移 = SCA 16 + FO 2 + OA-length 2 + OA-ToA 2 = 22
+  CHECK_EQ_INT(oaOff, 22);
+  // value hex 起点应是 "d6b2..."
+  CHECK_EQ_INT(std::strncmp(body + oaOff, "d6b23c6dce03", 12), 0);
+}
+
+// E2E: 切 OA → 解 alphanumeric → 写 phoneBuf
+// 期望: phone="Verify" (与 D6B23C6DCE03 100% 匹配)
+static void test_pdu_oa_offset_e2e_alpha() {
+  const char* body = "07916639081100F3240bd0d6b23c6dce030008626091200323822e0e230e2b0e310e2a0e220e370e190e220e310e190e020e2d0e070e040e380e13003a003500350039003600320039";
+  size_t bodyLen = std::strlen(body);
+  bool isAlpha = false;
+  size_t valueOctets = 0;
+  size_t oaOff = pdu::pdu_oa_offset(body, bodyLen, &isAlpha, &valueOctets);
+  CHECK(oaOff > 0);
+  CHECK(isAlpha);
+
+  char phoneBuf[64];
+  // 泰文验证码短信实际: floor(6*8/7) = 6 chars
+  size_t nchars = (valueOctets * 8) / 7;
+  // body+oaOff 是 hex string (6 octets = 12 hex chars), decode_gsm7_alpha_oa 要 raw bytes
+  // 这里 E2E 测试就拆 hex: 每 2 hex 字符 → 1 byte (生产代码 main.cpp 里要 hex→bytes 后再调)
+  uint8_t raw[6];
+  for (size_t i = 0; i < valueOctets; i++) {
+    char h0 = body[oaOff + i*2], h1 = body[oaOff + i*2 + 1];
+    auto v = [](char c)->uint8_t{
+      return (c<='9')?(c-'0'):((c<='F')?(c-'A'+10):(c-'a'+10));
+    };
+    raw[i] = (uint8_t)((v(h0) << 4) | v(h1));
+  }
+  size_t phoneN = pdu::decode_gsm7_alpha_oa((const char*)raw, valueOctets, nchars, phoneBuf, sizeof(phoneBuf));
+  std::string out(phoneBuf, phoneN);
+  CHECK(out == "Verify");
+  CHECK_EQ_INT(phoneN, 6);
+}
+
+// padding trim: oaLen=11 案例 (跟生产 ML307 一致), 4 chars 真数据装 6 octets, 后 2 octets 是 0x00 padding
+// 解 nchars=6, 应该 trim "@@" → 剩 4 chars "TRUE"
+static void test_alpha_sender_true_padded() {
+  // 4 chars "TRUE" 4 octets 5469B508 + 2 octets 0x00 padding
+  const uint8_t raw[6] = { 0x54, 0x69, 0xB5, 0x08, 0x00, 0x00 };
+  char buf[32];
+  // 起点 nchars_max = floor(6*8/7) = 6
+  size_t n = pdu::decode_gsm7_alpha_oa((const char*)raw, 6, 6, buf, sizeof(buf));
+  std::string out(buf, n);
+  CHECK(out == "TRUE");  // 应 trim 末 2 个 '@'
+  CHECK_EQ_INT(n, 4);
+}
+
+// padding trim: 1 char "X" 装 6 octets (oaLen=11, value=6 octets 0x58 + 5 octets 0x00)
+// 解 nchars=6, 末 5 char 全 '@' → trim → 1 char
+static void test_alpha_sender_one_char() {
+  const uint8_t raw[6] = { 0x58, 0x00, 0x00, 0x00, 0x00, 0x00 };  // GSM7 'X' = 0x58
+  char buf[32];
+  size_t n = pdu::decode_gsm7_alpha_oa((const char*)raw, 6, 6, buf, sizeof(buf));
+  std::string out(buf, n);
+  CHECK(out == "X");
+  CHECK_EQ_INT(n, 1);
+}
+
+// padding trim: 6 octets 全真数据 ("Verify"), 不应误 trim
+// (Verify 案例: 6 chars 装 6 octets, padding 6 bits 全 0 = 末尾 '@' 字符 = 0x00 septet)
+// unpack 6 chars → "Verify" + padding 0 = "Verify" + 0 个 '@' (因为 6 chars 用 42 bits,剩 6 bits padding,0x00 septet = 1 char 0, **但我们 trim 1 个会少 1 char**)
+// 实际 unpack: "Verify" (6 chars, 末 char 'y' 后面 6 bits padding = 0x00, 不算 char, 4-7 bit 范围)
+// 等等,LSB-first 7 bit groups: char 0..5 各 7 bits = 42 bits used, 剩 6 bits in last octet
+// char 0..5 unpacked = V, e, r, i, f, y (no trailing '@' from these 6 chars)
+// padding 6 bits = 0 (协议规定), 不解 char → 没 trailing '@', 不 trim
+// 期望: "Verify" 6 chars 不被 trim
+static void test_alpha_sender_verify_no_trim() {
+  const uint8_t raw[6] = { 0xD6, 0xB2, 0x3C, 0x6D, 0xCE, 0x03 };
+  char buf[32];
+  size_t n = pdu::decode_gsm7_alpha_oa((const char*)raw, 6, 6, buf, sizeof(buf));
+  std::string out(buf, n);
+  CHECK(out == "Verify");  // 不应 trim
+  CHECK_EQ_INT(n, 6);
+}
+
+// numeric OA: ToA=0x81 (unknown, ISDN) 走 numeric, 跟 v4.0.4 行为对齐
+// 数字 sender PDU: SCA=07...FO=04 OA=0B 81 86 09 14 00 09 00 → "+8613800001234" 之类
+static void test_pdu_oa_offset_numeric() {
+  const char* body = "07916639081100F304" "0B" "81" "860914000900F" "00" "00" "62609120506082";
+  size_t bodyLen = std::strlen(body);
+  bool isAlpha = false;
+  size_t valueOctets = 0;
+  size_t oaOff = pdu::pdu_oa_offset(body, bodyLen, &isAlpha, &valueOctets);
+  CHECK(oaOff > 0);
+  CHECK(!isAlpha);  // TON=0 (unknown) — numeric
+  CHECK_EQ_INT(valueOctets, 6);
+  CHECK_EQ_INT(oaOff, 22);  // SCA 16 + FO 2 + OA-len 2 + OA-ToA 2 = 22
+}
+
 int main() {
   std::printf("============================================================\n");
   std::printf("pdu_codec host test\n");
@@ -486,14 +1039,25 @@ int main() {
   // UCS-2
   test_ucs2_chinese();
   test_ucs2_skip_null_and_surrogate();
+  test_ucs2_empty();
+  test_ucs2_single_codepoint();
+  test_ucs2_latin1_supplement();
 
   // phone
   test_phone_international();
   test_phone_short_number_regression();
   test_phone_alpha_sender();
+  test_phone_plus_prefix();
+  test_phone_with_dash();
+  test_phone_pure_hex_returned_as_is();
+  test_phone_empty();
 
   // body
   test_body_mixed();
+  test_body_pure_ascii();
+  test_body_pure_ucs2();
+  test_body_5hex_odd_boundary();
+  test_body_empty();
 
   // UDH
   test_udh_16bit();
@@ -501,17 +1065,27 @@ int main() {
   test_udh_16bit_stripped_udhl();   // 烧板 regression: ML307 剥 UDHL
   test_udh_8bit_stripped_udhl();    // 烧板 regression: ML307 剥 UDHL
   test_udh_no_concat();
+  test_udh_empty();
+  test_udh_invalid_total_zero();
+  test_udh_invalid_total_nine();
+  test_udh_invalid_seq_overflow();
 
   // 7-bit (烧板 regression: 长泰文 DCS=0 7-bit)
   test_7bit_ascii_roundtrip();
   test_7bit_multichar();
   test_7bit_user_real_long_msg();
+  test_7bit_special_chars();        // @£$ (0x00 0x01 0x02)
+  test_7bit_extended_chars();       // ÄÖÑ (0x5B 0x5C 0x5D)
 
   // UTF-8 strict (DCS=0 但实际 UCS-2 的兜底)
   test_is_strict_utf8_true_ascii();
   test_is_strict_utf8_true_gsm7_extended();
   test_is_strict_utf8_false_lone_continuation();
   test_is_strict_utf8_false_4byte_lead();
+  test_is_strict_utf8_empty();
+  test_is_strict_utf8_cjk_3byte();
+  test_is_strict_utf8_euro_3byte();
+  test_is_strict_utf8_truncated_2byte();
 
   // task #37: looks_like_ucs2_be (raw bytes sniff, 网关 DCS 标错场景)
   test_looks_like_ucs2_thai();
@@ -519,15 +1093,20 @@ int main() {
   test_looks_like_ucs2_ascii_negative();
   test_looks_like_ucs2_gsm7_packed_negative();
   test_looks_like_ucs2_too_short();
+  test_looks_like_ucs2_odd_hex();
+  test_looks_like_ucs2_single_pair();
 
   // v4.0.6 短信发送 (双向)
   test_ucs2_encode_ascii();
   test_ucs2_encode_chinese();
   test_ucs2_encode_thai();
   test_ucs2_encode_invalid_utf8();
+  test_ucs2_encode_empty();
+  test_ucs2_encode_single_ascii();
   test_split_single_70();
   test_split_double_71();
   test_split_overflow_255segs();
+  test_split_exactly_255();
 
   // P0 fix #3: DA length = decimal digit count
   test_bcd_encode_phone_11digit();
@@ -535,6 +1114,9 @@ int main() {
   test_bcd_encode_phone_13digit_intl();  // 翔哥提的国外场景
   test_bcd_encode_phone_plus_prefix();
   test_bcd_encode_phone_invalid_chars();
+  test_bcd_encode_phone_20digit_max();
+  test_bcd_encode_phone_21digit_overflow();
+  test_bcd_encode_phone_empty();
 
   // P0 fix #1 + #3: PDU-type 0x51 for concat + DA length
   test_cmgs_build_pdu_single_pdu_type();
@@ -543,6 +1125,31 @@ int main() {
   test_cmgs_build_pdu_concat_pdu_type();
   test_cmgs_build_pdu_concat_udh_bytes();
   test_cmgs_build_pdu_invalid_utf8();
+  test_cmgs_build_pdu_phone_with_dash();
+
+  // v4.0.7 扩展: encode ↔ decode roundtrip (对称性)
+  test_ucs2_roundtrip_chinese();
+  test_ucs2_roundtrip_thai();
+  test_ucs2_roundtrip_japanese();
+
+  // v4.0.7: pdu_ud_offset + 泰文 PDU 端到端
+  test_pdu_ud_offset_thai_ucs2();
+  test_pdu_ud_offset_7bit();
+  test_pdu_ud_offset_invalid();
+  test_pdu_ud_offset_e2e_thai();
+
+  // v4.0.7.1 alphanumeric sender
+  test_alpha_sender_verify();
+  test_alpha_sender_dtac();
+  test_alpha_sender_ais();
+  test_alpha_sender_true();
+  test_alpha_sender_kbank();
+  test_alpha_sender_true_padded();   // 4 chars + 2 octets 0x00 padding → trim "@@"
+  test_alpha_sender_one_char();      // 1 char + 5 octets 0x00 padding → trim "@@@@@"
+  test_alpha_sender_verify_no_trim();// 6 chars 装 6 octets 正好, 不误 trim
+  test_pdu_oa_offset_alpha();
+  test_pdu_oa_offset_e2e_alpha();
+  test_pdu_oa_offset_numeric();
 
   std::printf("============================================================\n");
   std::printf("Result: %d passed, %d failed\n", g_pass, g_fail);

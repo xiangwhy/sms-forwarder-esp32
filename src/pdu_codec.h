@@ -54,6 +54,29 @@ bool is_strict_utf8(const char* buf, size_t n);
 // 返回 true = 大概率 UCS-2 BE, false = 不是 UCS-2
 bool looks_like_ucs2_be(const char* hex, size_t hexLen);
 
+// 从完整 PDU (SCA+FO+OA+PID+DCS+SCTS+UDL+UD) hex 跳过头部, 返回 UD 起始 (hex 偏移)
+// *outUdByteLen: UD 字节数 (7-bit 按 ceil(UDL*7/8), 8-bit/UCS-2 按 UDL)
+// is7bit: DCS 是否 7-bit, 决定 UDL 单位 (septets vs bytes)
+// 返回 0 = PDU 太短/格式错 (caller 兜底用全 body 当 UD)
+size_t pdu_ud_offset(const char* hex, size_t hexLen, bool is7bit, size_t* outUdByteLen);
+
+// 从完整 PDU (SCA+FO+OA+PID+...) hex 跳过 SCA+FO, 返回 OA 起始 (hex 偏移)
+// *outIsAlpha: true=TON=alphanumeric(GSM7 packed), false=numeric(BCD nibble swap)
+// *outValueOctets: OA value 段 octet 数 (= ceil(oaLen/2))
+//   alphanumeric 时实际 nchars = floor(octets*8/7) — oaLen 字段 ML307 写错不可信
+// 返回 0 = PDU 太短/格式错
+size_t pdu_oa_offset(const char* hex, size_t hexLen, bool* outIsAlpha, size_t* outValueOctets);
+
+// GSM 7-bit packed → UTF-8, 用于 OA alphanumeric sender (DTAC/AIS/TRUE/Verify 等)
+// LSB-first 7-bit unpack + GSM 03.38 default alphabet (basic char set only, 不含 0x1B escape extension)
+// octets: 原始 octets 指针 (caller 保证 ≥ ceil(nchars*7/8) bytes)
+// octetCount: octets 缓冲实际可读字节数 (防越界; 来自 pdu_oa_offset 的 outValueOctets)
+// nchars: 字符数 (caller 已知, alphanumeric 时由 floor(octets*8/7) 反算得最大值)
+// 返回写入字节数 (自动 trim 末尾 GSM7 '@' 字符, 即 padding 0x00 septet — 业务名不会以 '@' 结尾,
+//  安全; 真 sender 4 chars 装 6 octets → 解 6 chars → trim "@@" → 4 chars)
+size_t decode_gsm7_alpha_oa(const char* octets, size_t octetCount, size_t nchars,
+                            char* out, size_t outLen);
+
 // =================== 发送侧 (v4.0.6+) ===================
 
 // UCS2 编码 (发送): UTF-8 → UCS-2 BE hex (1 codepoint = 4 hex 字符)
