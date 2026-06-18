@@ -156,9 +156,15 @@ Web server up (Dashboard / API / OTA)
 | `minFreeHeap` | int | 启动以来最小空闲 heap | `esp_get_minimum_free_heap_size()`,排查泄漏关键 |
 | `lastSmsMs` | int | 上次收短信时间 (millis 上电后) | 0 表示从未收过;前端要换算成"X 秒前"需自己减 `Date.now()` |
 | `lastPushOkMs` | int | 上次推送成功时间 (millis) | 同上 |
+| `lastSmsUtc` | int | 上次收短信 epoch ms | **v4.0.6 P11b**:SNTP 同步前为 0,前端显 "-" |
+| `lastPushOkUtc` | int | 上次推送 epoch ms | 同上 |
+| `deviceTimeMs` | int | 当前设备 epoch ms | **v4.0.6 P11**:timeSynced=false 时为 0 |
+| `timeSynced` | bool | SNTP 是否同步 | v4.0.6 P11,前端据此决定显示真实时间还是 "-" |
 | `mlAlive` | bool | 4G 模组 (ML307) 是否 alive | setup 后置 true,watchdog 未实现 |
 | `udhActive` | int | 当前活跃 UDH 长短信拼接槽 (0–4) | 长时间 >0 表示有 slot 卡死 |
-| `fw` | str | 固件版本号 | 例 "v4.0.5" |
+| `heapTotal` | int | 总 heap (字节) | **v4.0.6 P13**:`heap_caps_get_total_size(MALLOC_CAP_INTERNAL)` |
+| `heapUsed` | int | 已使用 heap | **v4.0.6 P13**:heapTotal - freeHeap |
+| `fw` | str | 固件版本号 | 例 "v4.0.6" |
 
 **示例**:
 ```json
@@ -166,12 +172,17 @@ Web server up (Dashboard / API / OTA)
   "boot": 42, "pushOk": 138, "pushFail": 2, "qLen": 0,
   "wifi": true, "wifiRssi": -58,
   "freeHeap": 87344, "minFreeHeap": 81200,
+  "heapTotal": 327680, "heapUsed": 240336,
   "lastSmsMs": 3842100, "lastPushOkMs": 3842150,
+  "lastSmsUtc": 1749638400000, "lastPushOkUtc": 1749638450000,
+  "deviceTimeMs": 1749638450000, "timeSynced": true,
   "mlAlive": true, "udhActive": 0,
-  "fw": "v4.0.5"
+  "fw": "v4.0.6"
 }
 ```
 | `/update` | OTA 烧录 (弹窗输 OTA 用户密码) |
+| `/send`    | 双向短信发送页 (OTA 鉴权, 32 条历史, 清空按钮) |
+| `/config`  | 高级配置 (恢复出厂 NVS 全擦) |
 
 ## 功能清单
 
@@ -226,6 +237,48 @@ esp32-sms/
 4. **代码从 1640 行精简到 ~1320 行** (砍 ArduinoOTA/Dashboard/4G 统计/NVS 推队列/ping 监控等部分 v3.6.4 功能)
 5. **RNDIS 4G 上网禁用** (长期搁置)
 6. **短信编码从 v3.6.4 big-endian 切到 v4.0 little-endian 又回 big-endian** (调试过程产物,最终 v4.0 是 BE,与短短信工作结果一致)
+
+## v4.0.6 Dashboard (commit 3b42f4d)
+
+### 4 个顶部操作按钮
+dashboard 顶部一行 [OTA升级] [短信发送] [配置] [重启]:
+- **OTA 升级** → 跳 `/update` (BasicAuth 弹窗, 已配 OTA 账号)
+- **短信发送** → 跳 `/send` 页 (收件人+内容+发送, 限频 5/min, 32 条历史)
+- **配置** → anchor 跳 dashboard 自身 `#configSection` (WiFi/Token/Topic/OTA 改配, 不跳页)
+- **重启** → confirm 弹窗 → 1.5s 延后 ESP.restart
+
+### 暗色主题 + 状态卡
+- 运行卡: 启动次数 / WiFi RSSI / 4G 状态 / 长短信拼接槽 / 时间同步
+- 推送卡: 成功/失败/待推队列/上次推送/上次短信
+- 系统卡: 设备时间 (NTP 同步后真实 epoch) / 总内存 / 已使用 / 当前空闲 / 启动以来最低空闲
+- 配色: CSS vars (`--bg`, `--card`, `--accent`, `--err`), iOS 风格 toggle, SVG 自定义 select 箭头
+
+### NTP 真实时间 (P11)
+- 接 `esp_netif_sntp_init` + `ntp.aliyun.com`
+- 时区 `CST-8` (setenv + tzset)
+- `/api/status` 返 `deviceTimeMs` (epoch ms) + `timeSynced` (bool)
+- `lastSms` / `lastPushOk` 时间戳**只在 `timeSynced=true` 后写**, 否则保持 0
+  (否则会出现 `1970/01/01 08:00:27` 假数据)
+
+### 恢复出厂 (P19)
+- `/config` 页底部"恢复出厂"按钮 → confirm → `/api/factory` POST
+- 后端用 `RTC_DATA_ATTR` flag + 1.5s 后 `ESP.restart()` (detached task, 避 async_tcp 死锁)
+- setup() 早期检测 flag → `nvs_flash_erase()` → `nvs_flash_init()` → restart 进 AP 模式
+
+### /send 历史清空 (P14)
+- 最近发送 32 条尾部加"清空"按钮 → `/api/sent/clear` POST
+
+### WiFi 扫描下拉 (P15)
+- `/api/scan` GET → 扫附近 WiFi 返 `[{ssid, rssi, secured, current}]`
+- 配网页 WiFi SSID 用 `<select>` 真下拉 + 暗色主题
+
+### /api/status 新增字段
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `deviceTimeMs` | int | epoch ms (P11, 同步后有效) |
+| `timeSynced`  | bool | SNTP 同步状态 |
+| `heapTotal`   | int | 总 heap (bytes) |
+| `heapUsed`    | int | 已使用 (heapTotal - freeHeap) |
 
 ## 开发
 

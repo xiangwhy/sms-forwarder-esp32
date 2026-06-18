@@ -204,8 +204,11 @@ static volatile int  g_pushFail   = 0;
 static volatile uint32_t g_bootCount = 0;
 static volatile uint32_t g_lastSmsMs       = 0;  // 上次收短信时间 (millis, 兼容)
 static volatile uint32_t g_lastPushOkMs    = 0;  // 上次推送成功时间 (millis, 兼容)
-static volatile uint32_t g_lastSmsUtcMs    = 0;  // v4.0.6 P11b: epoch ms
-static volatile uint32_t g_lastPushOkUtcMs = 0;
+// v4.0.6 P11b: epoch ms (time(NULL) * 1000ULL)
+// P25: 改 uint64_t — uint32_t 在 2026 年会被截断成 ~3.6e9 (≈ 115 天前),
+//   前端 new Date() 显示 1970/02/12 假数据。64-bit JS Number 安全 (>2^53 才丢精度)
+static volatile uint64_t g_lastSmsUtcMs    = 0;
+static volatile uint64_t g_lastPushOkUtcMs = 0;
 static volatile bool     g_timeSynced      = false;  // SNTP 同步标志
 
 // 4G 模组健康
@@ -668,7 +671,7 @@ static size_t build_push_payload(const String& phoneUtf8, const String& bodyUtf8
 static inline void push_success_inc() {
   __atomic_add_fetch(&g_pushOk, 1, __ATOMIC_RELAXED);
   g_lastPushOkMs = millis();
-  if (g_timeSynced) g_lastPushOkUtcMs = (uint32_t)((uint64_t)time(NULL) * 1000ULL);
+  if (g_timeSynced) g_lastPushOkUtcMs = (uint64_t)time(NULL) * 1000ULL;  // P25: uint64 epoch ms
 }
 
 // 通用 HTTPS POST JSON, 返回 HTTP code (-1 = 网络错 / init 失败)
@@ -1122,7 +1125,7 @@ static void sms_task(void* /*param*/) {
       g_lastSmsMs = millis();
       // v4.0.6 P11c: 只在 SNTP 同步后写 epoch, 否则保持 0 (前端显示 "-")
       // 客户反馈 "1970/01/01 08:00:27" — 同步前 time(NULL)≈0, 写出小值
-      if (g_timeSynced) g_lastSmsUtcMs = (uint32_t)((uint64_t)time(NULL) * 1000ULL);
+      if (g_timeSynced) g_lastSmsUtcMs = (uint64_t)time(NULL) * 1000ULL;  // P25: uint64 epoch ms
       ESP_LOGI(TAG, "SMS: phone=%s body=%.120s", phoneUtf8.c_str(), bodyUtf8.c_str());
       ESP_LOGI(TAG, "SMS: body_raw=%.200s body_len=%u", msg.body_hex, (unsigned)strlen(msg.body_hex));
       // 诊断: 把解码出的每个字符的 codepoint 列出来
@@ -1427,49 +1430,8 @@ footer .refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;
   <div class="actions">
     <a class="btn primary" href="/update">OTA 升级</a>
     <a class="btn" href="/send">短信发送</a>
-    <a class="btn" href="#configSection">配置</a>
+    <a class="btn" href="/config">配置</a>
     <a class="btn warn" href="javascript:doRestart()">重启</a>
-  </div>
-
-  <div class="card form-card" id="configSection">
-    <div class="section-title">
-      <h2>配置</h2>
-      <div style="display:flex;gap:8px">
-        <button class="btn mute" onclick="loadCfg()">加载</button>
-        <button class="btn primary" onclick="saveCfg()">保存</button>
-      </div>
-    </div>
-
-    <div class="form-grid">
-      <div class="field">
-        <label>WiFi SSID <small id="c_curSsid" style="color:var(--accent)"></small></label>
-        <div style="display:flex;gap:8px">
-          <select id="c_ssidSel" style="flex:1"></select>
-          <button class="btn mute" type="button" onclick="scanWifi()" id="c_scanBtn">🔍 扫描</button>
-        </div>
-        <input id="c_ssid" maxlength="63" style="margin-top:6px" placeholder="或手动输入 SSID">
-        <small id="c_scanHint" style="color:var(--muted);font-size:11px;min-height:14px;display:block;margin-top:2px"></small>
-      </div>
-      <div class="field"><label>WiFi 密码 <small id="c_hasPass"></small></label><input id="c_pass" type="password" placeholder="留空不修改"></div>
-      <div class="field"><label>pushplus token</label><input id="c_token" maxlength="63"></div>
-      <div class="field"><label>pushplus topic <small>(空 = 个人推送)</small></label><input id="c_topic" maxlength="63"></div>
-      <div class="field"><label>OTA 用户名</label><input id="c_otaUser" maxlength="31"></div>
-      <div class="field"><label>OTA 密码 <small id="c_hasOtaPass"></small></label><input id="c_otaPass" type="password" placeholder="留空不修改"></div>
-    </div>
-
-    <div class="toggle-row">
-      <div class="label">
-        <span class="t">开机推送</span>
-        <span class="h">关闭后启动时不再推送通知;短信转发不受影响</span>
-      </div>
-      <label class="toggle">
-        <input type="checkbox" id="c_bp" onchange="toggleBp(this.checked)">
-        <span class="slider"></span>
-      </label>
-    </div>
-
-    <div id="c_status" class="status-line"></div>
-    <div style="margin-top:8px;font-size:12px;color:var(--muted)">保存后 WiFi / token 改动需重启生效</div>
   </div>
 
   <div class="card">
@@ -1599,100 +1561,8 @@ async function clearHist() {
   }
 }
 
-// v4.0.6 P17: 配网表单搬回 dashboard (P13 拆出去后翔哥说"用 dashboard 就行")
-async function loadCfg() {
-  const s = document.getElementById('c_status');
-  s.className = 'status-line'; s.textContent = '加载中…';
-  try {
-    const r = await fetch('/api/cfg');
-    if (!r.ok) throw new Error('HTTP '+r.status);
-    const j = await r.json();
-    document.getElementById('c_ssid').value    = j.ssid || '';
-    document.getElementById('c_ssidSel').innerHTML = '<option value="">— 选择扫描到的网络 —</option>';
-    document.getElementById('c_token').value   = j.token || '';
-    document.getElementById('c_topic').value   = j.topic || '';
-    document.getElementById('c_otaUser').value = j.otaUser || '';
-    document.getElementById('c_hasPass').textContent    = j.hasPass    ? '(已设置)' : '(未设置)';
-    document.getElementById('c_hasOtaPass').textContent = j.hasOtaPass ? '(已设置)' : '(未设置)';
-    document.getElementById('c_pass').value    = '';
-    document.getElementById('c_otaPass').value = '';
-    document.getElementById('c_bp').checked    = !!j.bootPush;
-    if (j.ssid) document.getElementById('c_curSsid').textContent = '当前: ' + j.ssid;
-    s.className = 'status-line ok'; s.textContent = '已加载';
-  } catch (e) {
-    s.className = 'status-line err'; s.textContent = '加载失败: ' + e.message;
-  }
-}
-async function saveCfg() {
-  const s = document.getElementById('c_status');
-  const body = {
-    ssid:    document.getElementById('c_ssid').value.trim(),
-    token:   document.getElementById('c_token').value.trim(),
-    topic:   document.getElementById('c_topic').value.trim(),
-    otaUser: document.getElementById('c_otaUser').value.trim(),
-    bootPush:document.getElementById('c_bp').checked,
-  };
-  const pw  = document.getElementById('c_pass').value;
-  const opw = document.getElementById('c_otaPass').value;
-  if (pw)  body.pass    = pw;
-  if (opw) body.otaPass = opw;
-  s.className = 'status-line'; s.textContent = '保存中…';
-  try {
-    const r = await fetch('/api/cfg', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(body)
-    });
-    const j = await r.json();
-    if (!r.ok || !j.ok) throw new Error('HTTP '+r.status);
-    s.className = 'status-line ok';
-    s.textContent = '已保存' + (j.restart ? ' · WiFi / token 改动需重启' : '');
-    document.getElementById('c_pass').value    = '';
-    document.getElementById('c_otaPass').value = '';
-  } catch (e) {
-    s.className = 'status-line err'; s.textContent = '保存失败: ' + e.message;
-  }
-}
-async function scanWifi() {
-  const btn = document.getElementById('c_scanBtn');
-  const hint = document.getElementById('c_scanHint');
-  const sel = document.getElementById('c_ssidSel');
-  btn.disabled = true; btn.textContent = '…扫描中';
-  hint.style.color = 'var(--muted)';
-  hint.textContent = '扫描中 (~3s, 阻塞)';
-  try {
-    const r = await fetch('/api/scan');
-    if (!r.ok) throw new Error('HTTP '+r.status);
-    const arr = await r.json();
-    const cur = document.getElementById('c_ssid').value;
-    sel.innerHTML = '<option value="">— 选择扫描到的网络 —</option>'
-      + arr.map(n => {
-        const tag = n.current ? ' ✓ 已连' : (n.secured ? ' 🔒' : ' 开放');
-        return '<option value="' + n.ssid.replace(/"/g,'&quot;') + '"' + (n.ssid===cur?' selected':'') + '>'
-          + n.ssid + ' · ' + n.rssi + ' dBm' + tag + '</option>';
-      }).join('');
-    sel.onchange = () => { if (sel.value) document.getElementById('c_ssid').value = sel.value; };
-    hint.style.color = 'var(--accent)';
-    hint.textContent = '找到 ' + arr.length + ' 个网络 (按信号强度排序)';
-  } catch (e) {
-    hint.style.color = 'var(--err)';
-    hint.textContent = '扫描失败: ' + e.message;
-  } finally {
-    btn.disabled = false; btn.textContent = '🔍 扫描';
-  }
-}
-async function toggleBp(on) {
-  try {
-    const r = await fetch('/api/bootPush', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({on: on})
-    });
-    if (!r.ok) { alert('保存失败'); loadCfg(); return; }
-  } catch (e) {
-    alert('网络错误: ' + e.message); loadCfg();
-  }
-}
-
-poll(); loadHist(); loadCfg();
+// v4.0.6 P24: 配网表单搬去 /config 页 (dashboard 只看状态), 这里不再加载
+poll(); loadHist();
 setInterval(poll, 30000);
 setInterval(loadHist, 60000);
 </script></body></html>
@@ -1720,11 +1590,12 @@ static void handleApiStatus(AsyncWebServerRequest* r) {
   doc["heapUsed"]    = (int32_t)doc["heapTotal"] - (int32_t)doc["freeHeap"];
   doc["lastSmsMs"]      = g_lastSmsMs;       // 兼容旧前端 (millis, 重启清零)
   doc["lastPushOkMs"]   = g_lastPushOkMs;
-  doc["lastSmsUtc"]     = g_lastSmsUtcMs;    // v4.0.6 P11b: epoch ms, 前端 toLocaleString 显示
+  doc["lastSmsUtc"]     = g_lastSmsUtcMs;    // v4.0.6 P11b: epoch ms uint64, 前端 toLocaleString
   doc["lastPushOkUtc"]  = g_lastPushOkUtcMs;
   doc["timeSynced"]     = g_timeSynced;      // false 时前端显示 "未同步" 提示
   // v4.0.6 P18: 当前设备时间 (SNTP 同步后才有意义)
-  doc["deviceTimeMs"]   = g_timeSynced ? (uint32_t)((uint64_t)time(NULL) * 1000ULL) : 0;
+  // P25: deviceTimeMs 用 uint64 epoch ms, 避免 uint32 截断成 1970 年
+  doc["deviceTimeMs"]   = g_timeSynced ? ((uint64_t)time(NULL) * 1000ULL) : 0;
   doc["mlAlive"]     = g_ml.alive;
   doc["udhActive"]   = udhActive;
   doc["fw"]          = FW_VERSION;
@@ -2238,6 +2109,61 @@ footer{margin-top:24px;text-align:center;font-size:12px;color:var(--muted)}
     <div id="info" style="color:var(--muted);font-size:13px">加载中…</div>
   </div>
 
+  <div class="card">
+    <h2>配置 (WiFi / 推送 / OTA)</h2>
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <button class="btn mute" onclick="loadCfg()">加载</button>
+      <button class="btn primary" onclick="saveCfg()">保存</button>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px 16px">
+      <div>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">WiFi SSID <small id="c_curSsid" style="color:var(--accent)"></small></label>
+        <div style="display:flex;gap:8px">
+          <select id="c_ssidSel" style="flex:1;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:13px"></select>
+          <button class="btn mute" type="button" onclick="scanWifi()" id="c_scanBtn" style="padding:6px 12px;font-size:12px">🔍 扫描</button>
+        </div>
+        <input id="c_ssid" maxlength="63" style="margin-top:6px;width:100%;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:13px;box-sizing:border-box" placeholder="或手动输入 SSID">
+        <small id="c_scanHint" style="color:var(--muted);font-size:11px;min-height:14px;display:block;margin-top:2px"></small>
+      </div>
+      <div>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">WiFi 密码 <small id="c_hasPass"></small></label>
+        <input id="c_pass" type="password" maxlength="63" style="width:100%;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:13px;box-sizing:border-box" placeholder="留空不修改">
+      </div>
+      <div>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">pushplus token</label>
+        <input id="c_token" maxlength="63" style="width:100%;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:13px;box-sizing:border-box">
+      </div>
+      <div>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">pushplus topic <small style="color:var(--muted)">(空 = 个人推送)</small></label>
+        <input id="c_topic" maxlength="63" style="width:100%;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:13px;box-sizing:border-box">
+      </div>
+      <div>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">OTA 用户名</label>
+        <input id="c_otaUser" maxlength="31" style="width:100%;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:13px;box-sizing:border-box">
+      </div>
+      <div>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">OTA 密码 <small id="c_hasOtaPass"></small></label>
+        <input id="c_otaPass" type="password" maxlength="31" style="width:100%;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:13px;box-sizing:border-box" placeholder="留空不修改">
+      </div>
+    </div>
+
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;padding:12px;background:var(--card2);border:1px solid var(--border);border-radius:8px;gap:12px">
+      <div>
+        <div style="font-size:13px;font-weight:500">开机推送</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">关闭后启动时不再推送通知;短信转发不受影响</div>
+      </div>
+      <label style="position:relative;display:inline-block;width:46px;height:26px;flex-shrink:0">
+        <input type="checkbox" id="c_bp" onchange="toggleBp(this.checked)" style="opacity:0;width:0;height:0;position:absolute">
+        <span style="position:absolute;inset:0;background:#3a4654;border-radius:999px;transition:background .2s;cursor:pointer" onclick="document.getElementById('c_bp').click()"></span>
+        <span style="position:absolute;top:2px;left:2px;width:22px;height:22px;background:#f1f5f9;border-radius:50%;box-shadow:0 2px 4px rgba(0,0,0,.3);transition:transform .2s" id="c_bpKnob"></span>
+      </label>
+    </div>
+
+    <div id="c_status" class="status-line"></div>
+    <div style="margin-top:8px;font-size:12px;color:var(--muted)">保存后 WiFi / token 改动需重启生效</div>
+  </div>
+
   <div class="card danger">
     <h2>危险操作</h2>
     <div class="danger-row">
@@ -2286,6 +2212,109 @@ async function doFactory() {
   }
 }
 loadInfo();
+
+// v4.0.6 P24: 配网表单从 dashboard 搬来 (/config 页)
+async function loadCfg() {
+  const s = document.getElementById('c_status');
+  s.className = 'status-line'; s.textContent = '加载中…';
+  try {
+    const r = await fetch('/api/cfg');
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const j = await r.json();
+    document.getElementById('c_ssid').value    = j.ssid || '';
+    document.getElementById('c_ssidSel').innerHTML = '<option value="">— 选择扫描到的网络 —</option>';
+    document.getElementById('c_token').value   = j.token || '';
+    document.getElementById('c_topic').value   = j.topic || '';
+    document.getElementById('c_otaUser').value = j.otaUser || '';
+    document.getElementById('c_hasPass').textContent    = j.hasPass    ? '(已设置)' : '(未设置)';
+    document.getElementById('c_hasOtaPass').textContent = j.hasOtaPass ? '(已设置)' : '(未设置)';
+    document.getElementById('c_pass').value    = '';
+    document.getElementById('c_otaPass').value = '';
+    document.getElementById('c_bp').checked    = !!j.bootPush;
+    updateBpKnob();
+    if (j.ssid) document.getElementById('c_curSsid').textContent = '当前: ' + j.ssid;
+    s.className = 'status-line ok'; s.textContent = '已加载';
+  } catch (e) {
+    s.className = 'status-line err'; s.textContent = '加载失败: ' + e.message;
+  }
+}
+async function saveCfg() {
+  const s = document.getElementById('c_status');
+  const body = {
+    ssid:    document.getElementById('c_ssid').value.trim(),
+    token:   document.getElementById('c_token').value.trim(),
+    topic:   document.getElementById('c_topic').value.trim(),
+    otaUser: document.getElementById('c_otaUser').value.trim(),
+    bootPush:document.getElementById('c_bp').checked,
+  };
+  const pw  = document.getElementById('c_pass').value;
+  const opw = document.getElementById('c_otaPass').value;
+  if (pw)  body.pass    = pw;
+  if (opw) body.otaPass = opw;
+  s.className = 'status-line'; s.textContent = '保存中…';
+  try {
+    const r = await fetch('/api/cfg', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error('HTTP '+r.status);
+    s.className = 'status-line ok';
+    s.textContent = '已保存' + (j.restart ? ' · WiFi / token 改动需重启' : '');
+    document.getElementById('c_pass').value    = '';
+    document.getElementById('c_otaPass').value = '';
+  } catch (e) {
+    s.className = 'status-line err'; s.textContent = '保存失败: ' + e.message;
+  }
+}
+async function scanWifi() {
+  const btn = document.getElementById('c_scanBtn');
+  const hint = document.getElementById('c_scanHint');
+  const sel = document.getElementById('c_ssidSel');
+  btn.disabled = true; btn.textContent = '…扫描中';
+  hint.style.color = 'var(--muted)';
+  hint.textContent = '扫描中 (~3s, 阻塞)';
+  try {
+    const r = await fetch('/api/scan');
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const arr = await r.json();
+    const cur = document.getElementById('c_ssid').value;
+    sel.innerHTML = '<option value="">— 选择扫描到的网络 —</option>'
+      + arr.map(n => {
+        const tag = n.current ? ' ✓ 已连' : (n.secured ? ' 🔒' : ' 开放');
+        return '<option value="' + n.ssid.replace(/"/g,'&quot;') + '"' + (n.ssid===cur?' selected':'') + '>'
+          + n.ssid + ' · ' + n.rssi + ' dBm' + tag + '</option>';
+      }).join('');
+    sel.onchange = () => { if (sel.value) document.getElementById('c_ssid').value = sel.value; };
+    hint.style.color = 'var(--accent)';
+    hint.textContent = '找到 ' + arr.length + ' 个网络 (按信号强度排序)';
+  } catch (e) {
+    hint.style.color = 'var(--err)';
+    hint.textContent = '扫描失败: ' + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = '🔍 扫描';
+  }
+}
+async function toggleBp(on) {
+  updateBpKnob();
+  try {
+    const r = await fetch('/api/bootPush', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({on: on})
+    });
+    if (!r.ok) { alert('保存失败'); loadCfg(); return; }
+  } catch (e) {
+    alert('网络错误: ' + e.message); loadCfg();
+  }
+}
+function updateBpKnob() {
+  const on = document.getElementById('c_bp').checked;
+  const track = document.querySelector('#c_bp').parentElement.children[1];
+  const knob  = document.querySelector('#c_bp').parentElement.children[2];
+  track.style.background = on ? 'var(--accent)' : '#3a4654';
+  knob.style.transform   = on ? 'translateX(20px)' : 'none';
+}
+loadCfg();
 </script></body></html>
 )HTML";
 
