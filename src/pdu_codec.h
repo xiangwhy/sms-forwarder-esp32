@@ -47,4 +47,11 @@ size_t decode_7bit_packed(const char* hex, size_t hexLen, size_t numChars,
 // 返回 true = buf 是合法 UTF-8, false = 大概率不是合法 7-bit 输出, 应 fallback UCS-2
 bool is_strict_utf8(const char* buf, size_t n);
 
+// Sniff raw body hex 是否呈 UCS-2 BE 模式
+// 用于: DCS 标 reserved/未知 (0x0C-0x0F, 0x1C-0x1F, 0xFF 等) 时, 决定走 7-bit 还是 UCS-2
+// 标准: 偶数字节 + 高字节落在 BMP 高频区 (0x0E-0x0F 泰文 / 0x4E-0x9F CJK / 0x34-0x4B CJK 扩展 A)
+//       至少 4 对字符 (8 字节 / 8 UCS-2 字符) + 80% 命中
+// 返回 true = 大概率 UCS-2 BE, false = 不是 UCS-2
+bool looks_like_ucs2_be(const char* hex, size_t hexLen);
+
 }  // namespace pdu

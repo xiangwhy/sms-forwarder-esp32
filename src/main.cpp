@@ -59,7 +59,7 @@ static const char* TAG_USB = "USBH";
 #define BOOT_GRACE_MS      30000   // 启动后 30s 不响应 BOOT (避开 GPIO0 strapping 抖动)
 #define BOOT_DEBOUNCE_N    5       // 连续 5 个 100ms 采样 = 500ms 才算真按下
 
-#define AP_SSID_PREFIX     "SMS-Forwarder-"
+#define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
 #define FW_VERSION         "v4.0.3"
 
@@ -95,8 +95,8 @@ struct Config {
 // 硬编码默认配置 (v4.0.4 patch, 烧板/重启后直接可用, 避免反复进 AP 配网)
 // NVS 优先, NVS 为空时回落到这里的默认值
 static Config g_cfg = {
-  "REDACTED_SSID",                          // ssid
-  "REDACTED_WIFI_PASS",                          // pass
+  "LYRD2.4G",                          // ssid
+  "lyrd@2022",                          // pass
   "49b6fce94afe49c2b5cf7cb59873800f",  // token
   "",                                  // topic (空 = 个人推送)
   "admin",                             // otaUser
@@ -795,25 +795,36 @@ static void sms_task(void* /*param*/) {
       size_t phoneN = pdu::decode_phone_field(msg.phone_hex, strnlen(msg.phone_hex, sizeof(msg.phone_hex)),
                                               phoneBuf, sizeof(phoneBuf));
       // 编码自动检测: DCS 优先 (3GPP TS 23.038 §4 + Wikipedia Data Coding Scheme)
-      // 7-bit (含 flash/ME/SIM/TE class): 0x00-0x03, 0x10-0x13, 0xF0-0xF3, 0xF8-0xFB
-      // 8-bit raw:                          0x04-0x07, 0x14-0x17, 0xF4-0xF7, 0xFC-0xFF
-      // UCS-2:                              0x08-0x0B, 0x18-0x1B
-      // reserved (启发):                    0x0C-0x0F, 0x1C-0x1F
-      // 启发原则: 严格匹配 → 7-bit (bodyBytes ≈ cmt_len*7/8 ±2), 其他默认 UCS-2
-      //   默认 UCS-2 防止 DCS=0xFF/未知 + 中英混排短信被误判 7-bit → 乱码
+      // 7-bit (含 flash/ME/SIM/TE class): 0x00-0x03, 0x10-0x13, 0xC0/0xD0 (MWI), 0xF0-0xF3
+      // 8-bit raw:                          0x04-0x07, 0x14-0x17, 0xF4-0xFB, 0xFC-0xFF
+      // UCS-2:                              0x08-0x0B, 0x18-0x1B, 0xE0
+      // reserved (启发):                    0x0C-0x0F, 0x1C-0x1F, 0xFF/未知
+      // 启发原则 (混合, 参 smspdudecoder + gammu GSM_GetMessageCoding):
+      //   1. 严格 DCS 命中 → 信 DCS
+      //   2. reserved/未知 → 先 sniff raw bytes (looks_like_ucs2_be), 是 UCS-2 BE → 走 UCS-2
+      //   3. 不像 UCS-2 + cmt_length 可信 → 长度匹配试 7-bit
+      //   4. 默认 UCS-2 (更安全, 防 DCS=0xFF/未知 + 中英混排短信被误判 7-bit → 乱码)
       size_t bodyHexLen = strnlen(msg.body_hex, sizeof(msg.body_hex));
       size_t bodyBytes  = bodyHexLen / 2;
       auto dcs7 = [](uint16_t d){
-        return (d<=0x03) || (d>=0x10&&d<=0x13) || (d>=0xF0&&d<=0xF3) || (d>=0xF8&&d<=0xFB);
+        return (d<=0x03) || (d>=0x10&&d<=0x13)
+            || (d==0xC0) || (d==0xD0)                              // MWI (3GPP TS 23.040 §9.2.3.10)
+            || (d>=0xF0&&d<=0xF3);
       };
       auto dcs8 = [](uint16_t d){
-        return (d>=0x04&&d<=0x07) || (d>=0x14&&d<=0x17) || (d>=0xF4&&d<=0xF7) || (d>=0xFC&&d<=0xFF);
+        return (d>=0x04&&d<=0x07) || (d>=0x14&&d<=0x17)
+            || (d>=0xF4&&d<=0xFB)                                   // 0xF8-0xFB: bit 2=1, 8-bit data
+            || (d>=0xFC&&d<=0xFF);
       };
       bool is7bit = dcs7(msg.dcs);
       bool is8bitData = !is7bit && dcs8(msg.dcs);
       if (!is7bit && !is8bitData) {
         // UCS-2 / reserved / 未知 → 启发, 默认 UCS-2 (更安全)
-        if (msg.cmt_length > 0) {
+        if (pdu::looks_like_ucs2_be(msg.body_hex, bodyHexLen)) {
+          // DCS=0 (或 reserved) 但实际 UCS-2 (gateway 标错, 泰文 0E23...) → 落 UCS-2 路径
+          // is7bit = false → 落到下面 else 分支调 decode_body_field
+          is7bit = false;
+        } else if (msg.cmt_length > 0) {
           // 7-bit: bodyBytes ≈ cmt_len*7/8 ±2
           size_t expect = (msg.cmt_length * 7 + 7) / 8;
           is7bit = (bodyBytes >= expect - 2 && bodyBytes <= expect + 2);
@@ -1261,7 +1272,7 @@ static void handleSave(AsyncWebServerRequest* req) {
 static void start_ap_mode() {
   uint8_t mac[6]; WiFi.macAddress(mac);
   char ssid[32];
-  snprintf(ssid, sizeof(ssid), "%s%02X%02X%02X", AP_SSID_PREFIX, mac[3], mac[4], mac[5]);
+  snprintf(ssid, sizeof(ssid), "%s", AP_SSID_PREFIX);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(ssid, AP_PASSWORD);

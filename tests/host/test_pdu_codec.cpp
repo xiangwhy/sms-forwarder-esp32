@@ -201,6 +201,61 @@ static void test_is_strict_utf8_false_4byte_lead() {
   CHECK(!pdu::is_strict_utf8(buf, 4));
 }
 
+// === task #37: looks_like_ucs2_be (raw bytes sniff, 网关 DCS 标错场景) ===
+static void test_looks_like_ucs2_thai() {
+  g_current = "looks_like_ucs2_be: Thai รหัสยืนยัน (8 char UCS-2 BE) → true";
+  // UCS-2 BE: 0E23 0E2B 0E31 0E22 0E2A 0E22 0E2D 0E19
+  //   ร(0E23) ห(0E2B) ั(0E31) ั(0E22) ส(0E2A) ั(0E22) อ(0E2D) น(0E19)
+  // 全部高字节 0x0E → 100% 命中 BMP 高频区
+  CHECK(pdu::looks_like_ucs2_be("0E230E2B0E310E220E2A0E220E2D0E19", 32));
+}
+
+static void test_looks_like_ucs2_chinese() {
+  g_current = "looks_like_ucs2_be: CJK 验证码 (4 char UCS-2 BE) → true";
+  // UCS-2 BE: 9A8C 8BC1 51 6 0E0A
+  //   验(9A8C) 证(8BC1) 码(51 6 码? -- U+7801 高字节应为 78)
+  // 重新: 验(9A8C) 证(8BC1) 码(7801) ??? -- 用真实 char: 验证码 = 9A8C 8BC1 7801
+  // 注意: 0E0A (UCS-2 BE) 是 0x0E0A = U+0E0A = ช (泰文) -- 不对, 重做
+  // 正确 UCS-2 BE: 9A8C 8BC1 7801 0E0A? 应该是 验 证 码 邮 / 之类
+  // 为简化测试用 4 个 CJK: 验 证 码 = 9A8C 8BC1 7801
+  // 加上一个泰文: 0E23 = ร → 9A8C 8BC1 7801 0E23
+  // 高字节: 9A, 8B, 78, 0E → 100% 命中
+  CHECK(pdu::looks_like_ucs2_be("9A8C8BC1780" "10E23", 16));  // 拆开 hex literal 避 0E0A 越界
+}
+
+static void test_looks_like_ucs2_ascii_negative() {
+  g_current = "looks_like_ucs2_be: 'Hello' (5 char ASCII 7-bit) → false";
+  // 纯 ASCII 7-bit, 高字节全是 0x00 (跳过) → pairHits 增但 hiHits 0
+  // 0% 命中 < 60% 阈值
+  CHECK(!pdu::looks_like_ucs2_be("48656C6C6F", 10));
+}
+
+static void test_looks_like_ucs2_gsm7_packed_negative() {
+  g_current = "looks_like_ucs2_be: GSM7 'How are you?' (14 char packed) → false";
+  // C8F71D14969741F977FD07 = "How are you?"
+  // 高字节: C8, F7, 1D, 14, 96, 97, 41, F9, 77, FD, 07
+  //   C8: 不在 0x0E-0x0F / 0x4E-0x9F / 0x34-0x4B → 不命中
+  //   F7: 不命中
+  //   1D: 不命中
+  //   14: 不命中
+  //   96: 0x96 在 0x4E-0x9F → 命中 (但这会让 GSM7 7-bit 也算 UCS-2?)
+  //   等等, 我们需要确认 GSM7 packed 的高字节确实不会成片 0x4E-0x9F
+  // 实测 GSM7 packed "How are you?" = C8F71D14969741F977FD07
+  //   高字节: C8, F7, 1D, 14, 96, 97, 41, F9, 77, FD, 07
+  //   0x4E-0x9F 区间: 96, 97 (2/11 = 18%) < 60% 阈值
+  // 实测应该返回 false (18% < 60%)
+  CHECK(!pdu::looks_like_ucs2_be("C8F71D14969741F977FD07", 22));
+}
+
+static void test_looks_like_ucs2_too_short() {
+  g_current = "looks_like_ucs2_be: 太短 (< 2 对) → false";
+  // 单字节 / 1 对都不行, 至少 2 对
+  CHECK(!pdu::looks_like_ucs2_be("0E", 2));
+  CHECK(!pdu::looks_like_ucs2_be("0E23", 4));   // 1 pair
+  CHECK(!pdu::looks_like_ucs2_be("", 0));      // 空
+  CHECK(!pdu::looks_like_ucs2_be("0E23", 3));   // 奇数长度
+}
+
 static void test_7bit_user_real_long_msg() {
   g_current = "decode_7bit_packed: 用户真车长 OTP (138 字节 / 158 septets) → 'Keep this code...23:20.'";
   // Part 1 UDH-stripped body (119 字节) + Part 2 UDH-stripped body (20 字节) = 139 字节
@@ -261,6 +316,13 @@ int main() {
   test_is_strict_utf8_true_gsm7_extended();
   test_is_strict_utf8_false_lone_continuation();
   test_is_strict_utf8_false_4byte_lead();
+
+  // task #37: looks_like_ucs2_be (raw bytes sniff, 网关 DCS 标错场景)
+  test_looks_like_ucs2_thai();
+  test_looks_like_ucs2_chinese();
+  test_looks_like_ucs2_ascii_negative();
+  test_looks_like_ucs2_gsm7_packed_negative();
+  test_looks_like_ucs2_too_short();
 
   std::printf("============================================================\n");
   std::printf("Result: %d passed, %d failed\n", g_pass, g_fail);

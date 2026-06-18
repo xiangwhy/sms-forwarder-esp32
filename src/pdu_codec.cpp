@@ -201,4 +201,46 @@ bool is_strict_utf8(const char* buf, size_t n) {
   return true;
 }
 
+// Sniff raw body hex 字节是否呈 UCS-2 BE 模式
+// 标准: DCS=0 但实际是 UCS-2 (gateway 标错, 如泰文 0E23...) → 应 fallback UCS-2
+// 规则:
+//   1. hexLen 偶数 (UCS-2 一字 2 字节)
+//   2. 至少 4 对完整字符 (>= 8 字节 hex, 即 4 UCS-2 字符) — 避免 1-2 字节巧合
+//   3. 高字节落在 BMP 高频区比例 >= 80% (严格, 防 7-bit packed 偶发命中)
+//      - 0x0E-0x0F: 泰文 (U+0E00-U+0E5F)
+//      - 0x4E-0x9F: CJK 统一表意 (U+4E00-U+9FFF)
+//      - 0x34-0x4B: CJK 扩展 A 等 (U+3400-U+4DBF, U+4E00-U+4BFF 边缘)
+//   4. 跳过: 高字节 0x00 (ASCII 嵌入) / 高字节 0xD8-0xDF (surrogate)
+bool looks_like_ucs2_be(const char* hex, size_t hexLen) {
+  if (hexLen == 0 || (hexLen & 1)) return false;
+  if (hexLen < 8) return false;  // 至少 2 对 (8 hex = 4 字节 = 2 UCS-2 字符)
+
+  auto nib = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+  };
+
+  size_t pairHits = 0;
+  size_t hiHits = 0;
+  for (size_t i = 0; i + 3 < hexLen; i += 4) {
+    int h0 = nib(hex[i]);
+    int h1 = nib(hex[i + 1]);
+    int h2 = nib(hex[i + 2]);
+    int h3 = nib(hex[i + 3]);
+    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) continue;
+    uint8_t hi = (uint8_t)((h0 << 4) | h1);
+    if (hi == 0x00) continue;                // 跳过 ASCII 嵌入对
+    if (hi >= 0xD8 && hi <= 0xDF) continue;  // 跳过 surrogate
+    pairHits++;
+    bool hiOk = (hi >= 0x0E && hi <= 0x0F)   // 泰文
+             || (hi >= 0x4E && hi <= 0x9F)   // CJK
+             || (hi >= 0x34 && hi <= 0x4B);  // CJK 扩展 A 等
+    if (hiOk) hiHits++;
+  }
+  // 至少 4 对 (8 个 UCS-2 字符) + 80% 高频区命中
+  return pairHits >= 4 && (hiHits * 100 / pairHits) >= 80;
+}
+
 }  // namespace pdu
