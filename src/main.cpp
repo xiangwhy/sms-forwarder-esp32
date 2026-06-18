@@ -96,12 +96,15 @@ struct Config {
   char otaPass[32];
   bool bootPush;   // 调试期可关 (v4.0.6+, 翔哥 2026-06-18 要求)
 };
-// 硬编码默认配置 (v4.0.4 patch, 烧板/重启后直接可用, 避免反复进 AP 配网)
+// 硬编码默认配置 (v4.0.6 P0 fix: 凭据字段全留空, NVS 空时强制 AP 配网)
 // NVS 优先, NVS 为空时回落到这里的默认值
+//   v4.0.4 patch 之前在 ssid/pass/token 写占位符 "YOUR_WIFI_SSID" 等,
+//   但占位符碰巧满足 isConfigValid() 长度校验 → STA 死循环无 AP fallback (P0 bug)
+//   现在凭据字段全留空 → isConfigValid() 立即 false → start_ap_mode()
 static Config g_cfg = {
-  "YOUR_WIFI_SSID",                     // ssid  — 改为你自己的 WiFi SSID, 或 web 配网覆盖
-  "YOUR_WIFI_PASS",                     // pass  — 改为你自己的 WiFi 密码, 或 web 配网覆盖
-  "YOUR_PUSHPLUS_TOKEN",                // token — 32 hex, pushplus 控制台拿, 或 web 配网覆盖
+  "",                                   // ssid  — 必须 web 配网填, 不在源码留凭据
+  "",                                   // pass  — 必须 web 配网填
+  "",                                   // token — 必须 web 配网填 (pushplus 控制台拿)
   "",                                   // topic (空 = 个人推送), 通过 web 配网设置
   "admin",                              // otaUser (默认), 配网时改
   "Admin@123",                         // otaPass (默认), 配网时改
@@ -138,7 +141,13 @@ static void saveConfig(const Config& c) {
 }
 
 static bool isConfigValid() {
-  return strlen(g_cfg.ssid) > 0 && strlen(g_cfg.token) >= 16;
+  if (strlen(g_cfg.ssid) == 0 || strlen(g_cfg.token) < 16) return false;
+  // v4.0.6 P0 fix: defense-in-depth, 拒占位符字符串
+  // 当前 g_cfg 凭据字段已全留空, 上面的 strlen 检查已足够,
+  // 这里保留 strcmp 防源码被改回去时静默失效
+  if (strcmp(g_cfg.ssid, "YOUR_WIFI_SSID") == 0) return false;
+  if (strcmp(g_cfg.token, "YOUR_PUSHPLUS_TOKEN") == 0) return false;
+  return true;
 }
 
 static void wipeConfig() {
@@ -1337,7 +1346,9 @@ header h1 .dot.bad{background:var(--err)}
 .tag-bad{background:rgba(248,113,113,.12);color:var(--err)}
 .tag-warn{background:rgba(251,191,36,.12);color:var(--warn)}
 .tag-mute{background:var(--card2);color:var(--muted)}
-.actions{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px;align-items:center}
+.actions .restart{margin-left:auto}
+@media(max-width:600px){.actions .restart{margin-left:0;width:100%;order:99}}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 14px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;color:var(--text);background:var(--card2);border:1px solid var(--border);transition:background .15s,border-color .15s,transform .05s;cursor:pointer;font-family:inherit}
 .btn:hover{background:#2c3744;border-color:#384454}
 .btn:active{transform:translateY(1px)}
@@ -1431,7 +1442,7 @@ footer .refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;
     <a class="btn primary" href="/update">OTA 升级</a>
     <a class="btn" href="/send">短信发送</a>
     <a class="btn" href="/config">配置</a>
-    <a class="btn warn" href="javascript:doRestart()">重启</a>
+    <a class="btn warn restart" href="javascript:doRestart()">重启</a>
   </div>
 
   <div class="card">
@@ -1490,9 +1501,10 @@ async function poll() {
     document.getElementById('ntp').textContent = j.timeSynced ? '已同步' : '未同步';
     document.getElementById('ntp').className   = 'tag ' + (j.timeSynced ? 'tag-ok' : 'tag-warn');
 
-    // P11b: 用 epoch ms 显示真实时间, 同步前显示 millis ago
-    const lp = j.lastPushOkUtc ? j.lastPushOkUtc : (j.lastPushOkMs || 0);
-    const ls = j.lastSmsUtc    ? j.lastSmsUtc    : (j.lastSmsMs    || 0);
+    // P11b: 用 epoch ms 显示真实时间, 同步前显示 "-"
+    // 修复 1970 bug: 不能 fallback 到 lastSmsMs (millis 自开机, 当 epoch 用 new Date() = 1970+uptime)
+    const lp = j.lastPushOkUtc || 0;
+    const ls = j.lastSmsUtc    || 0;
     const lpEl = document.getElementById('lp');
     const lsEl = document.getElementById('ls');
     lpEl.textContent = lp ? fmtUtc(lp) + ' (' + ago(lp) + ')' : '-';
@@ -2323,61 +2335,36 @@ static void handleConfigPage(AsyncWebServerRequest* r) {
   r->send_P(200, "text/html; charset=utf-8", CONFIG_HTML);
 }
 
-static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SMS Forwarder 配网</title>
-<style>
-body{font-family:-apple-system,sans-serif;max-width:420px;margin:30px auto;padding:0 16px}
-h1{font-size:20px}label{display:block;margin:12px 0 4px;font-size:14px;color:#555}
-input{width:100%;box-sizing:border-box;padding:10px;font-size:15px;border:1px solid #ccc;border-radius:6px}
-button{margin-top:20px;width:100%;padding:12px;font-size:16px;background:#06f;color:#fff;border:0;border-radius:6px}
-small{color:#888}
-fieldset{border:1px solid #ddd;border-radius:6px;padding:8px 12px;margin-top:18px}
-legend{font-size:13px;color:#666;padding:0 6px}
-</style></head><body>
-<h1>SMS Forwarder 配网</h1>
-<form method="POST" action="/save">
-<label>WiFi SSID</label><input name="ssid" required maxlength="63">
-<label>WiFi 密码</label><input name="pass" type="password" maxlength="63">
-<label>pushplus token <small>(pushplus.plus 个人中心)</small></label>
-<input name="token" required minlength="16" maxlength="63">
-<label>pushplus topic <small>(可空, 群组推送用)</small></label>
-<input name="topic" maxlength="63">
-<fieldset>
-<legend>Web OTA 烧录 (防别人乱刷)</legend>
-<label>OTA 用户名</label><input name="ota_user" value="admin" maxlength="31">
-<label>OTA 密码</label><input name="ota_pass" type="password" minlength="4" maxlength="31">
-</fieldset>
-<button>保存并重启</button>
-</form>
-<p><small>v4.0.2 / 重启后自动连 WiFi</small></p>
-</body></html>
-)HTML";
-
-static void handleSave(AsyncWebServerRequest* req) {
-  Config c = {};
-  if (req->hasParam("ssid", true))     strncpy(c.ssid,    req->getParam("ssid",    true)->value().c_str(), sizeof(c.ssid)-1);
-  if (req->hasParam("pass", true))     strncpy(c.pass,    req->getParam("pass",    true)->value().c_str(), sizeof(c.pass)-1);
-  if (req->hasParam("token", true))    strncpy(c.token,   req->getParam("token",   true)->value().c_str(), sizeof(c.token)-1);
-  if (req->hasParam("topic", true))    strncpy(c.topic,   req->getParam("topic",   true)->value().c_str(), sizeof(c.topic)-1);
-  if (req->hasParam("ota_user", true)) strncpy(c.otaUser, req->getParam("ota_user",true)->value().c_str(), sizeof(c.otaUser)-1);
-  if (req->hasParam("ota_pass", true)) strncpy(c.otaPass, req->getParam("ota_pass",true)->value().c_str(), sizeof(c.otaPass)-1);
-  if (strlen(c.ssid) == 0 || strlen(c.token) < 16) {
-    req->send(400, "text/plain; charset=utf-8", "SSID 不能空, token 至少 16 位");
-    return;
-  }
-  if (strlen(c.otaUser) == 0) strncpy(c.otaUser, "admin", sizeof(c.otaUser)-1);
-  if (strlen(c.otaPass) < 4) {
-    req->send(400, "text/plain; charset=utf-8", "OTA 密码至少 4 位 (防别人刷固件)");
-    return;
-  }
-  saveConfig(c);
-  req->send(200, "text/plain; charset=utf-8", "保存成功, 设备 1 秒后重启 ...");
-  delay(800);
-  ESP.restart();
+// =================== Web 路由 (AP + STA 共用) ===================
+// v4.0.6 P-merge: AP 模式也跑 dashboard, 凭这套路由同时挂到 g_webServer 和 g_apServer
+// auth 由 check_dashboard_auth 内部根据 g_cfg.otaUser/otaPass 决定 → AP 空 NVS 时是 no-op
+// 调用方负责注册 STA 专属的 /api/factory 和 /api/scan (AP 模式没意义)
+static void register_web_routes(AsyncWebServer* srv) {
+  srv->on("/api/status",       HTTP_GET,  handleApiStatus);
+  srv->on("/update",           HTTP_GET,  handle_ota_page);
+  srv->on("/update",           HTTP_POST, handle_ota_done,
+    [](AsyncWebServerRequest* r, const String& fn, size_t idx, uint8_t* d, size_t l, bool fin) {
+      handle_ota_chunk(r, fn, idx, d, l, fin);
+    });
+  srv->on("/restart",          HTTP_GET,  handle_restart);
+  srv->on("/send",             HTTP_GET,  handleSendPage);
+  srv->on("/config",           HTTP_GET,  handleConfigPage);
+  srv->on("/api/send",         HTTP_POST, handleApiSend, nullptr, handleApiSendBody);
+  srv->on("/api/sent",         HTTP_GET,  handleApiSent);
+  srv->on("/api/sent/clear",   HTTP_POST, handleApiSentClear);
+  srv->on("/api/bootPush",     HTTP_POST,
+    [](AsyncWebServerRequest* r) { if (!check_dashboard_auth(r)) return; },
+    nullptr,
+    handleApiBootPush);
+  srv->on("/api/cfg",          HTTP_GET,
+    [](AsyncWebServerRequest* r) { if (!check_dashboard_auth(r)) return; handleApiCfgGet(r); });
+  srv->on("/api/cfg",          HTTP_POST,
+    [](AsyncWebServerRequest* r) { if (!check_dashboard_auth(r)) return; },
+    nullptr,
+    handleApiCfgPost);
 }
 
+// =================== AP 配网 ===================
 static void start_ap_mode() {
   uint8_t mac[6]; WiFi.macAddress(mac);
   char ssid[32];
@@ -2393,10 +2380,16 @@ static void start_ap_mode() {
   g_apDns->start(53, "*", WiFi.softAPIP());
 
   g_apServer = new AsyncWebServer(80);
+  // v4.0.6 P-merge: AP 模式直接 dashboard, DNS captive portal 把所有主机名 → 192.168.4.1 → / 命中
   g_apServer->on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+    r->send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML);
   });
-  g_apServer->on("/save", HTTP_POST, handleSave);
+  // /dashboard 也直出, 让 dashboard 内的导航链接 (返回 dashboard 等) 不 404
+  g_apServer->on("/dashboard", HTTP_GET, [](AsyncWebServerRequest* r) {
+    r->send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML);
+  });
+  // AP 模式 auth 是 no-op (g_cfg.otaUser/otaPass 空) → 共用 helper 注册同一套路由
+  register_web_routes(g_apServer);
   g_apServer->onNotFound([](AsyncWebServerRequest* r) {
     r->redirect("/");
   });
@@ -2643,43 +2636,11 @@ void setup() {
     if (!check_dashboard_auth(r)) return;
     r->send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML);
   });
-  g_webServer->on("/api/status", HTTP_GET, handleApiStatus);
-  g_webServer->on("/update",     HTTP_GET, handle_ota_page);
-  g_webServer->on("/update",     HTTP_POST, handle_ota_done,
-    [](AsyncWebServerRequest* r, const String& fn, size_t idx, uint8_t* d, size_t l, bool fin) {
-      handle_ota_chunk(r, fn, idx, d, l, fin);
-    });
-  g_webServer->on("/restart", HTTP_GET, handle_restart);
-  g_webServer->on("/send",    HTTP_GET, handleSendPage);
-  // v4.0.6 P26: P24 搬配网表单去 /config 但漏注册路由, 补上
-  g_webServer->on("/config",  HTTP_GET, handleConfigPage);
-  // P0 fix #2: 5 参 on(uri, method, onRequest, onUpload=nullptr, onBody) 把 body handler 挂上
-  // ESP32Async fork 没 r->body 字段, body 由 handleApiSendBody 累积到 _tempObject
-  // (onBody 是 AsyncCallbackWebHandler 的 method, 见 WebHandlerImpl.h)
-  g_webServer->on("/api/send", HTTP_POST, handleApiSend, nullptr, handleApiSendBody);
-  g_webServer->on("/api/sent", HTTP_GET, handleApiSent);
-  g_webServer->on("/api/sent/clear", HTTP_POST, handleApiSentClear);
-  // P19: 恢复出厂
+  // 共用路由 (helper 跳过 /api/factory + /api/scan, AP 模式无意义)
+  register_web_routes(g_webServer);
+  // P19: 恢复出厂 — STA 专属 (AP 模式已是无凭据状态, 不需要这个)
   g_webServer->on("/api/factory", HTTP_POST, handleApiFactory);
-  // 开机推送开关: 要 dashboard 鉴权 (改的是持久配置)
-  g_webServer->on("/api/bootPush", HTTP_POST,
-    [](AsyncWebServerRequest* r) {
-      if (!check_dashboard_auth(r)) return;
-    },
-    nullptr,
-    handleApiBootPush);
-  // 配网编辑 (v4.0.6+, 翔哥 2026-06-18 加): 要 dashboard 鉴权
-  g_webServer->on("/api/cfg", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (!check_dashboard_auth(r)) return;
-    handleApiCfgGet(r);
-  });
-  g_webServer->on("/api/cfg", HTTP_POST,
-    [](AsyncWebServerRequest* r) {
-      if (!check_dashboard_auth(r)) return;
-    },
-    nullptr,
-    handleApiCfgPost);
-  // P15: WiFi 扫描
+  // P15: WiFi 扫描 — STA 专属 (AP 模式已经在 AP, 扫不到 STA 网络)
   g_webServer->on("/api/scan", HTTP_GET, handleApiScan);
   g_webServer->begin();
   ESP_LOGI(TAG, "Web server up (Dashboard / API / OTA)");
