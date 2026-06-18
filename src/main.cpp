@@ -2651,6 +2651,8 @@ void setup() {
     });
   g_webServer->on("/restart", HTTP_GET, handle_restart);
   g_webServer->on("/send",    HTTP_GET, handleSendPage);
+  // v4.0.6 P26: P24 搬配网表单去 /config 但漏注册路由, 补上
+  g_webServer->on("/config",  HTTP_GET, handleConfigPage);
   // P0 fix #2: 5 参 on(uri, method, onRequest, onUpload=nullptr, onBody) 把 body handler 挂上
   // ESP32Async fork 没 r->body 字段, body 由 handleApiSendBody 累积到 _tempObject
   // (onBody 是 AsyncCallbackWebHandler 的 method, 见 WebHandlerImpl.h)
