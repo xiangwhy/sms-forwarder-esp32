@@ -85,7 +85,7 @@ pio device monitor -b 115200 -p /dev/cu.usbserial-XXXX
 | `lastPushOkMs` | int | 上次推送成功时间 (millis) | 同上 |
 | `mlAlive` | bool | 4G 模组 (ML307) 是否 alive | setup 后置 true,watchdog 未实现 |
 | `udhActive` | int | 当前活跃 UDH 长短信拼接槽 (0–4) | 长时间 >0 表示有 slot 卡死 |
-| `fw` | str | 固件版本号 | 例 "v4.0.3" |
+| `fw` | str | 固件版本号 | 例 "v4.0.5" |
 
 **示例**:
 ```json
@@ -95,7 +95,7 @@ pio device monitor -b 115200 -p /dev/cu.usbserial-XXXX
   "freeHeap": 87344, "minFreeHeap": 81200,
   "lastSmsMs": 3842100, "lastPushOkMs": 3842150,
   "mlAlive": true, "udhActive": 0,
-  "fw": "v4.0.3"
+  "fw": "v4.0.5"
 }
 ```
 | `/update` | OTA 烧录 (弹窗输 OTA 用户密码) |
@@ -113,7 +113,7 @@ pio device monitor -b 115200 -p /dev/cu.usbserial-XXXX
 | Web OTA | ✅ | BasicAuth,密码存 NVS |
 | AP 配网 | ✅ | 无密码或默认 `12345678` |
 | LED 状态 | ✅ | 3 灯 |
-| BOOT 长按 5s 清 NVS | ✅ | GPIO0 长按 5s 触发 |
+| BOOT 长按 60s 清 NVS | ✅ | GPIO0 长按 60s + 500ms debounce 触发(防 GPIO0 抖动误 wipe) |
 | RNDIS 4G 上网 | ❌ | 长期搁置,iot_eth 0.1.x 的 `stack_input` 没接好会 NULL deref panic |
 | ArduinoOTA | ❌ | 用 web OTA 替代 |
 | 数据用量统计 | ❌ | 不要 |
@@ -132,12 +132,15 @@ esp32-sms/
 ├── sdkconfig.defaults      # ESP-IDF 配置(FREERTOS_HZ=1000, USB Host 等)
 ├── partitions.csv          # 8MB flash dual-OTA 分区表
 ├── src/
-│   ├── main.cpp           # 全部业务代码 (~1320 行,单文件)
+│   ├── main.cpp           # 业务代码 (WiFi / Web / SMS / push 队列)
+│   ├── pdu_codec.h        # PDU 解码函数声明 (纯 C++, host test 可跑)
+│   ├── pdu_codec.cpp      # PDU 7-bit packed / UCS-2 / phone / UDH 解码
 │   ├── CMakeLists.txt     # main 组件 REQUIRES
 │   └── idf_component.yml  # 依赖 iot_usbh_cdc ^3.0
-├── managed_components/     # 旧版残留,新版本不再用
-├── setup_components.sh     # 旧版拉 esp-iot-solution 脚本,新版本不需
-├── v4.0.factory.bin       # 整包固件 (bootloader+partitions+app),1.3MB
+├── tests/
+│   ├── host/              # C++ host test (PC 上跑,45 用例,绑定生产 pdu_codec.cpp)
+│   └── test_pdu_parser.py # 旧版 Python 测试 (deprecated, 已被 C++ 替代)
+├── v4.0.5.factory.bin     # 整包固件 (bootloader+partitions+app),1.13MB
 ├── README_v3.6.md          # v3.6 旧文档 (deprecated)
 └── PLATFORMIO_GUIDE.md     # PIO 环境搭建指南
 ```

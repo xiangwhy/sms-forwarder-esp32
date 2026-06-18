@@ -1,6 +1,6 @@
 # 路线图 (Roadmap)
 
-v4.0.2 已发布 (2026-06-13)。
+v4.0.5 已发布 (2026-06-18)。
 
 ## v4.2 — 待拍
 
@@ -25,12 +25,12 @@ v4.0.2 已发布 (2026-06-13)。
 
 ## 翔哥立刻能做的
 
-v4.0.2 长短信够用, **不用急开新版本**。如果某天:
+v4.0.5 长短信够用, **不用急开新版本**。如果某天:
 - WiFi 挂想用 4G 推送 → 提 issue。v4.0.3 已删 RNDIS 死路径,**走 esp_eth 重做 RNDIS** 或换模组(WiFi 永断场景才能补)
 - 收到 4 段以上长短信仍异常 → 提 issue, 我们查 UDH slot
 - 想要其他 push 通道 / 关键词过滤 / MQTT → 提 issue, 我们加
 
 ---
 
-**当前状态**: v4.0.2 stable (UDH 长短信拼接修 + phone 短号乱码修)
-**Release**: https://github.com/xiangwhy/sms-forwarder-esp32/releases/tag/v4.0.2
+**当前状态**: v4.0.5 stable (DCS 表对齐 gammu + 混合启发修泰文 DCS=0 误标 + BOOT 60s 防死循环)
+**Release**: https://github.com/xiangwhy/sms-forwarder-esp32/releases/tag/v4.0.5

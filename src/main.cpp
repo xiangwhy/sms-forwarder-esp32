@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- *  SMS Forwarder v4.0.3  (ESP32-S3 + USB 4G Modem + pushplus)
+ *  SMS Forwarder v4.0.5  (ESP32-S3 + USB 4G Modem + pushplus)
  *  Stack: ESP-IDF 5.5 + Arduino-ESP32 3.x (pioarduino platform)
  *
  *  v3.6.4 (IDF 4.4) 重写, 全面适配 IDF 5.5 API。
@@ -61,7 +61,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.3"
+#define FW_VERSION         "v4.0.5"
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -1043,7 +1043,7 @@ h1{font-size:20px}.row{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}
 .tag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:12px}
 .tag-ok{background:#dfd;color:#282}.tag-bad{background:#fdd;color:#822}
 </style></head><body>
-<h1>SMS Forwarder <span class=tag>FW v4.0.3</span></h1>
+<h1>SMS Forwarder <span class=tag>FW v4.0.5</span></h1>
 <div class=row>
   <div class=card><h3>运行</h3>
     <div class=kv><b>Boot</b><span id=boot>0</span></div>

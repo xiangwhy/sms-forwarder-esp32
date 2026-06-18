@@ -16,7 +16,7 @@ cd sms-forwarder-esp32
 
 # 烧整包 (bootloader + app)
 esptool.py --chip esp32s3 -p /dev/cu.usbserial-XXXX \
-  write_flash 0x0 v4.0.2.factory.bin
+  write_flash 0x0 v4.0.5.factory.bin
 ```
 
 或者用 PIO:
@@ -62,7 +62,8 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 
 | Release | 下载 |
 |---|---|
-| **v4.0.2** (最新) | [v4.0.2.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.2/v4.0.2.factory.bin) |
+| **v4.0.5** (最新) | [v4.0.5.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.5/v4.0.5.factory.bin) |
+| v4.0.2 | [v4.0.2.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.2/v4.0.2.factory.bin) |
 | v4.0.1 | [v4.0.1.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.1/v4.0.1.factory.bin) |
 | v4.0 | [v4.0.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0/v4.0.factory.bin) |
 
