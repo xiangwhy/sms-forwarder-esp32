@@ -59,6 +59,79 @@ pio device monitor -b 115200 -p /dev/cu.usbserial-XXXX
    - **OTA 密码**(至少 4 位,防别人乱刷)
 5. 保存 → 设备自动重启 → 启动后连 WiFi、连 4G、收 SMS、推送
 
+## 凭据维护 (3 种改 NVS 的方法)
+
+设备 6 个 NVS 凭据在 namespace `cfg` 下: `wifi.ssid` / `wifi.pass` / `pp.tok` / `pp.tpc` / `ota.user` / `ota.pass`。
+
+| 方法 | 适用 | 风险 |
+|---|---|---|
+| **A. Web `/send` 配网** | 改一项 (e.g. pushplus token) | 最低, 标准流程 |
+| **B. 长按 BOOT 5s 清 NVS → AP 配** | 全量重配 | bootCount / stat 不重置 (走 Preferences clear, 不是 NVS 全擦) |
+| **C. NVS blob 灌入 (esptool)** | 改一项, 不进 web | 见下方坑 |
+
+### 方法 C: NVS blob 灌入 (脱机改凭据)
+
+> 用于: 板子没配过 (AP 模式死循环) / 想脚本化初始化 N 块板子 / 不方便进 web。
+
+**坑**: `nvs_partition_gen.py` 的 CSV 第一行 **必须** 写 namespace 声明, 不然 6 个 key 全落到 namespace index 0 (ESP-IDF 系统 NS), Arduino `Preferences::begin("cfg")` 找不到, 全部回退占位符。
+
+**步骤**:
+
+1. 写 CSV (`/tmp/esp32-cfg.csv`):
+   ```csv
+   key,type,encoding,value
+   cfg,namespace,,
+   wifi.ssid,data,string,YOUR_WIFI_SSID
+   wifi.pass,data,string,YOUR_WIFI_PASS
+   pp.tok,data,string,YOUR_PUSHPLUS_TOKEN
+   pp.tpc,data,string,
+   ota.user,data,string,admin
+   ota.pass,data,string,change-me
+   ```
+   **第一行 `<ns_name>,namespace,,` 不可省**。
+   **警告**: CSV 含真实凭据,**绝对不能 commit 进仓库**,只放 `/tmp/` 用完即删。
+
+2. 生成 blob:
+   ```bash
+   python3 /Users/xiang/.platformio/packages/framework-espidf/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py generate /tmp/esp32-cfg.csv /tmp/esp32-cfg.bin 0x6000
+   ```
+   0x6000 = 24KB, 与 partition table 一致。
+
+3. 烧到 NVS 分区 (0x9000):
+   ```bash
+   python3 -m esptool --chip esp32s3 -p /dev/cu.usbserial-1240 write_flash 0x9000 /tmp/esp32-cfg.bin
+   ```
+   esptool 烧完自动 RTS 复位, 板子重启, 重新连 WiFi。
+
+4. **副作用**: 重写整个 NVS 也会清掉 page 1 里 ESP-IDF WiFi 库自动存的 `sta.ssid`/`sta.pswd` 和 `cal_data` — 但 ESP32 boot 时会自己重建, 不影响。`bootCount` 重置回 0。
+
+5. **恢复**: 烧之前先备份, `python3 -m esptool ... read_flash 0x9000 0x6000 /tmp/esp32-nvs-backup.bin`, 要回滚就 `write_flash 0x9000 /tmp/esp32-nvs-backup.bin`。
+
+**验证**:
+
+```bash
+# 抓 log 看 Config 行
+python3 -c "
+import serial, time
+ser = serial.Serial('/dev/cu.usbserial-1240', 115200, timeout=1)
+ser.setRTS(False); time.sleep(0.2); ser.setRTS(True)
+time.sleep(2); ser.reset_input_buffer()
+end = time.time() + 8
+buf = b''
+while time.time() < end:
+    chunk = ser.read(4096)
+    if chunk: buf += chunk
+print(buf.decode('utf-8', errors='replace'))
+" | grep -E "Config:|WiFi connected|Web server"
+```
+
+期望看到:
+```
+Config: ssid=YOUR_WIFI_SSID token=YOUR_PUSHPLUS... ota_user=admin
+WiFi connected, IP=192.168.1.130
+Web server up (Dashboard / API / OTA)
+```
+
 ## Web 页面
 
 设备连上 WiFi 后,同网段浏览器:

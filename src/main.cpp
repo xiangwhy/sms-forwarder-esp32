@@ -43,6 +43,9 @@
 #include <freertos/semphr.h>
 #include <driver/gpio.h>
 
+#include <esp_netif_sntp.h>   // v4.0.6 P11: 时间同步, 让 lastSms/lastPush 显示真实时间
+#include <esp_heap_caps.h>    // v4.0.6 P13: heap_caps_get_total_size 拿总内存
+
 #include "iot_usbh_cdc.h"
 #include "usbh_helper.h"
 #include "ping/ping_sock.h"
@@ -91,6 +94,7 @@ struct Config {
   char topic[64];
   char otaUser[32];
   char otaPass[32];
+  bool bootPush;   // 调试期可关 (v4.0.6+, 翔哥 2026-06-18 要求)
 };
 // 硬编码默认配置 (v4.0.4 patch, 烧板/重启后直接可用, 避免反复进 AP 配网)
 // NVS 优先, NVS 为空时回落到这里的默认值
@@ -100,7 +104,8 @@ static Config g_cfg = {
   "YOUR_PUSHPLUS_TOKEN",                // token — 32 hex, pushplus 控制台拿, 或 web 配网覆盖
   "",                                   // topic (空 = 个人推送), 通过 web 配网设置
   "admin",                              // otaUser (默认), 配网时改
-  "change-me"                           // otaPass (默认), 配网时改
+  "Admin@123",                         // otaPass (默认), 配网时改
+  true                                  // bootPush — 默认开, dashboard 可关
 };
 
 static void loadConfig() {
@@ -112,9 +117,11 @@ static void loadConfig() {
   p.getString("pp.tpc",    g_cfg.topic, sizeof(g_cfg.topic));
   p.getString("ota.user",  g_cfg.otaUser, sizeof(g_cfg.otaUser));
   p.getString("ota.pass",  g_cfg.otaPass, sizeof(g_cfg.otaPass));
+  // bootPush 用 UChar (1 byte) 存, 默认 true (NVS 不存在时 = 1)
+  g_cfg.bootPush = p.getUChar("bootPush", 1) != 0;
   p.end();
-  ESP_LOGI(TAG, "Config: ssid=%s token=%.8s... ota_user=%s",
-           g_cfg.ssid, g_cfg.token, g_cfg.otaUser);
+  ESP_LOGI(TAG, "Config: ssid=%s token=%.8s... ota_user=%s bootPush=%d",
+           g_cfg.ssid, g_cfg.token, g_cfg.otaUser, g_cfg.bootPush);
 }
 
 static void saveConfig(const Config& c) {
@@ -126,6 +133,7 @@ static void saveConfig(const Config& c) {
   p.putString("pp.tpc",    c.topic);
   p.putString("ota.user",  c.otaUser);
   p.putString("ota.pass",  c.otaPass);
+  p.putUChar("bootPush",  c.bootPush ? 1 : 0);
   p.end();
 }
 
@@ -194,8 +202,11 @@ static volatile bool g_wifiUp     = false;
 static volatile int  g_pushOk     = 0;
 static volatile int  g_pushFail   = 0;
 static volatile uint32_t g_bootCount = 0;
-static volatile uint32_t g_lastSmsMs    = 0;  // 上次收短信时间 (millis)
-static volatile uint32_t g_lastPushOkMs = 0;  // 上次推送成功时间 (millis)
+static volatile uint32_t g_lastSmsMs       = 0;  // 上次收短信时间 (millis, 兼容)
+static volatile uint32_t g_lastPushOkMs    = 0;  // 上次推送成功时间 (millis, 兼容)
+static volatile uint32_t g_lastSmsUtcMs    = 0;  // v4.0.6 P11b: epoch ms
+static volatile uint32_t g_lastPushOkUtcMs = 0;
+static volatile bool     g_timeSynced      = false;  // SNTP 同步标志
 
 // 4G 模组健康
 typedef struct {
@@ -210,6 +221,9 @@ static modem_lifecycle_t g_ml = {false, 0, 0, false, false, 0};
 
 // AP 模式
 static volatile bool g_apModeActive = false;
+// v4.0.6 P19: /api/factory 触发, setup() 早期检测, nvs_flash_erase 后重启
+// 用 RTC slow memory 存, ESP.restart() 不丢
+RTC_DATA_ATTR static volatile bool g_factoryReset = false;
 static portMUX_TYPE  s_apMux = portMUX_INITIALIZER_UNLOCKED;
 static void ap_mode_set(bool on) { taskENTER_CRITICAL(&s_apMux); g_apModeActive = on; taskEXIT_CRITICAL(&s_apMux); }
 static bool ap_mode_get()        { taskENTER_CRITICAL(&s_apMux); bool r = g_apModeActive; taskEXIT_CRITICAL(&s_apMux); return r; }
@@ -495,6 +509,15 @@ static void usb_rx_task(void* /*param*/) {
     if (dataLen > sizeof(buf)) dataLen = sizeof(buf);
     if (usbh_cdc_read_bytes(g_cdc, buf, &dataLen, pdMS_TO_TICKS(100)) != ESP_OK) continue;
 
+    // P6 调试: 临时打印 RX raw, 看 4G 模组到底回了什么 (收到 > 后会触发 g_atPrompt)
+    // P6b debug: 临时打开, 看到 RX 后再关
+#define DEBUG_CMGS_RX 1
+#ifdef DEBUG_CMGS_RX
+    if (g_waitingCmgsPrompt) {
+      ESP_LOGW(TAG, "RX[%u]: %.*s", (unsigned)dataLen, (int)dataLen, (const char*)buf);
+    }
+#endif
+
     size_t pos = 0;
     while (pos < dataLen) {
       void* nl = memchr(buf + pos, '\n', dataLen - pos);
@@ -639,9 +662,13 @@ static size_t build_push_payload(const String& phoneUtf8, const String& bodyUtf8
 }
 
 // 推送成功计数 + 时间戳统一更新(boot 通知 / net_task 共用)
+// v4.0.6 P11b: 同时记 epoch ms (g_timeSynced 后才有效; 同步前 epoch<1e9 也无所谓)
+// v4.0.6 P11c: 只在 SNTP 同步后写 epoch, 否则保持 0 (前端显 "-")
+//   客户反馈 "看到 1970/01/01 08:00:27" — 同步前 time(NULL)=0 写出小值显示 1970
 static inline void push_success_inc() {
   __atomic_add_fetch(&g_pushOk, 1, __ATOMIC_RELAXED);
   g_lastPushOkMs = millis();
+  if (g_timeSynced) g_lastPushOkUtcMs = (uint32_t)((uint64_t)time(NULL) * 1000ULL);
 }
 
 // 通用 HTTPS POST JSON, 返回 HTTP code (-1 = 网络错 / init 失败)
@@ -672,6 +699,10 @@ static bool post_pushplus_raw(const char* payload, size_t len) {
 
 // =================== 开机上线通知 ===================
 static void push_boot_notification() {
+  if (!g_cfg.bootPush) {
+    ESP_LOGI(TAG, "Boot notification skipped (cfg.bootPush=false)");
+    return;
+  }
   if (WiFi.status() != WL_CONNECTED) {
     ESP_LOGW(TAG, "WiFi not up, skip boot notification");
     return;
@@ -791,19 +822,14 @@ static void nvsQSanityCheck() {
 }
 
 // =================== SMS 发送 (v4.0.6+, 双向) ===================
-// 限频: 1 分钟 5 条 (滑窗, RAM token bucket)
-static uint32_t s_sendTs[5] = {0};
+// 限频: 1 分钟 N 条 (滑窗, RAM token bucket) — 调试期放大到 20/min
+static constexpr int SEND_RL_CAP = 20;
+static uint32_t s_sendTs[SEND_RL_CAP] = {0};
 static int      s_sendIdx = 0;
 static portMUX_TYPE s_sendMux = portMUX_INITIALIZER_UNLOCKED;
 static bool smsRateLimitOk() {
-  uint32_t now = millis();
-  portENTER_CRITICAL(&s_sendMux);
-  int alive = 0;
-  for (int i = 0; i < 5; i++) if (now - s_sendTs[i] < 60000) alive++;
-  bool ok = (alive < 5);
-  if (ok) { s_sendTs[s_sendIdx] = now; s_sendIdx = (s_sendIdx + 1) % 5; }
-  portEXIT_CRITICAL(&s_sendMux);
-  return ok;
+  // TODO: 修完 nvsSentList 噪声 + log 级别后, 恢复限频 (翔哥 2026-06-18 拍板先关闭)
+  return true;
 }
 
 // NVS "sent" 命名空间, 32 条滚动 (仿 pqueue 模式)
@@ -822,6 +848,13 @@ static void nvsSentEnqueue(const char* phone, const char* body_preview,
     (unsigned long)millis(), phone, body_preview, ref, ok ? 1 : 0, err_code);
   p.putString(key, val);
   p.putUChar("head", (head + 1) % SENT_CAP);
+  p.end();
+}
+// v4.0.6 P14: 清空 sent 历史 (翔哥 2026-06-18 加, dashboard 列表清掉)
+static void nvsSentClear() {
+  Preferences p;
+  p.begin(NVS_NS_SENT, false);
+  p.clear();    // 整 namespace 擦 (32 keys + head)
   p.end();
 }
 
@@ -882,29 +915,100 @@ static int cmgs_send_pdu(const char* pdu_hex, uint8_t& outRef, int& outErr, uint
   usbh_cdc_write_bytes(g_cdc, (uint8_t*)cmd, strlen(cmd), pdMS_TO_TICKS(100));
 
   int rc = -2;
-  if (xSemaphoreTake(g_atPrompt, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-    // 写 PDU + Ctrl-Z
-    size_t n = strlen(pdu_hex);
-    char buf[600];
-    if (n + 1 >= sizeof(buf)) { g_waitingCmgsPrompt = false; xSemaphoreGive(g_atMutex); return -2; }
-    memcpy(buf, pdu_hex, n);
-    buf[n] = 0x1A;     // Ctrl-Z
-    usbh_cdc_write_bytes(g_cdc, (uint8_t*)buf, n + 1, pdMS_TO_TICKS(200));
-    // 等 OK/ERROR
-    if (xSemaphoreTake(g_atDone, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-      rc = g_atResult;
-      if (rc == 0) {
-        const char* p = strstr(g_atReply, "+CMGS:");
-        if (p) outRef = (uint8_t)atoi(p + 6);
-      } else {
-        const char* p = strstr(g_atReply, "+CMS ERROR:");
-        if (p) outErr = atoi(p + 11);
-      }
+  // v4.0.6 P6b: ML307 PDU 模式可能不回 ">" 提示 (Quectel 风格: AT+CMGS=n 后直接进入 PDU 接收)
+  // 先等 200ms, 拿到 > 就走老路; 拿不到就直接发 PDU+CtrlZ
+  bool gotPrompt = (xSemaphoreTake(g_atPrompt, pdMS_TO_TICKS(200)) == pdTRUE);
+  if (!gotPrompt) ESP_LOGW(TAG, "CMGS no '>' prompt, send PDU directly (ML307 quirk?)");
+  // 写 PDU + Ctrl-Z
+  size_t n = strlen(pdu_hex);
+  char buf[600];
+  if (n + 1 >= sizeof(buf)) { g_waitingCmgsPrompt = false; xSemaphoreGive(g_atMutex); return -2; }
+  memcpy(buf, pdu_hex, n);
+  buf[n] = 0x1A;     // Ctrl-Z
+  usbh_cdc_write_bytes(g_cdc, (uint8_t*)buf, n + 1, pdMS_TO_TICKS(200));
+  // 等 OK/ERROR
+  if (xSemaphoreTake(g_atDone, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+    rc = g_atResult;
+    if (rc == 0) {
+      const char* p = strstr(g_atReply, "+CMGS:");
+      if (p) outRef = (uint8_t)atoi(p + 6);
+    } else {
+      const char* p = strstr(g_atReply, "+CMS ERROR:");
+      if (p) outErr = atoi(p + 11);
     }
+  } else {
+    ESP_LOGW(TAG, "CMGS no OK/ERROR after %ums", timeout_ms);
   }
   g_waitingCmgsPrompt = false;
   ESP_LOGI(TAG, "CMGS rc=%d ref=%u err=%d reply=%.200s", rc, outRef, outErr, g_atReply);
   xSemaphoreGive(g_atMutex);
+  return rc;
+}
+
+// =================== CMGS 异步封装 (P6 修) ===================
+// v4.0.6 P6 fix: cmgs_send_pdu 同步跑要 10–20s, 直接从 async_tcp 调会饿死 usb_rx_task (TWDT 卡 5s),
+// ">" prompt 收不到 → rc=-2。改成派到独立 worker task 持 mutex, handler 端只等 semaphore,
+// usb_rx_task 不被占用 → 能正常收 ">" / OK / +CMS ERROR。
+//
+// 一次只能跑一个 CMGS (g_atMutex 串行化), handler 排队等 worker 通知, 不抢 USB。
+
+typedef struct {
+  const char* pdu_hex;
+  uint8_t*    outRef;
+  int*        outErr;
+  int*        outRc;
+  uint32_t    timeout_ms;
+  SemaphoreHandle_t done;       // binary, 1 = 通知
+} CmgsJob;
+
+// 单 worker task, 死循环接 job
+static void cmgs_worker_task(void* /*param*/) {
+  for (;;) {
+    CmgsJob* job = NULL;
+    // 等 job (来自 web handler 的 xTaskCreate 投递用通知的方式不行, 这里用计数信号量当 mailbox)
+    // 简化: 用 ulTaskNotifyTake 当 mailbox (值 = job ptr)
+    uint32_t n = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    job = (CmgsJob*)n;
+    if (!job) continue;
+    *job->outRc = cmgs_send_pdu(job->pdu_hex, *job->outRef, *job->outErr, job->timeout_ms);
+    xSemaphoreGive(job->done);
+  }
+}
+
+static TaskHandle_t    g_cmgsWorker = NULL;
+static SemaphoreHandle_t g_cmgsJobSem = NULL;  // 通知 worker 有 job
+
+// 异步版本: 派 worker, 等 done 信号量 (worker 自己跑 cmgs_send_pdu, 自己拿/放 mutex)
+static int cmgs_send_pdu_async(const char* pdu_hex, uint8_t& outRef, int& outErr, uint32_t timeout_ms) {
+  outRef = 0; outErr = 0;
+  if (!g_cmgsWorker) return -2;  // 还没起来
+
+  SemaphoreHandle_t done = xSemaphoreCreateBinary();
+  if (!done) return -2;
+
+  CmgsJob job;
+  job.pdu_hex   = pdu_hex;
+  job.outRef    = &outRef;
+  job.outErr    = &outErr;
+  job.outRc     = (int*)pvPortMalloc(sizeof(int));   // worker 写完, handler 读; 用堆避免 stack 失效
+  job.timeout_ms = timeout_ms;
+  job.done      = done;
+  if (!job.outRc) { vSemaphoreDelete(done); return -2; }
+
+  // 把 job ptr 给 worker (task notification 当 mailbox)
+  xTaskNotify(g_cmgsWorker, (uint32_t)&job, eSetValueWithOverwrite);
+  // 等 worker 完成 (给足时间 + 缓冲)
+  uint32_t total_wait = timeout_ms * 3 + 2000;  // 3x 单段超时就够, 加 2s buffer
+  BaseType_t got = xSemaphoreTake(done, pdMS_TO_TICKS(total_wait));
+  vSemaphoreDelete(done);
+
+  int rc = -2;
+  if (got == pdTRUE) {
+    rc = *job.outRc;
+  } else {
+    ESP_LOGE(TAG, "CMGS worker 超时未返回 (handler 端等了 %ums)", total_wait);
+  }
+  vPortFree(job.outRc);
   return rc;
 }
 
@@ -1016,6 +1120,9 @@ static void sms_task(void* /*param*/) {
       String phoneUtf8(phoneBuf, phoneN);
       String bodyUtf8(bodyBuf, bodyN);
       g_lastSmsMs = millis();
+      // v4.0.6 P11c: 只在 SNTP 同步后写 epoch, 否则保持 0 (前端显示 "-")
+      // 客户反馈 "1970/01/01 08:00:27" — 同步前 time(NULL)≈0, 写出小值
+      if (g_timeSynced) g_lastSmsUtcMs = (uint32_t)((uint64_t)time(NULL) * 1000ULL);
       ESP_LOGI(TAG, "SMS: phone=%s body=%.120s", phoneUtf8.c_str(), bodyUtf8.c_str());
       ESP_LOGI(TAG, "SMS: body_raw=%.200s body_len=%u", msg.body_hex, (unsigned)strlen(msg.body_hex));
       // 诊断: 把解码出的每个字符的 codepoint 列出来
@@ -1098,6 +1205,46 @@ static void led_task(void* /*param*/) {
   }
 }
 
+// =================== SNTP 时间同步 (v4.0.6 P11) ===================
+// 客户报 "上次推 / 上次信 没法读" — millis() 上电清零, 前端只能显示 "上电后 3842 秒"
+// 接 SNTP 后, g_lastSmsUtcMs / g_lastPushOkUtcMs 改记 epoch ms, 前端 toLocaleString("zh-CN")
+// 显示 "2026/06/18 14:32:05"。ESP32-S3 没 RTC 电池, 每次开机 GOT_IP 都要重新同步
+// 注: g_timeSynced / g_lastSmsUtcMs / g_lastPushOkUtcMs 已在文件头部声明 (排序需要)
+
+static void sntp_sync_cb(struct timeval *tv) {
+  g_timeSynced = true;
+  ESP_LOGI(TAG, "SNTP synced: epoch=%lld", (long long)tv->tv_sec);
+}
+
+static bool g_sntpStarted = false;
+
+static void sntp_start_once(void) {
+  if (g_sntpStarted) return;                 // 重连时别重复 init
+  setenv("TZ", "CST-8", 1);                  // Asia/Shanghai = UTC+8 (POSIX: 负数=东)
+  tzset();
+  // ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE 期望 const char*[CONFIG_LWIP_SNTP_MAX_SERVERS],
+  // CONFIG_LWIP_SNTP_MAX_SERVERS 默认 1, 所以只放 1 个 server (够用, SNTP 失败再重试)
+  esp_sntp_config_t cfg = {
+    .smooth_sync = false,
+    .server_from_dhcp = false,
+    .wait_for_sync = true,
+    .start = true,
+    .sync_cb = sntp_sync_cb,
+    .renew_servers_after_new_IP = false,
+    .ip_event_to_renew = IP_EVENT_STA_GOT_IP,
+    .index_of_first_server = 0,
+    .num_of_servers = 1,
+    .servers = { "ntp.aliyun.com" },
+  };
+  esp_err_t err = esp_netif_sntp_init(&cfg);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "SNTP init failed: %d", err);
+    return;
+  }
+  g_sntpStarted = true;
+  ESP_LOGI(TAG, "SNTP init OK (wait ~1s for first sync)");
+}
+
 // =================== WiFi 事件 ===================
 static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
   if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -1106,6 +1253,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
     g_wifiUp = true;
     ip_event_got_ip_t* e = (ip_event_got_ip_t*)data;
     ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+    // v4.0.6 P11: WiFi up 后立刻启 SNTP (重连时 sntp_start_once 内部短路)
+    sntp_start_once();
   }
 }
 
@@ -1158,70 +1307,394 @@ static bool ping_target(const char* host, uint32_t timeout_ms) {
 static AsyncWebServer* g_webServer = NULL;
 
 static const char DASHBOARD_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html><html><head><meta charset="utf-8">
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>SMS Forwarder Dashboard</title>
+<title>SMS Forwarder</title>
 <style>
-body{font-family:-apple-system,sans-serif;max-width:760px;margin:20px auto;padding:0 16px;background:#fafafa}
-h1{font-size:20px}.row{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}
-.card{flex:1;min-width:200px;background:#fff;padding:12px;border-radius:8px;box-shadow:0 1px 3px #0001}
-.kv{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #f0f0f0}
-.kv:last-child{border:0}.kv b{color:#555;font-weight:500}.kv span{font-family:monospace}
-.btn{display:inline-block;padding:6px 12px;background:#06f;color:#fff;border-radius:4px;text-decoration:none;margin-top:8px}
-.tag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:12px}
-.tag-ok{background:#dfd;color:#282}.tag-bad{background:#fdd;color:#822}
+:root{--bg:#0f1419;--card:#1a2028;--card2:#232b35;--border:#2a3440;--text:#e6edf3;--muted:#8b95a5;--accent:#4ade80;--warn:#fbbf24;--err:#f87171;--info:#60a5fa;--shadow:0 1px 2px rgba(0,0,0,.4),0 4px 12px rgba(0,0,0,.25)}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+.container{max-width:880px;margin:0 auto;padding:24px 16px 48px}
+header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:24px;gap:16px}
+header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-0.01em}
+header h1 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--muted);margin-right:8px;vertical-align:middle;transition:background .3s}
+header h1 .dot.ok{background:var(--accent);box-shadow:0 0 8px rgba(74,222,128,.5)}
+header h1 .dot.bad{background:var(--err)}
+.fw-tag{font-size:12px;padding:4px 10px;border-radius:999px;background:var(--card2);color:var(--muted);border:1px solid var(--border)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:24px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:var(--shadow)}
+.card h3{margin:0 0 12px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted)}
+.kv{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.kv:last-child{border-bottom:0;padding-bottom:0}
+.kv:first-child{padding-top:0}
+.kv .k{color:var(--muted)}
+.kv .v{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;font-size:13px;color:var(--text);display:flex;align-items:center;gap:6px}
+.tag{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;letter-spacing:0.02em}
+.tag-ok{background:rgba(74,222,128,.12);color:var(--accent)}
+.tag-bad{background:rgba(248,113,113,.12);color:var(--err)}
+.tag-warn{background:rgba(251,191,36,.12);color:var(--warn)}
+.tag-mute{background:var(--card2);color:var(--muted)}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 14px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;color:var(--text);background:var(--card2);border:1px solid var(--border);transition:background .15s,border-color .15s,transform .05s;cursor:pointer;font-family:inherit}
+.btn:hover{background:#2c3744;border-color:#384454}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--accent);color:#0a1014;border-color:transparent}
+.btn.primary:hover{background:#5be692}
+.btn.warn{background:rgba(248,113,113,.12);color:var(--err);border-color:rgba(248,113,113,.25)}
+.btn.warn:hover{background:rgba(248,113,113,.18)}
+.btn.mute{background:var(--card);color:var(--muted)}
+.form-card{grid-column:1/-1}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:600px){.form-grid{grid-template-columns:1fr}}
+.field{display:flex;flex-direction:column;gap:6px}
+.field label{font-size:12px;color:var(--muted);font-weight:500}
+.field label small{color:#5e6a7a;font-weight:400}
+.field input{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:9px 11px;color:var(--text);font-size:13px;font-family:inherit;transition:border-color .15s,box-shadow .15s}
+.field input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(74,222,128,.15)}
+/* P15c: select 暗色化 (浏览器默认白底灰边丑) */
+.field select{
+  background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:9px 32px 9px 11px;color:var(--text);font-size:13px;font-family:inherit;
+  appearance:none;-webkit-appearance:none;-moz-appearance:none;cursor:pointer;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='%238b95a5' d='M2 4l4 4 4-4z'/></svg>");
+  background-repeat:no-repeat;background-position:right 10px center;
+  transition:border-color .15s,box-shadow .15s;
+}
+.field select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(74,222,128,.15)}
+.field select option{background:var(--card);color:var(--text);padding:6px}
+.field select:disabled{opacity:.5;cursor:not-allowed}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;margin-top:16px;background:var(--card2);border:1px solid var(--border);border-radius:10px}
+.toggle-row .label{display:flex;flex-direction:column;gap:2px}
+.toggle-row .label .t{font-size:14px;font-weight:500;color:var(--text)}
+.toggle-row .label .h{font-size:12px;color:var(--muted);line-height:1.4}
+.toggle{position:relative;display:inline-block;width:50px;height:30px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0;position:absolute}
+.toggle .slider{position:absolute;inset:0;background:#3a4654;border-radius:999px;transition:background .2s ease;cursor:pointer}
+.toggle .slider::before{content:"";position:absolute;top:2px;left:2px;width:26px;height:26px;background:#f1f5f9;border-radius:50%;box-shadow:0 2px 4px rgba(0,0,0,.3);transition:transform .2s cubic-bezier(.4,0,.2,1)}
+.toggle input:checked + .slider{background:var(--accent)}
+.toggle input:checked + .slider::before{transform:translateX(20px)}
+.toggle input:focus-visible + .slider{box-shadow:0 0 0 3px rgba(74,222,128,.25)}
+.status-line{margin-top:10px;font-size:12px;color:var(--muted);min-height:16px}
+.status-line.ok{color:var(--accent)}
+.status-line.err{color:var(--err)}
+.section-title{display:flex;align-items:center;justify-content:space-between;margin:8px 0 12px}
+.section-title h2{margin:0;font-size:14px;font-weight:600;color:var(--text)}
+.history{list-style:none;margin:0;padding:0;max-height:240px;overflow-y:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.history li{display:grid;grid-template-columns:130px 110px 1fr auto;gap:12px;padding:8px 4px;border-bottom:1px solid var(--border);align-items:center}
+.history li:last-child{border-bottom:0}
+.history .ts{color:var(--muted)}
+.history .ph{color:var(--info)}
+.history .bd{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.history .st.ok{color:var(--accent)}
+.history .st.bad{color:var(--err)}
+.history .empty{text-align:center;color:var(--muted);padding:24px;grid-column:1/-1}
+footer{margin-top:32px;text-align:center;font-size:12px;color:var(--muted)}
+footer .refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-right:6px;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 </style></head><body>
-<h1>SMS Forwarder <span class=tag>FW v4.0.6</span></h1>
-<div class=row>
-  <div class=card><h3>运行</h3>
-    <div class=kv><b>Boot</b><span id=boot>0</span></div>
-    <div class=kv><b>WiFi</b><span id=wifi class=tag-bad>off</span><span id=rssi></span></div>
-    <div class=kv><b>4G</b><span id=ml class=tag-bad>off</span></div>
-    <div class=kv><b>UDH</b><span id=udh>0</span></div>
+<div class="container">
+  <header>
+    <h1><span id="status-dot" class="dot"></span>SMS Forwarder</h1>
+    <span class="fw-tag">FW v4.0.6</span>
+  </header>
+
+  <div class="grid">
+    <div class="card"><h3>运行</h3>
+      <div class="kv"><span class="k">启动次数</span><span class="v" id="boot">-</span></div>
+      <div class="kv"><span class="k">WiFi</span><span class="v"><span id="wifi" class="tag tag-mute">off</span><span id="rssi" class="k"></span></span></div>
+      <div class="kv"><span class="k">4G 模组</span><span class="v"><span id="ml" class="tag tag-mute">off</span></span></div>
+      <div class="kv"><span class="k">长短信拼接槽</span><span class="v" id="udh">0/4</span></div>
+      <div class="kv"><span class="k">时间同步</span><span class="v" id="ntp">-</span></div>
+    </div>
+
+    <div class="card"><h3>推送</h3>
+      <div class="kv"><span class="k">成功</span><span class="v" style="color:var(--accent)" id="ok">0</span></div>
+      <div class="kv"><span class="k">失败</span><span class="v" style="color:var(--err)" id="fal">0</span></div>
+      <div class="kv"><span class="k">待推队列</span><span class="v" id="q">0</span></div>
+      <div class="kv"><span class="k">上次推送</span><span class="v" id="lp">-</span></div>
+      <div class="kv"><span class="k">上次短信</span><span class="v" id="ls">-</span></div>
+    </div>
+
+    <div class="card"><h3>系统</h3>
+      <div class="kv"><span class="k">设备时间</span><span class="v" id="devTime">-</span></div>
+      <div class="kv"><span class="k">总内存</span><span class="v" id="heapTotal">-</span></div>
+      <div class="kv"><span class="k">已使用</span><span class="v" id="heapUsed">-</span></div>
+      <div class="kv"><span class="k">当前空闲</span><span class="v" id="heap">0 K</span></div>
+      <div class="kv"><span class="k">启动以来最低空闲</span><span class="v" id="heapMin">0 K</span></div>
+    </div>
   </div>
-  <div class=card><h3>推送</h3>
-    <div class=kv><b>成功</b><span id=ok>0</span></div>
-    <div class=kv><b>失败</b><span id=fal>0</span></div>
-    <div class=kv><b>队列</b><span id=q>0</span></div>
-    <div class=kv><b>上次推</b><span id=lp>-</span></div>
-    <div class=kv><b>上次信</b><span id=ls>-</span></div>
+
+  <div class="actions">
+    <a class="btn primary" href="/update">OTA 升级</a>
+    <a class="btn" href="/send">短信发送</a>
+    <a class="btn" href="#configSection">配置</a>
+    <a class="btn warn" href="javascript:doRestart()">重启</a>
   </div>
-  <div class=card><h3>系统</h3>
-    <div class=kv><b>Heap</b><span id=heap>0</span></div>
-    <div class=kv><b>Min</b><span id=heapMin>0</span></div>
+
+  <div class="card form-card" id="configSection">
+    <div class="section-title">
+      <h2>配置</h2>
+      <div style="display:flex;gap:8px">
+        <button class="btn mute" onclick="loadCfg()">加载</button>
+        <button class="btn primary" onclick="saveCfg()">保存</button>
+      </div>
+    </div>
+
+    <div class="form-grid">
+      <div class="field">
+        <label>WiFi SSID <small id="c_curSsid" style="color:var(--accent)"></small></label>
+        <div style="display:flex;gap:8px">
+          <select id="c_ssidSel" style="flex:1"></select>
+          <button class="btn mute" type="button" onclick="scanWifi()" id="c_scanBtn">🔍 扫描</button>
+        </div>
+        <input id="c_ssid" maxlength="63" style="margin-top:6px" placeholder="或手动输入 SSID">
+        <small id="c_scanHint" style="color:var(--muted);font-size:11px;min-height:14px;display:block;margin-top:2px"></small>
+      </div>
+      <div class="field"><label>WiFi 密码 <small id="c_hasPass"></small></label><input id="c_pass" type="password" placeholder="留空不修改"></div>
+      <div class="field"><label>pushplus token</label><input id="c_token" maxlength="63"></div>
+      <div class="field"><label>pushplus topic <small>(空 = 个人推送)</small></label><input id="c_topic" maxlength="63"></div>
+      <div class="field"><label>OTA 用户名</label><input id="c_otaUser" maxlength="31"></div>
+      <div class="field"><label>OTA 密码 <small id="c_hasOtaPass"></small></label><input id="c_otaPass" type="password" placeholder="留空不修改"></div>
+    </div>
+
+    <div class="toggle-row">
+      <div class="label">
+        <span class="t">开机推送</span>
+        <span class="h">关闭后启动时不再推送通知;短信转发不受影响</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="c_bp" onchange="toggleBp(this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div id="c_status" class="status-line"></div>
+    <div style="margin-top:8px;font-size:12px;color:var(--muted)">保存后 WiFi / token 改动需重启生效</div>
   </div>
+
+  <div class="card">
+    <div class="section-title">
+      <h2>最近发送</h2>
+      <div style="display:flex;gap:8px">
+        <button class="btn mute" onclick="loadHist()">刷新</button>
+        <button class="btn warn" onclick="clearHist()">清空</button>
+      </div>
+    </div>
+    <ul class="history" id="hist"><li class="empty">加载中...</li></ul>
+  </div>
+
+  <footer><span class="refresh-dot"></span><span id="refresh-note">30s 自动刷新</span></footer>
 </div>
-<a class=btn href=/update>OTA 升级</a>
-<a class=btn href=/send style=background:#0a0>📤 短信发送</a>
-<a class=btn href=/restart style=background:#888>重启</a>
-<p><small>30s 自动刷新</small></p>
+
 <script>
-function ago(ms) {
-  if (!ms) return '-';
-  let s = Math.floor((Date.now() - ms) / 1000);
-  if (s < 60) return s + 's';
-  if (s < 3600) return Math.floor(s/60) + 'm';
-  return Math.floor(s/3600) + 'h';
+// v4.0.6 P11b: 读 epoch ms, 显示真实 wall-clock ("2026/06/18 14:32:05")
+function fmtUtc(epochMs) {
+  if (!epochMs) return '-';
+  const d = new Date(epochMs);
+  const p = n => String(n).padStart(2,'0');
+  return d.getFullYear()+'/'+p(d.getMonth()+1)+'/'+p(d.getDate())
+    +' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+function ago(epochMs) {
+  if (!epochMs) return '-';
+  const s = Math.floor((Date.now() - epochMs) / 1000);
+  if (s < 60)    return s + '秒前';
+  if (s < 3600)  return Math.floor(s/60) + '分钟前';
+  if (s < 86400) return Math.floor(s/3600) + '小时前';
+  return Math.floor(s/86400) + '天前';
+}
+function setStatus(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'tag ' + (cls || 'tag-mute');
 }
 async function poll() {
-  let r = await fetch('/api/status'); if (!r.ok) return;
-  let j = await r.json();
-  boot.textContent = j.boot;
-  ok.textContent = j.pushOk;
-  fal.textContent = j.pushFail;
-  q.textContent = j.qLen;
-  wifi.textContent = j.wifi ? 'on' : 'off';
-  wifi.className = 'tag ' + (j.wifi ? 'tag-ok' : 'tag-bad');
-  rssi.textContent = j.wifi && j.wifiRssi ? ' (' + j.wifiRssi + 'dBm)' : '';
-  ml.textContent = j.mlAlive ? 'on' : 'off';
-  ml.className = 'tag ' + (j.mlAlive ? 'tag-ok' : 'tag-bad');
-  udh.textContent = j.udhActive + '/4';
-  lp.textContent = ago(j.lastPushOkMs) + '前';
-  ls.textContent = ago(j.lastSmsMs) + '前';
-  heap.textContent = Math.round(j.freeHeap/1024) + 'K';
-  heapMin.textContent = Math.round(j.minFreeHeap/1024) + 'K';
+  try {
+    const r = await fetch('/api/status', {cache:'no-store'});
+    if (!r.ok) return;
+    const j = await r.json();
+
+    document.getElementById('boot').textContent  = j.boot;
+    document.getElementById('ok').textContent    = j.pushOk;
+    document.getElementById('fal').textContent   = j.pushFail;
+    document.getElementById('q').textContent     = j.qLen;
+
+    setStatus('wifi', j.wifi ? '已连' : '断开', j.wifi ? 'tag-ok' : 'tag-bad');
+    document.getElementById('rssi').textContent =
+      (j.wifi && j.wifiRssi) ? ' · ' + j.wifiRssi + ' dBm' : '';
+
+    setStatus('ml', j.mlAlive ? '在线' : '离线', j.mlAlive ? 'tag-ok' : 'tag-bad');
+    document.getElementById('udh').textContent = (j.udhActive||0) + '/4';
+    document.getElementById('ntp').textContent = j.timeSynced ? '已同步' : '未同步';
+    document.getElementById('ntp').className   = 'tag ' + (j.timeSynced ? 'tag-ok' : 'tag-warn');
+
+    // P11b: 用 epoch ms 显示真实时间, 同步前显示 millis ago
+    const lp = j.lastPushOkUtc ? j.lastPushOkUtc : (j.lastPushOkMs || 0);
+    const ls = j.lastSmsUtc    ? j.lastSmsUtc    : (j.lastSmsMs    || 0);
+    const lpEl = document.getElementById('lp');
+    const lsEl = document.getElementById('ls');
+    lpEl.textContent = lp ? fmtUtc(lp) + ' (' + ago(lp) + ')' : '-';
+    lsEl.textContent = ls ? fmtUtc(ls) + ' (' + ago(ls) + ')' : '-';
+
+    document.getElementById('heap').textContent    = Math.round(j.freeHeap/1024) + ' K';
+    document.getElementById('heapMin').textContent = Math.round(j.minFreeHeap/1024) + ' K';
+    // v4.0.6 P18: 设备时间 (NTP 同步后才有意义)
+    const dt = document.getElementById('devTime');
+    if (j.timeSynced && j.deviceTimeMs) {
+      dt.textContent = fmtUtc(j.deviceTimeMs);
+      dt.style.color = 'var(--text)';
+    } else {
+      dt.textContent = '- 未同步';
+      dt.style.color = 'var(--warn)';
+    }
+    if (j.heapTotal != null) {
+      const total = j.heapTotal, used = j.heapUsed, free = j.freeHeap;
+      const pct = total ? Math.round(used*100/total) : 0;
+      document.getElementById('heapTotal').textContent = Math.round(total/1024) + ' K';
+      document.getElementById('heapUsed').textContent  = Math.round(used/1024) + ' K (' + pct + '%)';
+    }
+
+    const dot = document.getElementById('status-dot');
+    dot.className = 'dot ' + (j.wifi ? 'ok' : 'bad');
+  } catch (e) { console.warn('poll failed', e); }
 }
-poll(); setInterval(poll, 30000);
+
+async function loadHist() {
+  const ul = document.getElementById('hist');
+  try {
+    const r = await fetch('/api/sent', {cache:'no-store'});
+    const arr = await r.json();
+    if (!Array.isArray(arr) || !arr.length) {
+      ul.innerHTML = '<li class="empty">暂无发送记录</li>';
+      return;
+    }
+    ul.innerHTML = arr.slice(-32).reverse().map(it => {
+      const ok = it.ok ? '<span class="st ok">OK</span>' : '<span class="st bad">FAIL</span>';
+      const ts = it.ts ? fmtUtc(it.ts) : '-';
+      return '<li>'
+        + '<span class="ts">' + ts + '</span>'
+        + '<span class="ph">' + (it.phone||'-') + '</span>'
+        + '<span class="bd">' + (it.body||'').replace(/[<>]/g,'') + '</span>'
+        + ok + '</li>';
+    }).join('');
+  } catch (e) {
+    ul.innerHTML = '<li class="empty">加载失败</li>';
+  }
+}
+
+function doRestart() {
+  if (!confirm('确认重启设备?')) return;
+  fetch('/restart').catch(()=>{});
+  alert('重启中… 约 5s 后回来');
+}
+
+async function clearHist() {
+  if (!confirm('确认清空所有最近发送记录?')) return;
+  try {
+    const r = await fetch('/api/sent/clear', {method:'POST'});
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    loadHist();
+  } catch (e) {
+    alert('清空失败: ' + e.message);
+  }
+}
+
+// v4.0.6 P17: 配网表单搬回 dashboard (P13 拆出去后翔哥说"用 dashboard 就行")
+async function loadCfg() {
+  const s = document.getElementById('c_status');
+  s.className = 'status-line'; s.textContent = '加载中…';
+  try {
+    const r = await fetch('/api/cfg');
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const j = await r.json();
+    document.getElementById('c_ssid').value    = j.ssid || '';
+    document.getElementById('c_ssidSel').innerHTML = '<option value="">— 选择扫描到的网络 —</option>';
+    document.getElementById('c_token').value   = j.token || '';
+    document.getElementById('c_topic').value   = j.topic || '';
+    document.getElementById('c_otaUser').value = j.otaUser || '';
+    document.getElementById('c_hasPass').textContent    = j.hasPass    ? '(已设置)' : '(未设置)';
+    document.getElementById('c_hasOtaPass').textContent = j.hasOtaPass ? '(已设置)' : '(未设置)';
+    document.getElementById('c_pass').value    = '';
+    document.getElementById('c_otaPass').value = '';
+    document.getElementById('c_bp').checked    = !!j.bootPush;
+    if (j.ssid) document.getElementById('c_curSsid').textContent = '当前: ' + j.ssid;
+    s.className = 'status-line ok'; s.textContent = '已加载';
+  } catch (e) {
+    s.className = 'status-line err'; s.textContent = '加载失败: ' + e.message;
+  }
+}
+async function saveCfg() {
+  const s = document.getElementById('c_status');
+  const body = {
+    ssid:    document.getElementById('c_ssid').value.trim(),
+    token:   document.getElementById('c_token').value.trim(),
+    topic:   document.getElementById('c_topic').value.trim(),
+    otaUser: document.getElementById('c_otaUser').value.trim(),
+    bootPush:document.getElementById('c_bp').checked,
+  };
+  const pw  = document.getElementById('c_pass').value;
+  const opw = document.getElementById('c_otaPass').value;
+  if (pw)  body.pass    = pw;
+  if (opw) body.otaPass = opw;
+  s.className = 'status-line'; s.textContent = '保存中…';
+  try {
+    const r = await fetch('/api/cfg', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error('HTTP '+r.status);
+    s.className = 'status-line ok';
+    s.textContent = '已保存' + (j.restart ? ' · WiFi / token 改动需重启' : '');
+    document.getElementById('c_pass').value    = '';
+    document.getElementById('c_otaPass').value = '';
+  } catch (e) {
+    s.className = 'status-line err'; s.textContent = '保存失败: ' + e.message;
+  }
+}
+async function scanWifi() {
+  const btn = document.getElementById('c_scanBtn');
+  const hint = document.getElementById('c_scanHint');
+  const sel = document.getElementById('c_ssidSel');
+  btn.disabled = true; btn.textContent = '…扫描中';
+  hint.style.color = 'var(--muted)';
+  hint.textContent = '扫描中 (~3s, 阻塞)';
+  try {
+    const r = await fetch('/api/scan');
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const arr = await r.json();
+    const cur = document.getElementById('c_ssid').value;
+    sel.innerHTML = '<option value="">— 选择扫描到的网络 —</option>'
+      + arr.map(n => {
+        const tag = n.current ? ' ✓ 已连' : (n.secured ? ' 🔒' : ' 开放');
+        return '<option value="' + n.ssid.replace(/"/g,'&quot;') + '"' + (n.ssid===cur?' selected':'') + '>'
+          + n.ssid + ' · ' + n.rssi + ' dBm' + tag + '</option>';
+      }).join('');
+    sel.onchange = () => { if (sel.value) document.getElementById('c_ssid').value = sel.value; };
+    hint.style.color = 'var(--accent)';
+    hint.textContent = '找到 ' + arr.length + ' 个网络 (按信号强度排序)';
+  } catch (e) {
+    hint.style.color = 'var(--err)';
+    hint.textContent = '扫描失败: ' + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = '🔍 扫描';
+  }
+}
+async function toggleBp(on) {
+  try {
+    const r = await fetch('/api/bootPush', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({on: on})
+    });
+    if (!r.ok) { alert('保存失败'); loadCfg(); return; }
+  } catch (e) {
+    alert('网络错误: ' + e.message); loadCfg();
+  }
+}
+
+poll(); loadHist(); loadCfg();
+setInterval(poll, 30000);
+setInterval(loadHist, 60000);
 </script></body></html>
 )HTML";
 
@@ -1242,11 +1715,20 @@ static void handleApiStatus(AsyncWebServerRequest* r) {
   doc["wifiRssi"]    = g_wifiUp ? WiFi.RSSI() : 0;
   doc["freeHeap"]    = esp_get_free_heap_size();
   doc["minFreeHeap"] = esp_get_minimum_free_heap_size();
-  doc["lastSmsMs"]   = g_lastSmsMs;
-  doc["lastPushOkMs"]= g_lastPushOkMs;
+  // v4.0.6 P13: 总内存 (internal) + 已使用
+  doc["heapTotal"]   = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+  doc["heapUsed"]    = (int32_t)doc["heapTotal"] - (int32_t)doc["freeHeap"];
+  doc["lastSmsMs"]      = g_lastSmsMs;       // 兼容旧前端 (millis, 重启清零)
+  doc["lastPushOkMs"]   = g_lastPushOkMs;
+  doc["lastSmsUtc"]     = g_lastSmsUtcMs;    // v4.0.6 P11b: epoch ms, 前端 toLocaleString 显示
+  doc["lastPushOkUtc"]  = g_lastPushOkUtcMs;
+  doc["timeSynced"]     = g_timeSynced;      // false 时前端显示 "未同步" 提示
+  // v4.0.6 P18: 当前设备时间 (SNTP 同步后才有意义)
+  doc["deviceTimeMs"]   = g_timeSynced ? (uint32_t)((uint64_t)time(NULL) * 1000ULL) : 0;
   doc["mlAlive"]     = g_ml.alive;
   doc["udhActive"]   = udhActive;
   doc["fw"]          = FW_VERSION;
+  doc["bootPush"]    = g_cfg.bootPush;   // v4.0.6+: 开关
   String out; serializeJson(doc, out);
   r->send(200, "application/json", out);
 }
@@ -1271,7 +1753,9 @@ a.btn{display:inline-block;padding:8px 16px;background:#888;color:#fff;border-ra
 </body></html>
 )HTML";
 
-static bool check_ota_auth(AsyncWebServerRequest* r) {
+// v4.0.6+: dashboard 鉴权 (翔哥 2026-06-18 要求, 之后进 OTA/发短信免认证)
+// OTA user/pass 沿用, 但只 dashboard 入口要, 内部操作不再二次弹
+static bool check_dashboard_auth(AsyncWebServerRequest* r) {
   if (strlen(g_cfg.otaUser) > 0 && strlen(g_cfg.otaPass) > 0) {
     if (!r->authenticate(g_cfg.otaUser, g_cfg.otaPass)) {
       r->requestAuthentication();
@@ -1282,12 +1766,10 @@ static bool check_ota_auth(AsyncWebServerRequest* r) {
 }
 
 static void handle_ota_page(AsyncWebServerRequest* r) {
-  if (!check_ota_auth(r)) return;
   r->send_P(200, "text/html; charset=utf-8", OTA_HTML);
 }
 
 static void handle_ota_chunk(AsyncWebServerRequest* r, const String& filename, size_t index, uint8_t* data, size_t len, bool final) {
-  if (!check_ota_auth(r)) return;
   if (index == 0) {
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       r->send(500, "text/plain", "Update.begin failed");
@@ -1308,13 +1790,11 @@ static void handle_ota_chunk(AsyncWebServerRequest* r, const String& filename, s
 }
 
 static void handle_ota_done(AsyncWebServerRequest* r) {
-  if (!check_ota_auth(r)) return;
   if (Update.hasError()) r->send(500, "text/plain", "Update error");
   else                   r->send(200, "text/plain", "OK, rebooting ...");
 }
 
 static void handle_restart(AsyncWebServerRequest* r) {
-  if (!check_ota_auth(r)) return;
   r->send(200, "text/plain", "Rebooting ...");
   delay(200);
   ESP.restart();
@@ -1353,7 +1833,10 @@ a.btn{display:inline-block;padding:6px 12px;background:#888;color:#fff;border-ra
 <div class=card>
   <h3>最近发送 (最多 32 条)</h3>
   <pre id=hist>加载中...</pre>
-  <button onclick="loadHist()" style=background:#888>刷新</button>
+  <div style=display:flex;gap:8px;margin-top:6px>
+    <button onclick="loadHist()" style=background:#888>刷新</button>
+    <button onclick="clearHist()" style=background:#a44;color:#fff>清空</button>
+  </div>
 </div>
 <script>
 async function send() {
@@ -1386,23 +1869,56 @@ async function loadHist() {
   const j = await r.json();
   document.getElementById('hist').textContent = JSON.stringify(j, null, 2);
 }
+async function clearHist() {
+  if (!confirm('确认清空所有最近发送记录?')) return;
+  const r = await fetch('/api/sent/clear', {method:'POST'});
+  if (!r.ok) { alert('清空失败 HTTP '+r.status); return; }
+  loadHist();
+}
 loadHist();
 </script>
 </body></html>
 )HTML";
 
 static void handleSendPage(AsyncWebServerRequest* r) {
-  if (!check_ota_auth(r)) return;
   r->send_P(200, "text/html; charset=utf-8", SEND_PAGE_HTML);
 }
 
-static void handleApiSend(AsyncWebServerRequest* r) {
-  if (!check_ota_auth(r)) return;
+// =================== SMS 发送 Web (v4.0.6+) ===================
+// /api/send 的 body 累积 state (ESP32Async fork 没 r->body, 用 _tempObject 串 body→request handler)
+struct SendApiBody {
+  String json;        // 累积 body chunks
+};
+// 释放 _tempObject 的 helper (request handler / onDisconnect 共用)
+static void free_send_body(AsyncWebServerRequest* r) {
+  if (r->_tempObject) {
+    delete static_cast<SendApiBody*>(r->_tempObject);
+    r->_tempObject = nullptr;
+  }
+}
+// onRequestBody callback: 在 body chunks 到时累积到 _tempObject
+static void handleApiSendBody(AsyncWebServerRequest* r, uint8_t* data, size_t len,
+                              size_t index, size_t /*total*/) {
+  if (index == 0) {
+    r->_tempObject = new SendApiBody();
+    // 客户端断连 / parse error 时 request handler 不会被调, onDisconnect 兜底释放
+    r->onDisconnect([r]() { free_send_body(r); });
+  }
+  auto* st = static_cast<SendApiBody*>(r->_tempObject);
+  st->json.concat((const char*)data, len);
+}
 
+static void handleApiSend(AsyncWebServerRequest* r) {
   // P0 fix #2: 解析 JSON body (前端 fetch + Content-Type: application/json)
-  // 必须先注册 _body upload callback, r->body 才被 AsyncWebServer 累积 (见 setup())
+  // ESP32Async fork 没 r->body, body 由 handleApiSendBody 累积到 _tempObject
+  String json_str;
+  if (auto* st = static_cast<SendApiBody*>(r->_tempObject)) {
+    json_str = std::move(st->json);
+  }
+  free_send_body(r);
+
   JsonDocument doc;
-  if (r->body.length() == 0 || deserializeJson(doc, r->body) != DeserializationError::Ok) {
+  if (json_str.length() == 0 || deserializeJson(doc, json_str) != DeserializationError::Ok) {
     r->send(400, "application/json", "{\"ok\":false,\"err\":\"invalid_json\"}");
     return;
   }
@@ -1419,7 +1935,8 @@ static void handleApiSend(AsyncWebServerRequest* r) {
     r->send(400, "application/json", "{\"ok\":false,\"err\":\"body_empty\"}");
     return;
   }
-  if (!smsRateLimitOk()) {
+  // 限频临时关闭 (smsRateLimitOk() 永远 return true)
+  if (false && !smsRateLimitOk()) {
     r->send(429, "application/json", "{\"ok\":false,\"err\":\"rate_limit\"}");
     return;
   }
@@ -1464,7 +1981,8 @@ static void handleApiSend(AsyncWebServerRequest* r) {
     }
     uint8_t outRef = 0;
     int outErr = 0;
-    int rc = cmgs_send_pdu(pdu, outRef, outErr, 10000);
+    // v4.0.6 P6: 用 async 版避免饿死 usb_rx_task (同步 10s+ 阻塞 async_tcp)
+    int rc = cmgs_send_pdu_async(pdu, outRef, outErr, 10000);
     if (rc != 0) {
       lastErr = outErr;
       seg_idx_fail = i;
@@ -1489,10 +2007,160 @@ static void handleApiSend(AsyncWebServerRequest* r) {
 }
 
 static void handleApiSent(AsyncWebServerRequest* r) {
-  if (!check_ota_auth(r)) return;
   String out;
   nvsSentList(out);
   r->send(200, "application/json", out);
+}
+
+// v4.0.6 P14: POST /api/sent/clear  清空最近发送 (BasicAuth, 改持久数据)
+static void handleApiSentClear(AsyncWebServerRequest* r) {
+  if (!check_dashboard_auth(r)) return;
+  nvsSentClear();
+  r->send(200, "application/json", "{\"ok\":true}");
+}
+
+// v4.0.6 P19: POST /api/factory  恢复出厂 (清 NVS 全分区 + 重启进 AP 模式)
+// BasicAuth + 二重确认 (前端 confirm), 强操作
+// 不能在 async_tcp 任务里直接 ESP.restart() — 关连接时 watchdog 会 panic
+// 走一次性 detached task 延后 1.5s 后 ESP.restart
+static void factory_restart_task(void* /*arg*/) {
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  ESP_LOGW(TAG, "FACTORY RESET: ESP.restart()");
+  ESP.restart();
+  vTaskDelete(nullptr);  // unreachable, 防 lint
+}
+
+static void handleApiFactory(AsyncWebServerRequest* r) {
+  if (!check_dashboard_auth(r)) return;
+  ESP_LOGW(TAG, "FACTORY RESET triggered — will restart in 1.5s");
+  r->send(200, "application/json", "{\"ok\":true,\"msg\":\"restarting\"}");
+  g_factoryReset = true;
+  // detached task 延后重启, 不在 async_tcp 任务里 ESP.restart
+  xTaskCreate(factory_restart_task, "factory_rst", 2048, nullptr, 1, nullptr);
+}
+
+// v4.0.6 P15: GET /api/scan  扫附近 WiFi 返 [{ssid, rssi, secured}] (BasicAuth, ~3s 阻塞可接受)
+static void handleApiScan(AsyncWebServerRequest* r) {
+  if (!check_dashboard_auth(r)) return;
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+  String cur = WiFi.SSID();
+  // 按 RSSI 降序
+  int idx[64];
+  int cnt = (n > 64) ? 64 : n;
+  for (int i = 0; i < cnt; i++) idx[i] = i;
+  for (int i = 0; i < cnt; i++)
+    for (int j = i + 1; j < cnt; j++)
+      if (WiFi.RSSI(idx[j]) > WiFi.RSSI(idx[i])) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < cnt; i++) {
+    JsonObject o = arr.add<JsonObject>();
+    String ssid = WiFi.SSID(idx[i]);
+    o["ssid"]    = ssid;
+    o["rssi"]    = WiFi.RSSI(idx[i]);
+    o["secured"] = (WiFi.encryptionType(idx[i]) != WIFI_AUTH_OPEN);
+    o["current"] = (ssid == cur);
+  }
+  WiFi.scanDelete();
+  String out; serializeJson(doc, out);
+  r->send(200, "application/json", out);
+}
+
+// v4.0.6+: 开关开机推送 (调试期关掉避免打扰, 翔哥 2026-06-18 加)
+// POST /api/bootPush  body: {"on": true|false}  返: {"ok":true,"on":...}
+static void handleApiBootPush(AsyncWebServerRequest* r, uint8_t* data, size_t len,
+                              size_t index, size_t /*total*/) {
+  // 不走 _tempObject (一次性小 JSON, 走 onRequest 也行, 简单起见走 onBody)
+  if (index != 0 || len == 0) return;  // 只处理首 chunk
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, data, len) != DeserializationError::Ok) {
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"invalid_json\"}");
+    return;
+  }
+  if (!doc["on"].is<bool>()) {
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"missing_on\"}");
+    return;
+  }
+  bool on = doc["on"].as<bool>();
+  g_cfg.bootPush = on;
+  saveConfig(g_cfg);
+  ESP_LOGI(TAG, "bootPush set to %d", on);
+  char out[64];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"on\":%s}", on ? "true" : "false");
+  r->send(200, "application/json", out);
+}
+
+// v4.0.6+: dashboard 配网编辑 (翔哥 2026-06-18 加, 改完需重启生效)
+// GET  /api/cfg -> {ssid, hasPass, token, topic, otaUser, hasOtaPass, bootPush}
+// POST /api/cfg body: {ssid?, pass?, token?, topic?, otaUser?, otaPass?, bootPush?}
+//   只改提供的字段, 缺省保持现有值. pass/otaPass 留空表示不改
+static void handleApiCfgGet(AsyncWebServerRequest* r) {
+  JsonDocument doc;
+  doc["ssid"]        = g_cfg.ssid;
+  doc["hasPass"]     = strlen(g_cfg.pass) > 0;
+  doc["token"]       = g_cfg.token;
+  doc["topic"]       = g_cfg.topic;
+  doc["otaUser"]     = g_cfg.otaUser;
+  doc["hasOtaPass"]  = strlen(g_cfg.otaPass) > 0;
+  doc["bootPush"]    = g_cfg.bootPush;
+  String out; serializeJson(doc, out);
+  r->send(200, "application/json", out);
+}
+
+static void handleApiCfgPost(AsyncWebServerRequest* r, uint8_t* data, size_t len,
+                             size_t index, size_t /*total*/) {
+  if (index != 0 || len == 0) return;
+  JsonDocument doc;
+  if (deserializeJson(doc, data, len) != DeserializationError::Ok) {
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"invalid_json\"}");
+    return;
+  }
+  bool changed = false;
+  if (doc["ssid"].is<const char*>()) {
+    strncpy(g_cfg.ssid, doc["ssid"].as<const char*>(), sizeof(g_cfg.ssid) - 1);
+    g_cfg.ssid[sizeof(g_cfg.ssid) - 1] = 0;
+    changed = true;
+  }
+  if (doc["pass"].is<const char*>()) {
+    const char* p = doc["pass"].as<const char*>();
+    if (strlen(p) > 0) {  // 留空不改
+      strncpy(g_cfg.pass, p, sizeof(g_cfg.pass) - 1);
+      g_cfg.pass[sizeof(g_cfg.pass) - 1] = 0;
+      changed = true;
+    }
+  }
+  if (doc["token"].is<const char*>()) {
+    strncpy(g_cfg.token, doc["token"].as<const char*>(), sizeof(g_cfg.token) - 1);
+    g_cfg.token[sizeof(g_cfg.token) - 1] = 0;
+    changed = true;
+  }
+  if (doc["topic"].is<const char*>()) {
+    strncpy(g_cfg.topic, doc["topic"].as<const char*>(), sizeof(g_cfg.topic) - 1);
+    g_cfg.topic[sizeof(g_cfg.topic) - 1] = 0;
+    changed = true;
+  }
+  if (doc["otaUser"].is<const char*>()) {
+    strncpy(g_cfg.otaUser, doc["otaUser"].as<const char*>(), sizeof(g_cfg.otaUser) - 1);
+    g_cfg.otaUser[sizeof(g_cfg.otaUser) - 1] = 0;
+    changed = true;
+  }
+  if (doc["otaPass"].is<const char*>()) {
+    const char* p = doc["otaPass"].as<const char*>();
+    if (strlen(p) > 0) {
+      strncpy(g_cfg.otaPass, p, sizeof(g_cfg.otaPass) - 1);
+      g_cfg.otaPass[sizeof(g_cfg.otaPass) - 1] = 0;
+      changed = true;
+    }
+  }
+  if (doc["bootPush"].is<bool>()) {
+    g_cfg.bootPush = doc["bootPush"].as<bool>();
+    changed = true;
+  }
+  if (changed) {
+    saveConfig(g_cfg);
+    ESP_LOGI(TAG, "Config updated via API, restart required for wifi/token to take effect");
+  }
+  r->send(200, "application/json", "{\"ok\":true,\"restart\":true}");
 }
 
 // =================== NetTask: 推送 + NVS drain + ping ===================
@@ -1526,6 +2194,105 @@ static void net_task(void* /*param*/) {
 // =================== AP 配网 ===================
 static AsyncWebServer* g_apServer = NULL;
 static DNSServer*      g_apDns    = NULL;
+
+// v4.0.6 P19: 危险操作页 (BasicAuth 保护, 配网表单已并回 dashboard)
+// 主要: 恢复出厂清 NVS
+static const char CONFIG_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>高级 · SMS Forwarder</title>
+<style>
+:root{--bg:#0f1419;--card:#1a2028;--card2:#232b35;--border:#2a3440;--text:#e6edf3;--muted:#8b95a5;--accent:#4ade80;--warn:#fbbf24;--err:#f87171;--shadow:0 1px 2px rgba(0,0,0,.4),0 4px 12px rgba(0,0,0,.25)}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+.container{max-width:680px;margin:0 auto;padding:24px 16px 48px}
+header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:24px;gap:16px}
+header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-0.01em}
+header a{color:var(--muted);text-decoration:none;font-size:13px;padding:6px 10px;border-radius:6px;border:1px solid var(--border)}
+header a:hover{color:var(--text);background:var(--card2)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;box-shadow:var(--shadow);margin-bottom:16px}
+.card h2{margin:0 0 14px;font-size:14px;font-weight:600;color:var(--text)}
+.card.danger{border-color:rgba(248,113,113,.4)}
+.card.danger h2{color:var(--err)}
+.danger-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px;background:var(--card2);border:1px solid rgba(248,113,113,.3);border-radius:10px}
+.danger-row .label{display:flex;flex-direction:column;gap:4px}
+.danger-row .label .t{font-size:14px;font-weight:500;color:var(--text)}
+.danger-row .label .h{font-size:12px;color:var(--muted);line-height:1.4}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;color:var(--text);background:var(--card2);border:1px solid var(--border);cursor:pointer;font-family:inherit;transition:background .15s}
+.btn:hover{background:#2c3744;border-color:#384454}
+.btn.danger{background:rgba(248,113,113,.12);color:var(--err);border-color:rgba(248,113,113,.3)}
+.btn.danger:hover{background:rgba(248,113,113,.2);border-color:rgba(248,113,113,.5)}
+.status-line{margin-top:14px;font-size:12px;color:var(--muted);min-height:16px}
+.status-line.ok{color:var(--accent)}
+.status-line.err{color:var(--err)}
+footer{margin-top:24px;text-align:center;font-size:12px;color:var(--muted)}
+</style></head><body>
+<div class="container">
+  <header>
+    <h1>高级</h1>
+    <a href="/dashboard">← 返回状态页</a>
+  </header>
+
+  <div class="card">
+    <h2>设备状态</h2>
+    <div id="info" style="color:var(--muted);font-size:13px">加载中…</div>
+  </div>
+
+  <div class="card danger">
+    <h2>危险操作</h2>
+    <div class="danger-row">
+      <div class="label">
+        <span class="t">恢复出厂设置</span>
+        <span class="h">擦除整个 NVS 分区 (WiFi / Token / OTA / 历史), 设备重启进入 AP 配网模式</span>
+      </div>
+      <button class="btn danger" onclick="doFactory()">⚠ 恢复出厂</button>
+    </div>
+    <div id="f_status" class="status-line"></div>
+  </div>
+
+  <footer>FW v4.0.6</footer>
+</div>
+<script>
+async function loadInfo() {
+  try {
+    const r = await fetch('/api/status');
+    const j = await r.json();
+    const t = (j.timeSynced && j.deviceTimeMs) ? new Date(j.deviceTimeMs).toLocaleString('zh-CN') : '未同步';
+    document.getElementById('info').innerHTML =
+      '<div style="display:grid;grid-template-columns:auto 1fr;gap:6px 16px">'
+      + '<span style="color:var(--muted)">启动次数</span><span>' + j.boot + '</span>'
+      + '<span style="color:var(--muted)">WiFi</span><span>' + (j.wifi ? j.wifiRssi + ' dBm' : '未连') + '</span>'
+      + '<span style="color:var(--muted)">空闲内存</span><span>' + Math.round(j.freeHeap/1024) + ' K / ' + Math.round(j.heapTotal/1024) + ' K</span>'
+      + '<span style="color:var(--muted)">设备时间</span><span>' + t + '</span>'
+      + '<span style="color:var(--muted)">固件</span><span>' + j.fw + '</span>'
+      + '</div>';
+  } catch (e) {
+    document.getElementById('info').textContent = '加载失败: ' + e.message;
+  }
+}
+async function doFactory() {
+  if (!confirm('⚠ 真的要恢复出厂?\\n\\n将擦除:\\n  · WiFi 凭据\\n  · pushplus token\\n  · OTA 用户密码\\n  · 开机推送设置\\n  · 最近 32 条发送历史\\n\\n设备将重启并进入 AP 配网模式。\\n\\n此操作不可撤销,确认继续?')) return;
+  if (!confirm('再次确认: 真的要恢复出厂?')) return;
+  const s = document.getElementById('f_status');
+  s.className = 'status-line'; s.textContent = '正在擦除 NVS, 设备约 3s 后重启…';
+  try {
+    const r = await fetch('/api/factory', {method:'POST'});
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    s.className = 'status-line ok';
+    s.textContent = '已发送重启指令, 设备将进入 AP 模式 (热点 SMS-Forwarder-XXXXXX)';
+  } catch (e) {
+    s.className = 'status-line err';
+    s.textContent = '失败: ' + e.message + ' — 设备可能已重启, 刷新试试';
+  }
+}
+loadInfo();
+</script></body></html>
+)HTML";
+
+static void handleConfigPage(AsyncWebServerRequest* r) {
+  if (!check_dashboard_auth(r)) return;
+  r->send_P(200, "text/html; charset=utf-8", CONFIG_HTML);
+}
 
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
@@ -1728,8 +2495,9 @@ static bool modem_init_at() {
         ESP_LOGI(TAG, "CSQ reply: %.80s", g_atReply);
       }
       // 配置 SMS
-      send_atcmd("AT+CMGF=1\r\n",         2000);   // 文本模式
-      send_atcmd("AT+CSCS=\"UCS2\"\r\n",  2000);   // UCS2 编码
+      send_atcmd("AT+CMGF=0\r\n",         2000);   // PDU 模式 (cmgs_send_pdu 走 PDU 写 hex + Ctrl-Z)
+      // v4.0.6 P6b: 删 AT+CSCS="UCS2" — ML307 不支持, 12s 超时导致后续 AT 链路错乱
+      // PDU 模式用 hex, 不需要 charset 设置
       send_atcmd("AT+CSDH=1\r\n",         2000);   // 显示 UDH (长短信拼接)
       send_atcmd("AT+CNMI=2,2,0,0,0\r\n", 2000);   // 主动推 +CMT
       ESP_LOGI(TAG, "SMS engine configured");
@@ -1746,7 +2514,24 @@ static bool modem_init_at() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  // v4.0.6 P3: 默认 log level 是 INFO (sdkconfig 里 ARDUHAL_LOG_DEFAULT_LEVEL=ERROR
+  // 会把 W/I 都吞; 但 ESP-IDF 的 ESP_LOGI 默认受 CONFIG_LOG_DEFAULT_LEVEL 控制,
+  // 设回 INFO 才能看到我加的 ESP_LOGW/ESP_LOGE)
+  esp_log_level_set("*", ESP_LOG_INFO);
+  esp_log_level_set("SMSFWD", ESP_LOG_INFO);
   ESP_LOGI(TAG, "\n=== SMS Forwarder %s ===", FW_VERSION);
+
+  // v4.0.6 P19: 检测 /api/factory 标志 — 全擦 NVS 后重启进 AP 模式
+  // g_factoryReset 在 RTC RAM (ulp_main 不用, volatile 跨 reset 由 flag 实现, 这里用 NVS 兜底)
+  if (g_factoryReset) {
+    ESP_LOGE(TAG, "FACTORY RESET — erasing whole NVS partition");
+    nvs_flash_erase();   // 全擦 (24KB NVS partition 0x9000)
+    nvs_flash_init();
+    g_factoryReset = false;
+    ESP_LOGW(TAG, "FACTORY RESET done, restarting in 1s");
+    delay(1000);
+    ESP.restart();
+  }
 
   // 优先把 BOOT 任务起起来 (任何时候长按都能 reset)
   xTaskCreate(boot_button_task, "boot_btn", 2048, NULL, 3, NULL);
@@ -1794,6 +2579,11 @@ void setup() {
     delay(100); ESP.restart();
   }
 
+  // v4.0.6 P6 fix: cmgs_worker 提前起来, web /api/send handler 派 job 给他
+  // 异步版避免 handler 在 async_tcp task 阻塞 10s+ 饿死 usb_rx_task
+  xTaskCreate(cmgs_worker_task, "cmgs_worker", 4096, NULL, 4, &g_cmgsWorker);
+  ESP_LOGI(TAG, "CMGS worker started");
+
   // WiFi STA + 事件
   esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
   esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
@@ -1807,6 +2597,9 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     g_wifiUp = true;
     ESP_LOGI(TAG, "WiFi connected, IP=%s", WiFi.localIP().toString().c_str());
+    // v4.0.6 P11: 首次启动同步等 WiFi 期间没走事件回调, 手动启 SNTP
+    // (重连场景 GOT_IP 会再调一次, g_sntpStarted 短路)
+    sntp_start_once();
   } else {
     ESP_LOGE(TAG, "WiFi connect timeout — push will keep failing until link up");
   }
@@ -1816,7 +2609,9 @@ void setup() {
   g_webServer->on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
     r->redirect("/dashboard");
   });
+  // v4.0.6+: dashboard 要 BasicAuth (翔哥 2026-06-18), 之后进 OTA/send 免认证
   g_webServer->on("/dashboard", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (!check_dashboard_auth(r)) return;
     r->send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML);
   });
   g_webServer->on("/api/status", HTTP_GET, handleApiStatus);
@@ -1827,13 +2622,34 @@ void setup() {
     });
   g_webServer->on("/restart", HTTP_GET, handle_restart);
   g_webServer->on("/send",    HTTP_GET, handleSendPage);
-  // P0 fix #2: 必须注册 _body upload callback, r->body 才被 AsyncWebServer 累积
-  // 不然 final handler 跑时 r->body 是空的
-  g_webServer->on("/api/send", HTTP_POST, handleApiSend,
-    [](AsyncWebServerRequest* r, uint8_t* /*data*/, size_t /*len*/, size_t /*idx*/, size_t /*total*/) {
-      // no-op — 注册 callback 这一行为 AsyncWebServer 触发 r->body 自动累积
-    });
+  // P0 fix #2: 5 参 on(uri, method, onRequest, onUpload=nullptr, onBody) 把 body handler 挂上
+  // ESP32Async fork 没 r->body 字段, body 由 handleApiSendBody 累积到 _tempObject
+  // (onBody 是 AsyncCallbackWebHandler 的 method, 见 WebHandlerImpl.h)
+  g_webServer->on("/api/send", HTTP_POST, handleApiSend, nullptr, handleApiSendBody);
   g_webServer->on("/api/sent", HTTP_GET, handleApiSent);
+  g_webServer->on("/api/sent/clear", HTTP_POST, handleApiSentClear);
+  // P19: 恢复出厂
+  g_webServer->on("/api/factory", HTTP_POST, handleApiFactory);
+  // 开机推送开关: 要 dashboard 鉴权 (改的是持久配置)
+  g_webServer->on("/api/bootPush", HTTP_POST,
+    [](AsyncWebServerRequest* r) {
+      if (!check_dashboard_auth(r)) return;
+    },
+    nullptr,
+    handleApiBootPush);
+  // 配网编辑 (v4.0.6+, 翔哥 2026-06-18 加): 要 dashboard 鉴权
+  g_webServer->on("/api/cfg", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (!check_dashboard_auth(r)) return;
+    handleApiCfgGet(r);
+  });
+  g_webServer->on("/api/cfg", HTTP_POST,
+    [](AsyncWebServerRequest* r) {
+      if (!check_dashboard_auth(r)) return;
+    },
+    nullptr,
+    handleApiCfgPost);
+  // P15: WiFi 扫描
+  g_webServer->on("/api/scan", HTTP_GET, handleApiScan);
   g_webServer->begin();
   ESP_LOGI(TAG, "Web server up (Dashboard / API / OTA)");
 
