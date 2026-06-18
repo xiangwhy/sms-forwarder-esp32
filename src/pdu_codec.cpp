@@ -307,6 +307,60 @@ size_t pdu_ud_offset(const char* hex, size_t hexLen, bool is7bit, size_t* outUdB
   return pos;
 }
 
+// 从完整 PDU 跳过 SCA+FO+OA+PID+DCS+SCTS+UDL, 返回 UDH 起始 (UDHL byte 位置, hex 偏移)
+// *outUdhByteLen: UDH 段总字节数 (UDHL byte 1 + IEs bytes = UDHL+1)
+// 返回 0 = PDU 太短/格式错
+size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen) {
+  if (outUdhByteLen) *outUdhByteLen = 0;
+  if (!hex || hexLen < 4 || !outUdhByteLen) return 0;
+
+  auto isH = [](char c) -> bool {
+    return (c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f');
+  };
+  auto nib = [](char c) -> int {
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='A'&&c<='F') return c-'A'+10;
+    if (c>='a'&&c<='f') return c-'a'+10;
+    return -1;
+  };
+  auto byte = [&](size_t pos) -> int {
+    if (pos + 2 > hexLen) return -1;
+    if (!isH(hex[pos]) || !isH(hex[pos+1])) return -1;
+    int hi = nib(hex[pos]), lo = nib(hex[pos+1]);
+    return (hi<<4) | lo;
+  };
+
+  // SCA
+  int scaLen = byte(0);
+  if (scaLen < 0 || scaLen > 12) return 0;
+  size_t pos = 2 + (size_t)scaLen * 2;
+
+  // FO
+  if (byte(pos) < 0) return 0;
+  pos += 2;
+
+  // OA
+  int oaLen = byte(pos);
+  if (oaLen < 0 || oaLen > 20) return 0;
+  pos += 2 + 2 + ((size_t)oaLen + 1) / 2 * 2;
+
+  // PID + DCS + SCTS
+  if (pos + 2 + 2 + 14 > hexLen) return 0;
+  pos += 2 + 2 + 14;
+
+  // UDL
+  int udl = byte(pos);
+  if (udl < 0 || udl > 255) return 0;
+  pos += 2;
+
+  // UDH 起始 (UDHL byte 位置)
+  if (pos + 2 > hexLen) return 0;
+  int udhl = byte(pos);
+  if (udhl < 0 || udhl > 140) return 0;  // UDHL 范围 0..140 (3GPP 23.040 §9.2.3.24)
+  *outUdhByteLen = (size_t)(udhl + 1);
+  return pos;
+}
+
 // 从完整 PDU hex 跳过 SCA + FO, 返回 OA 起始 (hex 偏移)
 // *outIsAlpha: true=TON=alphanumeric (GSM7 packed), false=numeric (BCD nibble swap)
 // *outValueOctets: OA value 段 octet 数

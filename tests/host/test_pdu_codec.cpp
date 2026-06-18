@@ -1031,6 +1031,130 @@ static void test_pdu_oa_offset_numeric() {
   CHECK_EQ_INT(oaOff, 22);  // SCA 16 + FO 2 + OA-len 2 + OA-ToA 2 = 22
 }
 
+// =================== v4.0.9: pdu_udh_offset (concat SMS path bug fix) ===================
+// 修前 bug: main.cpp:497-505 误用 strstr("0804"/"0003") + p16<=body+2 判定 UDH 位置,
+//   "0804" 实际在 body 深处 (UDH IE), 条件永远 false, udhSkip=0, stashed 含整段 PDU header
+// 修后: pdu_udh_offset 用 UDL 后的 UDHL byte 定位 UDH 起点, outUdhByteLen=UDHL+1
+//
+// 测试用 2 段真实 concat PDU (单条 PDU, 含 UDH 16-bit concat IE 0504 refH refL total seq)
+//
+// 真实 concat PDU 布局 (SCA=00, FO=04, OA=0B 国内 13x, PID=00, DCS=00 7-bit, SCTS=7B, UDL=99, UDHL=05):
+//   "00"                                                 // SCA len 0
+//   "04"                                                 // FO: SMS-DELIVER, no MMS
+//   "0B 81 86 09 14 00 09 00"                            // OA: len=11, ToA=0x81 unknown, BCD 13x...
+//   "00"                                                 // PID
+//   "00"                                                 // DCS 7-bit default
+//   "62609120506082"                                     // SCTS (7 bytes)
+//   "63"                                                 // UDL = 99 septets (7-bit)
+//   "05 00 03 9C AD 01"                                  // UDH 8-bit concat: UDHL=05 IEI=00 IEDL=03 ref=0x9CAD total=01 seq=01
+//   <UD 7-bit packed 95 bytes hex = 190 hex chars>
+//
+// 期望: pdu_udh_offset 返回 46 (hex chars), outUdhByteLen=6 (UDHL+5 IEs bytes)
+static void test_pdu_udh_offset_8bit_concat() {
+  const char* body =
+    "00"                                                  // SCA len 0
+    "04"                                                  // FO
+    "0B" "81" "860914000900"                              // OA 国内 (11 digits = 12 hex)
+    "00"                                                  // PID
+    "00"                                                  // DCS 7-bit
+    "62609120506082"                                      // SCTS
+    "63"                                                  // UDL 99 septets
+    "05" "00" "03" "9C" "AD" "01";                        // UDH 8-bit: UDHL=05 IEI=00 IEDL=03 ref=0x9CAD total=1 seq=1
+  size_t bodyLen = std::strlen(body);
+  size_t udhBytes = 0;
+  size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, &udhBytes);
+  // SCA 0: pos=2
+  // FO 1:   pos=4
+  // OA 6:   pos=4 + 2 + 2 + 12 = 20
+  // PID 1:  pos=22
+  // DCS 1:  pos=24
+  // SCTS 7: pos=38
+  // UDL 1:  pos=40
+  // UDHL:   pos=40 (UDHL byte 位置)
+  // (UDHL=05, IE 5 bytes → udhBytes=6)
+  CHECK_EQ_INT(udhOff, 40);
+  CHECK_EQ_INT(udhBytes, 6);
+}
+
+// 16-bit concat PDU 布局 (SCA=07, FO=04, OA=0B, PID=00, DCS=08 UCS-2, SCTS=7B, UDL=46 UCS-2 chars, UDHL=06):
+//   "07 91 66 39 08 11 00 F3"                             // SCA len=7, type=91, BCD 66839001810003
+//   "04"                                                 // FO
+//   "0B 81 86 09 14 00 09 00"                            // OA 11 digits
+//   "00"                                                 // PID
+//   "08"                                                 // DCS UCS-2
+//   "62609120506082"                                     // SCTS
+//   "46"                                                 // UDL 70 UCS-2 chars (concat 后单条 70)
+//   "06 08 04 9C AD 00 01"                               // UDH 16-bit: UDHL=06 IEI=08 IEDL=04 ref=0x9CAD total=0 seq=1
+//   <UD UCS-2 70 chars = 140 hex chars>
+static void test_pdu_udh_offset_16bit_concat() {
+  const char* body =
+    "07" "91" "6639081100F3"                              // SCA
+    "04"                                                  // FO
+    "0B" "81" "860914000900"                              // OA
+    "00"                                                  // PID
+    "08"                                                  // DCS UCS-2
+    "62609120506082"                                      // SCTS
+    "46"                                                  // UDL 70 UCS-2 chars
+    "06" "08" "04" "9C" "AD" "00" "01";                   // UDH 16-bit: UDHL=06 IEI=08 IEDL=04 ref=0x9CAD total=0 seq=1
+  size_t bodyLen = std::strlen(body);
+  size_t udhBytes = 0;
+  size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, &udhBytes);
+  // SCA 8: pos=2 + 14 = 16
+  // FO 1: pos=18
+  // OA 6: pos=18 + 2 + 2 + 12 = 34
+  // PID 1: pos=36
+  // DCS 1: pos=38
+  // SCTS 7: pos=52
+  // UDL 1: pos=54
+  // UDHL: pos=54
+  CHECK_EQ_INT(udhOff, 54);
+  CHECK_EQ_INT(udhBytes, 7);  // UDHL=06 + 6 IEs
+}
+
+// 边界: PDU 太短, 应该返回 0
+static void test_pdu_udh_offset_too_short() {
+  size_t udhBytes = 99;
+  size_t udhOff = pdu::pdu_udh_offset("00", 2, &udhBytes);  // SCA len 0 + FO 缺
+  CHECK_EQ_INT(udhOff, 0);
+  CHECK_EQ_INT(udhBytes, 0);
+
+  udhBytes = 99;
+  udhOff = pdu::pdu_udh_offset("ZZ", 2, &udhBytes);  // 非 hex
+  CHECK_EQ_INT(udhOff, 0);
+}
+
+// 边界: 已知坏 PDU (OA 长度超限) → 返回 0
+static void test_pdu_udh_offset_invalid_oa_len() {
+  const char* body = "00" "04" "FF" "81" "1234567890123456789012" "00" "00" "0000000000000" "00";
+  size_t bodyLen = std::strlen(body);
+  size_t udhBytes = 99;
+  size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, &udhBytes);
+  CHECK_EQ_INT(udhOff, 0);
+  CHECK_EQ_INT(udhBytes, 0);
+}
+
+// 无 UDH 场景 (单条 SMS): UDHL=0, udhBytes=1
+//   SCA=00 FO=04 OA=0B ... DCS=00 SCTS=7B UDL=10 UD=...
+static void test_pdu_udh_offset_no_udh() {
+  // body hex 总长 60: SCA=2, FO=2, OA=16, PID=2, DCS=2, SCTS=14, UDL=2, UDHL=2, UD=18
+  const char* body =
+    "00"                                                  // SCA len 0
+    "04"                                                  // FO
+    "0B" "81" "860914000900"                             // OA
+    "00"                                                  // PID
+    "00"                                                  // DCS 7-bit
+    "62609120506082"                                      // SCTS
+    "10"                                                  // UDL 16 septets
+    "00"                                                  // UDHL=0, 无 UDH IE
+    "C8329BFD065DDF7236";                                 // UD 7-bit 16 chars
+  size_t bodyLen = std::strlen(body);
+  size_t udhBytes = 0;
+  size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, &udhBytes);
+  // UDHL pos = 40 (跟 8bit concat 同样 header 布局, 只差 UDHL=0)
+  CHECK_EQ_INT(udhOff, 40);
+  CHECK_EQ_INT(udhBytes, 1);  // UDHL=0 + 0 IE = 1 byte, caller udhSkip=2 hex chars
+}
+
 int main() {
   std::printf("============================================================\n");
   std::printf("pdu_codec host test\n");
@@ -1150,6 +1274,13 @@ int main() {
   test_pdu_oa_offset_alpha();
   test_pdu_oa_offset_e2e_alpha();
   test_pdu_oa_offset_numeric();
+
+  // v4.0.9: pdu_udh_offset (concat SMS path bug fix)
+  test_pdu_udh_offset_8bit_concat();
+  test_pdu_udh_offset_16bit_concat();
+  test_pdu_udh_offset_too_short();
+  test_pdu_udh_offset_invalid_oa_len();
+  test_pdu_udh_offset_no_udh();
 
   std::printf("============================================================\n");
   std::printf("Result: %d passed, %d failed\n", g_pass, g_fail);

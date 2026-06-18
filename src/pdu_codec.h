@@ -60,6 +60,13 @@ bool looks_like_ucs2_be(const char* hex, size_t hexLen);
 // 返回 0 = PDU 太短/格式错 (caller 兜底用全 body 当 UD)
 size_t pdu_ud_offset(const char* hex, size_t hexLen, bool is7bit, size_t* outUdByteLen);
 
+// 从完整 PDU 跳过 SCA+FO+OA+PID+DCS+SCTS+UDL, 返回 UDH 起始 (UDHL byte 位置, hex 偏移)
+// *outUdhByteLen: UDH 段总字节数 (UDHL byte 1 + IEs bytes = UDHL+1)
+//   调用方 udhSkip = *outUdhByteLen * 2 (hex chars) → 跳过 UDH 进 UD
+// 返回 0 = PDU 太短/格式错 (caller 兜底用全 body 当 UD)
+// 配套 stash_udh_part: 用于切出 concat SMS part 的纯 UD body (剥 UDH 头)
+size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen);
+
 // 从完整 PDU (SCA+FO+OA+PID+...) hex 跳过 SCA+FO, 返回 OA 起始 (hex 偏移)
 // *outIsAlpha: true=TON=alphanumeric(GSM7 packed), false=numeric(BCD nibble swap)
 // *outValueOctets: OA value 段 octet 数 (= ceil(oaLen/2))

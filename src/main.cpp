@@ -64,7 +64,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.8"
+#define FW_VERSION         "v4.0.9"
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -485,22 +485,26 @@ static bool stash_udh_part(const SmsMsg* msg) {
     r = alloc_udh_slot(refId, total, msg->phone_hex);
     if (!r) return false;
   }
-  // UDH 头长度:
-  //   8-bit concat:  IEI(1) 03 ref total seq  = 5 字节 = 10 hex
-  //   16-bit concat: IEI(1) 04 refH refL total seq = 6 字节 = 12 hex
-  // ML307 标准格式: body[0..1] = UDHLEN(1 byte hex), body[2..] = IE
-  //   16-bit: "06 08 04 ..." → "0804" 在 body+2 → skip 14
-  //   8-bit:  "05 00 03 ..." → "0003" 在 body+2 → skip 12
-  // ML307 剥 UDHL (实测踩过): body[0..] 直接 IE
-  //   16-bit: "08 04 ..." → "0804" 在 body+0 → skip 12
-  //   8-bit:  "00 03 ..." → "0003" 在 body+0 → skip 10
+  // UDH 头长度: 用 pdu_udh_offset 走 PDU header 链 (SCA+FO+OA+PID+DCS+SCTS+UDL) 跳到 UDHL byte 位置
+  // 修前 bug: 旧逻辑用 strstr("0804"/"0003") + p16<=body+2, "0804" 实际在 body 深处 (UDH IE),
+  //   条件永远 false → udhSkip=0 → stashed = 整段 PDU body (含 header) → 拼接/decode 全失败 → 死锁
+  // 修后: 走 PDU 头链 + 读 UDHL byte 算 UDH 段长度, 兼容 ML307 标准 (UDHL 在 body) 和剥 UDHL 罕见场景
+  size_t udhBytes = 0;
+  size_t udhOff = pdu::pdu_udh_offset(msg->body_hex, strlen(msg->body_hex), &udhBytes);
   size_t udhSkip = 0;
-  const char* p16 = strstr(msg->body_hex, "0804");
-  const char* p8  = strstr(msg->body_hex, "0003");
-  if (p16 != NULL && p16 <= msg->body_hex + 2) {
-    udhSkip = (p16 == msg->body_hex + 2) ? 14 : 12;
-  } else if (p8 != NULL && p8 <= msg->body_hex + 2) {
-    udhSkip = (p8 == msg->body_hex + 2) ? 12 : 10;
+  if (udhOff > 0 && udhBytes > 0) {
+    udhSkip = udhBytes * 2;  // UDH 段 = UDHL + IEs, hex chars = bytes * 2
+  } else {
+    // pdu_udh_offset 失败 (PDU header 异常), 兜底用旧启发式 (已知 0804/0003 在 body 头)
+    // 真出这条 = 模组给了非标 PDU, 应现场抓 PDU 抓 bug
+    ESP_LOGE(TAG, "pdu_udh_offset failed, fallback to old heuristic (body_str=%.40s...)", msg->body_hex);
+    const char* p16 = strstr(msg->body_hex, "0804");
+    const char* p8  = strstr(msg->body_hex, "0003");
+    if (p16 != NULL && p16 <= msg->body_hex + 2) {
+      udhSkip = (p16 == msg->body_hex + 2) ? 14 : 12;
+    } else if (p8 != NULL && p8 <= msg->body_hex + 2) {
+      udhSkip = (p8 == msg->body_hex + 2) ? 12 : 10;
+    }
   }
   const char* partBody = msg->body_hex + udhSkip;
   if (seq < 1 || seq > MAX_UDH_PARTS) return false;
@@ -1419,22 +1423,20 @@ static void nvsSentList(String& out) {
   Preferences p;
   p.begin(NVS_NS_SENT, true);
   uint8_t head = p.getUChar("head", 0);
-  p.end();
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
   // 从 head-1 倒着读 32 条 (新 → 旧)
   for (int i = 0; i < SENT_CAP; i++) {
     int idx = ((int)head - 1 - i + SENT_CAP) % SENT_CAP;
     char key[8]; snprintf(key, sizeof(key), "s%d", idx);
-    p.begin(NVS_NS_SENT, true);
     String s = p.getString(key, "");
-    p.end();
     if (s.length() == 0) continue;
     JsonDocument item;
     if (deserializeJson(item, s) == DeserializationError::Ok) {
       arr.add(item);
     }
   }
+  p.end();
   serializeJson(arr, out);
 }
 
