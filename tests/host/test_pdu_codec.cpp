@@ -256,6 +256,202 @@ static void test_looks_like_ucs2_too_short() {
   CHECK(!pdu::looks_like_ucs2_be("0E23", 3));   // 奇数长度
 }
 
+// === v4.0.6 短信发送 (双向): ucs2_encode + sms_split_for_send ===
+static void test_ucs2_encode_ascii() {
+  g_current = "ucs2_encode: 'Hi' (2 ASCII) → '00480069' (4 hex 字符)";
+  char buf[32] = {};
+  int n = pdu::ucs2_encode("Hi", buf, sizeof(buf));
+  CHECK_EQ_INT(n, 8);  // 2 char × 4 hex
+  CHECK_EQ_STR(std::string(buf), "00480069");
+}
+
+static void test_ucs2_encode_chinese() {
+  g_current = "ucs2_encode: '你好' (2 CJK) → '4F60597D'";
+  // 你 = U+4F60, 好 = U+597D, big-endian
+  char buf[32] = {};
+  int n = pdu::ucs2_encode("你好", buf, sizeof(buf));
+  CHECK_EQ_INT(n, 8);
+  CHECK_EQ_STR(std::string(buf), "4F60597D");
+}
+
+static void test_ucs2_encode_thai() {
+  g_current = "ucs2_encode: Thai 'สวัสดี' (6 char) → '0E2A0E270E310E2A0E140E35'";
+  // ส(0E2A) ว(0E27) ั(0E31) ส(0E2A) ด(0E14) ี(0E35)
+  char buf[64] = {};
+  int n = pdu::ucs2_encode("สวัสดี", buf, sizeof(buf));
+  CHECK_EQ_INT(n, 24);
+  CHECK_EQ_STR(std::string(buf), "0E2A0E270E310E2A0E140E35");
+}
+
+static void test_ucs2_encode_invalid_utf8() {
+  g_current = "ucs2_encode: 不合法 UTF-8 (\\xC3\\x28 truncated) → -1";
+  // \xC3 起始 2 字节序列, 但 \x28 不是 0x80-0xBF 续字节 → 拒绝
+  const char bad[] = { (char)0xC3, (char)0x28, 0 };
+  char buf[32] = {};
+  int n = pdu::ucs2_encode(bad, buf, sizeof(buf));
+  CHECK_EQ_INT(n, -1);
+}
+
+static void test_split_single_70() {
+  g_current = "sms_split_for_send: 70 chars / seg 70 → 1 段 [0, 70]";
+  pdu::SmsPart parts[8] = {};
+  int n = pdu::sms_split_for_send(70, 70, parts, 8);
+  CHECK_EQ_INT(n, 1);
+  CHECK_EQ_INT(parts[0].offset_chars, 0);
+  CHECK_EQ_INT(parts[0].len_chars, 70);
+}
+
+static void test_split_double_71() {
+  g_current = "sms_split_for_send: 71 chars / seg 67 → 2 段 [0, 67] + [67, 4]";
+  // 拼接每段 67 (UDH 占 6 字符), 71 = 67 + 4
+  // caller 知道是拼接时传 67, 单条时传 70
+  pdu::SmsPart parts[8] = {};
+  int n = pdu::sms_split_for_send(71, 67, parts, 8);
+  CHECK_EQ_INT(n, 2);
+  CHECK_EQ_INT(parts[0].offset_chars, 0);
+  CHECK_EQ_INT(parts[0].len_chars, 67);
+  CHECK_EQ_INT(parts[1].offset_chars, 67);
+  CHECK_EQ_INT(parts[1].len_chars, 4);
+}
+
+static void test_split_overflow_255segs() {
+  g_current = "sms_split_for_send: 70×256 chars (256 段超 GSM 限制) → 0";
+  // GSM UDH ref 8-bit 最大 255 段, sms_split 应当把 256 段当 overflow
+  // 实际本项目 max_parts=8 也会限住, 这里再测 256 段触发 GSM 上限
+  pdu::SmsPart parts[8] = {};
+  int n = pdu::sms_split_for_send(70 * 256, 70, parts, 8);
+  CHECK_EQ_INT(n, 0);
+}
+
+// === P0 fix #3: DA length 字段是 decimal digit count, 不是 hex char 数 ===
+// GSM 03.40 §9.1.2.5 — 11 位手机 → DA length = 11 (不是 hex chars 12)
+static void test_bcd_encode_phone_11digit() {
+  g_current = "bcd_encode_phone: '13800001234' (11 位) → 返回 11, hex='3108001032F4' (12 hex)";
+  char buf[32] = {};
+  int n = pdu::bcd_encode_phone("13800001234", buf, sizeof(buf));
+  CHECK_EQ_INT(n, 11);  // digit count, 不是 hex char 数
+  // 11 位 digits="13800001234" → (1,3)→31, (8,0)→08, (0,0)→00, (0,1)→10, (2,3)→32, 末位 4→F4
+  CHECK_EQ_STR(std::string(buf), "3108001032F4");
+}
+
+static void test_bcd_encode_phone_10digit() {
+  g_current = "bcd_encode_phone: '1380000123' (10 位) → 返回 10, hex='3108001032' (10 hex)";
+  char buf[32] = {};
+  int n = pdu::bcd_encode_phone("1380000123", buf, sizeof(buf));
+  CHECK_EQ_INT(n, 10);
+  CHECK_EQ_STR(std::string(buf), "3108001032");
+}
+
+static void test_bcd_encode_phone_13digit_intl() {
+  g_current = "bcd_encode_phone: '8613800001234' (13 位国际号, 翔哥提的国外场景) → 返回 13";
+  char buf[32] = {};
+  int n = pdu::bcd_encode_phone("8613800001234", buf, sizeof(buf));
+  CHECK_EQ_INT(n, 13);
+  // 13 位 digits: 8,6,1,3,8,0,0,0,0,1,2,3,4
+  // i=0..10 even-iterations normal: "68" "31" "08" "00" "10" "32"
+  // i=12 odd-iteration: "F" + digits[12]='4' → "F4"
+  CHECK_EQ_STR(std::string(buf), "683108001032F4");
+}
+
+static void test_bcd_encode_phone_plus_prefix() {
+  g_current = "bcd_encode_phone: '+8613800001234' → 静默剥 +, 返回 13";
+  char buf[32] = {};
+  int n = pdu::bcd_encode_phone("+8613800001234", buf, sizeof(buf));
+  CHECK_EQ_INT(n, 13);
+  // 跟 13 位国际号一样: 剥 + 后同 8613800001234
+  CHECK_EQ_STR(std::string(buf), "683108001032F4");
+}
+
+static void test_bcd_encode_phone_invalid_chars() {
+  g_current = "bcd_encode_phone: '138a0001234' (含字母) → -1";
+  char buf[32] = {};
+  CHECK_EQ_INT(pdu::bcd_encode_phone("138a0001234", buf, sizeof(buf)), -1);
+}
+
+// === P0 fix #1: 拼接 SMS 必须 PDU-type 0x51 (UDHI bit 置 1) ===
+static void test_cmgs_build_pdu_single_pdu_type() {
+  g_current = "cmgs_build_pdu: 单条 → PDU-type = '11' (UDHI=0, 相对 VP)";
+  char pdu[600];
+  int n = pdu::cmgs_build_pdu("13800001234", "Hi", -1, nullptr, 0,
+                              0x2A, pdu, sizeof(pdu));
+  CHECK(n > 0);
+  // hex chars 0-1 = "11" (SMS-SUBMIT, UDHI=0, 相对 VP)
+  CHECK_EQ_STR(std::string(pdu, 2), "11");
+}
+
+static void test_cmgs_build_pdu_single_da_length_11digit() {
+  g_current = "cmgs_build_pdu: 单条 11 位手机 → DA length byte = '0B' (11, 不是 12)";
+  char pdu[600];
+  int n = pdu::cmgs_build_pdu("13800001234", "Hi", -1, nullptr, 0,
+                              0x2A, pdu, sizeof(pdu));
+  CHECK(n > 0);
+  // hex chars 0-1: PDU-type="11"
+  // hex chars 2-3: MR="00"
+  // hex chars 4-5: DA length = "0B" (11) — 不是 "0C" (12)!
+  CHECK_EQ_STR(std::string(pdu + 4, 2), "0B");
+}
+
+static void test_cmgs_build_pdu_single_da_length_10digit() {
+  g_current = "cmgs_build_pdu: 单条 10 位手机 → DA length byte = '0A' (10)";
+  char pdu[600];
+  int n = pdu::cmgs_build_pdu("1380000123", "Hi", -1, nullptr, 0,
+                              0x2A, pdu, sizeof(pdu));
+  CHECK(n > 0);
+  CHECK_EQ_STR(std::string(pdu + 4, 2), "0A");
+}
+
+static void test_cmgs_build_pdu_concat_pdu_type() {
+  g_current = "cmgs_build_pdu: 拼接 → PDU-type = '51' (UDHI=1, 模组才会解析 UDH)";
+  // body 71 字符, 拆 2 段 (67 + 4), 每段都要 PDU-type 0x51
+  char body[200];
+  std::memset(body, 'A', 71);
+  body[71] = 0;
+  pdu::SmsPart parts[8];
+  int segs = pdu::sms_split_for_send(71, 67, parts, 8);
+  CHECK_EQ_INT(segs, 2);
+  char pdu0[600], pdu1[600];
+  int n0 = pdu::cmgs_build_pdu("13800001234", body, 0, parts, segs,
+                               0x2A, pdu0, sizeof(pdu0));
+  int n1 = pdu::cmgs_build_pdu("13800001234", body, 1, parts, segs,
+                               0x2A, pdu1, sizeof(pdu1));
+  CHECK(n0 > 0 && n1 > 0);
+  // hex chars 0-1 = "51" (UDHI bit 置 1)
+  CHECK_EQ_STR(std::string(pdu0, 2), "51");
+  CHECK_EQ_STR(std::string(pdu1, 2), "51");
+  // hex chars 4-5 仍应是 "0B" (11 digit count)
+  CHECK_EQ_STR(std::string(pdu0 + 4, 2), "0B");
+  CHECK_EQ_STR(std::string(pdu1 + 4, 2), "0B");
+}
+
+static void test_cmgs_build_pdu_concat_udh_bytes() {
+  g_current = "cmgs_build_pdu: 拼接 → chars 14-23 = '050003' + ref/total/seq (UDH 8-bit concat)";
+  // chars 0-1: PDU-type="51", 2-3: MR="00", 4-5: DA len="0B",
+  // 6-7: ToA="81", 8-19: DA digits (12 hex), 20-21: PID="00",
+  // 22-23: DCS="08", 24-25: VP="AA", 26-35: UDH="050003" + RR TT SS (10 hex)
+  char body[200];
+  std::memset(body, 'A', 71);
+  body[71] = 0;
+  pdu::SmsPart parts[8];
+  int segs = pdu::sms_split_for_send(71, 67, parts, 8);
+  char pdu0[600];
+  int n = pdu::cmgs_build_pdu("13800001234", body, 0, parts, segs,
+                              0x2A, pdu0, sizeof(pdu0));
+  CHECK(n > 0);
+  // UDH 头 6 hex = "050003" (UDHL=05, IEI=00, IEDL=03)
+  CHECK_EQ_STR(std::string(pdu0 + 26, 6), "050003");
+  // ref(2A) total(02) seq(01)
+  CHECK_EQ_STR(std::string(pdu0 + 32, 6), "2A0201");
+}
+
+static void test_cmgs_build_pdu_invalid_utf8() {
+  g_current = "cmgs_build_pdu: body 含非法 UTF-8 (\\xC3\\x28 truncated) → -1";
+  char body[] = { 'H', (char)0xC3, (char)0x28, 0 };
+  char pdu[600];
+  int n = pdu::cmgs_build_pdu("13800001234", body, -1, nullptr, 0,
+                              0x2A, pdu, sizeof(pdu));
+  CHECK_EQ_INT(n, -1);
+}
+
 static void test_7bit_user_real_long_msg() {
   g_current = "decode_7bit_packed: 用户真车长 OTP (138 字节 / 158 septets) → 'Keep this code...23:20.'";
   // Part 1 UDH-stripped body (119 字节) + Part 2 UDH-stripped body (20 字节) = 139 字节
@@ -323,6 +519,30 @@ int main() {
   test_looks_like_ucs2_ascii_negative();
   test_looks_like_ucs2_gsm7_packed_negative();
   test_looks_like_ucs2_too_short();
+
+  // v4.0.6 短信发送 (双向)
+  test_ucs2_encode_ascii();
+  test_ucs2_encode_chinese();
+  test_ucs2_encode_thai();
+  test_ucs2_encode_invalid_utf8();
+  test_split_single_70();
+  test_split_double_71();
+  test_split_overflow_255segs();
+
+  // P0 fix #3: DA length = decimal digit count
+  test_bcd_encode_phone_11digit();
+  test_bcd_encode_phone_10digit();
+  test_bcd_encode_phone_13digit_intl();  // 翔哥提的国外场景
+  test_bcd_encode_phone_plus_prefix();
+  test_bcd_encode_phone_invalid_chars();
+
+  // P0 fix #1 + #3: PDU-type 0x51 for concat + DA length
+  test_cmgs_build_pdu_single_pdu_type();
+  test_cmgs_build_pdu_single_da_length_11digit();
+  test_cmgs_build_pdu_single_da_length_10digit();
+  test_cmgs_build_pdu_concat_pdu_type();
+  test_cmgs_build_pdu_concat_udh_bytes();
+  test_cmgs_build_pdu_invalid_utf8();
 
   std::printf("============================================================\n");
   std::printf("Result: %d passed, %d failed\n", g_pass, g_fail);

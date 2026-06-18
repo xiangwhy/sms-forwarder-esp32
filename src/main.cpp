@@ -61,7 +61,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.5"
+#define FW_VERSION         "v4.0.6"
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -169,6 +169,7 @@ struct PushItem {
 static usbh_cdc_port_handle_t g_cdc = NULL;
 static SemaphoreHandle_t      g_atMutex = NULL;
 static SemaphoreHandle_t      g_atDone  = NULL;
+static SemaphoreHandle_t      g_atPrompt = NULL;   // v4.0.6: ">" prompt (CMGS step 2)
 static QueueHandle_t          g_smsQ    = NULL;
 static QueueHandle_t          g_pushQ   = NULL;
 static QueueHandle_t          g_urcQ    = NULL;
@@ -179,6 +180,7 @@ static volatile int    g_atResult   = -2;   // 0=OK, -1=ERROR, -2=timeout/pendin
 
 static bool g_waitingCmtBody = false;
 static char g_cmtHeader[CMT_HEADER_BUF] = {0};
+static volatile bool g_waitingCmgsPrompt = false;   // v4.0.6: 等 ">" 后写 PDU
 
 // LED
 typedef enum { LED_OFF, LED_ON, LED_BLINK_SLOW, LED_BLINK_FAST } led_state_t;
@@ -323,6 +325,14 @@ static void handle_at_line(const char* line) {
       }
     }
     return;
+  }
+
+  // v4.0.6: CMGS prompt "> " → 触发 g_atPrompt 让 cmgs_send_pdu 写 PDU
+  // ("> " 不以 + 开头, 走这里而不是 URC 分支)
+  if (g_waitingCmgsPrompt && line[0] == '>' && (line[1] == ' ' || line[1] == 0)) {
+    g_waitingCmgsPrompt = false;
+    if (g_atPrompt) xSemaphoreGive(g_atPrompt);
+    return;   // "> " 行不入 reply
   }
 
   // 普通行 → 累加到 reply (行末加 '\n' 方便多行响应排错)
@@ -780,6 +790,124 @@ static void nvsQSanityCheck() {
   }
 }
 
+// =================== SMS 发送 (v4.0.6+, 双向) ===================
+// 限频: 1 分钟 5 条 (滑窗, RAM token bucket)
+static uint32_t s_sendTs[5] = {0};
+static int      s_sendIdx = 0;
+static portMUX_TYPE s_sendMux = portMUX_INITIALIZER_UNLOCKED;
+static bool smsRateLimitOk() {
+  uint32_t now = millis();
+  portENTER_CRITICAL(&s_sendMux);
+  int alive = 0;
+  for (int i = 0; i < 5; i++) if (now - s_sendTs[i] < 60000) alive++;
+  bool ok = (alive < 5);
+  if (ok) { s_sendTs[s_sendIdx] = now; s_sendIdx = (s_sendIdx + 1) % 5; }
+  portEXIT_CRITICAL(&s_sendMux);
+  return ok;
+}
+
+// NVS "sent" 命名空间, 32 条滚动 (仿 pqueue 模式)
+namespace { constexpr const char* NVS_NS_SENT = "sent"; constexpr int SENT_CAP = 32; }
+
+static void nvsSentEnqueue(const char* phone, const char* body_preview,
+                           uint8_t ref, bool ok, int err_code) {
+  Preferences p;
+  p.begin(NVS_NS_SENT, false);
+  uint8_t head = p.getUChar("head", 0);
+  char key[8]; snprintf(key, sizeof(key), "s%u", head);
+  char val[256];
+  // body_preview 已 truncate ≤ 40 字符, phone ≤ 16
+  snprintf(val, sizeof(val),
+    "{\"ts\":%lu,\"ph\":\"%.16s\",\"bp\":\"%.40s\",\"ref\":%u,\"ok\":%d,\"c\":%d}",
+    (unsigned long)millis(), phone, body_preview, ref, ok ? 1 : 0, err_code);
+  p.putString(key, val);
+  p.putUChar("head", (head + 1) % SENT_CAP);
+  p.end();
+}
+
+// 把 NVS "sent" 32 条返成 JSON 数组 (新 → 旧)
+static void nvsSentList(String& out) {
+  Preferences p;
+  p.begin(NVS_NS_SENT, true);
+  uint8_t head = p.getUChar("head", 0);
+  p.end();
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  // 从 head-1 倒着读 32 条 (新 → 旧)
+  for (int i = 0; i < SENT_CAP; i++) {
+    int idx = ((int)head - 1 - i + SENT_CAP) % SENT_CAP;
+    char key[8]; snprintf(key, sizeof(key), "s%d", idx);
+    p.begin(NVS_NS_SENT, true);
+    String s = p.getString(key, "");
+    p.end();
+    if (s.length() == 0) continue;
+    JsonDocument item;
+    if (deserializeJson(item, s) == DeserializationError::Ok) {
+      arr.add(item);
+    }
+  }
+  serializeJson(arr, out);
+}
+
+// CMGS 走完整流程: 写 AT+CMGS=<n> → 等 "> " → 写 PDU+Ctrl-Z → 等 OK/ERROR
+// 返: 0 = OK (outRef 已写), -1 = ERROR (outErr 已写), -2 = timeout
+// 注意: 自己拿/放 g_atMutex
+static int cmgs_send_pdu(const char* pdu_hex, uint8_t& outRef, int& outErr, uint32_t timeout_ms) {
+  outRef = 0; outErr = 0;
+  if (!g_cdc) return -2;
+  if (xSemaphoreTake(g_atMutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return -2;
+
+  // drain
+  size_t dummy = 0;
+  uint8_t trash[64];
+  while (1) {
+    usbh_cdc_get_rx_buffer_size(g_cdc, &dummy);
+    if (!dummy) break;
+    if (dummy > sizeof(trash)) dummy = sizeof(trash);
+    usbh_cdc_read_bytes(g_cdc, trash, &dummy, 0);
+  }
+  // reset
+  g_atReplyLen = 0;
+  g_atReply[0] = 0;
+  g_atResult   = -2;
+  xSemaphoreTake(g_atDone, 0);
+  xSemaphoreTake(g_atPrompt, 0);
+  g_waitingCmgsPrompt = true;
+
+  // AT+CMGS=<pdu_byte_len>\r
+  int pdu_byte_len = (int)strlen(pdu_hex) / 2;
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "AT+CMGS=%d\r", pdu_byte_len);
+  ESP_LOGI(TAG, "AT TX: %s", cmd);
+  usbh_cdc_write_bytes(g_cdc, (uint8_t*)cmd, strlen(cmd), pdMS_TO_TICKS(100));
+
+  int rc = -2;
+  if (xSemaphoreTake(g_atPrompt, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+    // 写 PDU + Ctrl-Z
+    size_t n = strlen(pdu_hex);
+    char buf[600];
+    if (n + 1 >= sizeof(buf)) { g_waitingCmgsPrompt = false; xSemaphoreGive(g_atMutex); return -2; }
+    memcpy(buf, pdu_hex, n);
+    buf[n] = 0x1A;     // Ctrl-Z
+    usbh_cdc_write_bytes(g_cdc, (uint8_t*)buf, n + 1, pdMS_TO_TICKS(200));
+    // 等 OK/ERROR
+    if (xSemaphoreTake(g_atDone, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+      rc = g_atResult;
+      if (rc == 0) {
+        const char* p = strstr(g_atReply, "+CMGS:");
+        if (p) outRef = (uint8_t)atoi(p + 6);
+      } else {
+        const char* p = strstr(g_atReply, "+CMS ERROR:");
+        if (p) outErr = atoi(p + 11);
+      }
+    }
+  }
+  g_waitingCmgsPrompt = false;
+  ESP_LOGI(TAG, "CMGS rc=%d ref=%u err=%d reply=%.200s", rc, outRef, outErr, g_atReply);
+  xSemaphoreGive(g_atMutex);
+  return rc;
+}
+
 // =================== SmsTask ===================
 static void sms_task(void* /*param*/) {
   TickType_t last = xTaskGetTickCount();
@@ -1043,7 +1171,7 @@ h1{font-size:20px}.row{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}
 .tag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:12px}
 .tag-ok{background:#dfd;color:#282}.tag-bad{background:#fdd;color:#822}
 </style></head><body>
-<h1>SMS Forwarder <span class=tag>FW v4.0.5</span></h1>
+<h1>SMS Forwarder <span class=tag>FW v4.0.6</span></h1>
 <div class=row>
   <div class=card><h3>运行</h3>
     <div class=kv><b>Boot</b><span id=boot>0</span></div>
@@ -1064,6 +1192,7 @@ h1{font-size:20px}.row{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}
   </div>
 </div>
 <a class=btn href=/update>OTA 升级</a>
+<a class=btn href=/send style=background:#0a0>📤 短信发送</a>
 <a class=btn href=/restart style=background:#888>重启</a>
 <p><small>30s 自动刷新</small></p>
 <script>
@@ -1189,6 +1318,181 @@ static void handle_restart(AsyncWebServerRequest* r) {
   r->send(200, "text/plain", "Rebooting ...");
   delay(200);
   ESP.restart();
+}
+
+// =================== SMS 发送 Web (v4.0.6+) ===================
+// 页面: 表单 + 发送结果 + 最近发送历史
+static const char SEND_PAGE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>SMS 发送</title>
+<style>
+body{font-family:-apple-system,sans-serif;max-width:760px;margin:20px auto;padding:0 16px;background:#fafafa}
+h1{font-size:20px}.card{background:#fff;padding:12px;border-radius:8px;box-shadow:0 1px 3px #0001;margin:12px 0}
+label{display:block;margin:8px 0 4px;font-size:13px;color:#555}
+input,textarea{width:100%;box-sizing:border-box;padding:8px;font-size:15px;border:1px solid #ccc;border-radius:6px;font-family:inherit}
+textarea{resize:vertical;min-height:80px}
+button{margin-top:12px;padding:10px 20px;font-size:15px;background:#06f;color:#fff;border:0;border-radius:6px;cursor:pointer}
+button:disabled{background:#aaa;cursor:not-allowed}
+.kv{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #f0f0f0;font-size:13px}
+.kv:last-child{border:0}
+.tag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:12px}
+.tag-ok{background:#dfd;color:#282}.tag-bad{background:#fdd;color:#822}
+pre{background:#f4f4f4;padding:8px;border-radius:4px;overflow:auto;font-size:12px;max-height:200px}
+a.btn{display:inline-block;padding:6px 12px;background:#888;color:#fff;border-radius:4px;text-decoration:none;margin-left:8px;font-size:13px}
+</style></head><body>
+<h1>📤 SMS 发送 <span class=tag>v4.0.6</span> <a class=btn href=/dashboard>← Dashboard</a></h1>
+<div class=card>
+  <label>接收方手机号</label>
+  <input id=ph placeholder="13800001234 或 +8613800001234" maxlength=20>
+  <label>短信内容 <small id=cnt>(0 / 70 字符单条上限)</small></label>
+  <textarea id=body maxlength=500 oninput="document.getElementById('cnt').textContent='(' + this.value.length + ' / 70 字符单条上限)'"></textarea>
+  <button id=go onclick="send()">发送</button>
+  <div id=out style=margin-top:12px></div>
+</div>
+<div class=card>
+  <h3>最近发送 (最多 32 条)</h3>
+  <pre id=hist>加载中...</pre>
+  <button onclick="loadHist()" style=background:#888>刷新</button>
+</div>
+<script>
+async function send() {
+  const ph = document.getElementById('ph').value.trim();
+  const body = document.getElementById('body').value;
+  const out = document.getElementById('out');
+  const go = document.getElementById('go');
+  if (!ph || !body) { out.innerHTML = '<span class=tag-bad>tag</span> 手机号和内容不能空'; return; }
+  go.disabled = true; out.textContent = '发送中… (最长 10s)';
+  try {
+    const r = await fetch('/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: ph, body: body })
+    });
+    const j = await r.json();
+    let html = '<b>HTTP ' + r.status + '</b> ' + (j.ok ? '<span class=tag-ok>OK</span>' : '<span class=tag-bad>FAIL</span>');
+    if (j.ok) html += ' ref=' + j.ref + ' parts=' + j.parts;
+    else      html += ' err=' + j.err + (j.code !== undefined ? ' code=' + j.code : '');
+    out.innerHTML = html;
+    if (j.ok) loadHist();
+  } catch (e) {
+    out.innerHTML = '<span class=tag-bad>网络错误</span> ' + e.message;
+  } finally {
+    go.disabled = false;
+  }
+}
+async function loadHist() {
+  const r = await fetch('/api/sent');
+  const j = await r.json();
+  document.getElementById('hist').textContent = JSON.stringify(j, null, 2);
+}
+loadHist();
+</script>
+</body></html>
+)HTML";
+
+static void handleSendPage(AsyncWebServerRequest* r) {
+  if (!check_ota_auth(r)) return;
+  r->send_P(200, "text/html; charset=utf-8", SEND_PAGE_HTML);
+}
+
+static void handleApiSend(AsyncWebServerRequest* r) {
+  if (!check_ota_auth(r)) return;
+
+  // P0 fix #2: 解析 JSON body (前端 fetch + Content-Type: application/json)
+  // 必须先注册 _body upload callback, r->body 才被 AsyncWebServer 累积 (见 setup())
+  JsonDocument doc;
+  if (r->body.length() == 0 || deserializeJson(doc, r->body) != DeserializationError::Ok) {
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"invalid_json\"}");
+    return;
+  }
+  String phone = doc["phone"] | "";
+  String body  = doc["body"]  | "";
+  phone.trim();
+  // body 不要 trim — 用户可能想发 leading/trailing 空格
+
+  if (phone.length() == 0) {
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"phone_empty\"}");
+    return;
+  }
+  if (body.length() == 0) {
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"body_empty\"}");
+    return;
+  }
+  if (!smsRateLimitOk()) {
+    r->send(429, "application/json", "{\"ok\":false,\"err\":\"rate_limit\"}");
+    return;
+  }
+
+  // UCS2 编码 + UDH 拆段
+  char ucs2[1024];
+  int ucs2_n = pdu::ucs2_encode(body.c_str(), ucs2, sizeof(ucs2));
+  if (ucs2_n < 0) {
+    nvsSentEnqueue(phone.c_str(), "[invalid_utf8]", 0, false, -1);
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"invalid_utf8\"}");
+    return;
+  }
+  int total_chars = ucs2_n / 4;
+  pdu::SmsPart parts[8];
+  // 单条 (≤70 char) 用 max=70, 拼接 (>70) 用 max=67
+  int max_per = (total_chars > 70) ? 67 : 70;
+  int segs = pdu::sms_split_for_send(total_chars, max_per, parts, 8);
+  if (segs < 1) {
+    nvsSentEnqueue(phone.c_str(), "[body_too_long]", 0, false, 0);
+    r->send(413, "application/json", "{\"ok\":false,\"err\":\"body_too_long\"}");
+    return;
+  }
+
+  // 选 ref (用 bootCount + millis() 后 8 位, 避免 +CMS ERROR 331 重复)
+  uint8_t ref = (uint8_t)((g_bootCount + millis() / 1000) & 0xFF);
+  if (ref == 0) ref = 1;
+
+  // 循环发每段
+  uint8_t lastRef = 0;
+  int lastErr = 0;
+  int seg_idx_fail = -1;
+  for (int i = 0; i < segs; i++) {
+    char pdu[600];
+    int pdu_n = pdu::cmgs_build_pdu(phone.c_str(), body.c_str(),
+                                    (segs > 1) ? i : -1,
+                                    parts, segs, ref,
+                                    pdu, sizeof(pdu));
+    if (pdu_n < 0) {
+      nvsSentEnqueue(phone.c_str(), body.c_str(), 0, false, 0);
+      r->send(500, "application/json", "{\"ok\":false,\"err\":\"pdu_build\"}");
+      return;
+    }
+    uint8_t outRef = 0;
+    int outErr = 0;
+    int rc = cmgs_send_pdu(pdu, outRef, outErr, 10000);
+    if (rc != 0) {
+      lastErr = outErr;
+      seg_idx_fail = i;
+      break;
+    }
+    lastRef = outRef;
+  }
+
+  if (seg_idx_fail >= 0) {
+    nvsSentEnqueue(phone.c_str(), body.c_str(), 0, false, lastErr);
+    char out[128];
+    snprintf(out, sizeof(out), "{\"ok\":false,\"err\":\"cmgs_error\",\"code\":%d}", lastErr);
+    r->send(502, "application/json", out);
+    return;
+  }
+  // 成功
+  nvsSentEnqueue(phone.c_str(), body.c_str(), lastRef, true, 0);
+  g_ledNet.flashTrig = true;   // NET LED 闪一下
+  char out[128];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"ref\":%u,\"parts\":%d}", lastRef, segs);
+  r->send(200, "application/json", out);
+}
+
+static void handleApiSent(AsyncWebServerRequest* r) {
+  if (!check_ota_auth(r)) return;
+  String out;
+  nvsSentList(out);
+  r->send(200, "application/json", out);
 }
 
 // =================== NetTask: 推送 + NVS drain + ping ===================
@@ -1481,10 +1785,11 @@ void setup() {
   // FreeRTOS 同步对象
   g_atMutex = xSemaphoreCreateMutex();
   g_atDone  = xSemaphoreCreateBinary();
+  g_atPrompt = xSemaphoreCreateBinary();
   g_smsQ    = xQueueCreate(SMS_QUEUE_LEN, sizeof(SmsMsg));
   g_pushQ   = xQueueCreate(SMS_QUEUE_LEN, sizeof(PushItem));
   g_urcQ    = xQueueCreate(16, URC_LINE_BUF);
-  if (!g_atMutex || !g_atDone || !g_smsQ || !g_pushQ || !g_urcQ) {
+  if (!g_atMutex || !g_atDone || !g_atPrompt || !g_smsQ || !g_pushQ || !g_urcQ) {
     ESP_LOGE(TAG, "FATAL: FreeRTOS primitive create failed");
     delay(100); ESP.restart();
   }
@@ -1521,6 +1826,14 @@ void setup() {
       handle_ota_chunk(r, fn, idx, d, l, fin);
     });
   g_webServer->on("/restart", HTTP_GET, handle_restart);
+  g_webServer->on("/send",    HTTP_GET, handleSendPage);
+  // P0 fix #2: 必须注册 _body upload callback, r->body 才被 AsyncWebServer 累积
+  // 不然 final handler 跑时 r->body 是空的
+  g_webServer->on("/api/send", HTTP_POST, handleApiSend,
+    [](AsyncWebServerRequest* r, uint8_t* /*data*/, size_t /*len*/, size_t /*idx*/, size_t /*total*/) {
+      // no-op — 注册 callback 这一行为 AsyncWebServer 触发 r->body 自动累积
+    });
+  g_webServer->on("/api/sent", HTTP_GET, handleApiSent);
   g_webServer->begin();
   ESP_LOGI(TAG, "Web server up (Dashboard / API / OTA)");
 

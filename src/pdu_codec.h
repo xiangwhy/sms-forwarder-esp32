@@ -54,4 +54,55 @@ bool is_strict_utf8(const char* buf, size_t n);
 // 返回 true = 大概率 UCS-2 BE, false = 不是 UCS-2
 bool looks_like_ucs2_be(const char* hex, size_t hexLen);
 
+// =================== 发送侧 (v4.0.6+) ===================
+
+// UCS2 编码 (发送): UTF-8 → UCS-2 BE hex (1 codepoint = 4 hex 字符)
+// 例: "Hi" → "00480069"; "你好" → "4F60597D"; "สวัสดี" → "0E2A0E27..."
+// 写入 ucs2_hex_out (null-terminated, 大写 hex), 需要 out_cap >= 4*utf8_chars + 1
+// 返回写入的 hex 字符数 (不含 \0); -1 = 输入无效 (不合法 UTF-8 截断 / buffer 不够)
+int ucs2_encode(const char* utf8, char* ucs2_hex_out, size_t out_cap);
+
+// 一段长短信在原字符流中的位置 (输出给 sms_split_for_send)
+// offset_chars / len_chars 都是以"UCS2 字符"为单位 (1 char = 4 hex)
+struct SmsPart {
+  int offset_chars;
+  int len_chars;
+};
+
+// UCS2 字符流拆段 (发送): total_chars 个字符按 max_chars_per_seg 拆
+// max_chars_per_seg: 70 单条 / 67 拼接 (UDH 占 6 字符)
+// max_parts: 缓冲数组长度 (本项目固定 8, GSM 协议最大 255)
+// 返回段数; 0 = 太多段 (> max_parts 或 > 255 GSM 上限) — caller 应 413
+int sms_split_for_send(int total_chars, int max_chars_per_seg,
+                       SmsPart out_parts[], int max_parts);
+
+// BCD 翻转编码 (GSM 04.08 §10.5.4.7), 写入 TPDU 的 DA 字段
+// 输入 phone_in: "13800001234" / "+8613800001234" / "138-0000-1234"
+//   '+' '-' ' ' 静默剥除; 其它非数字 → 拒绝 (-1)
+// 输出 out: 大写 hex BCD, null-terminated. 例: "13800001234" → "3108000010324F"
+//   末位奇数 → 高 nibble = F (填充)
+// 返回 decimal digit count (10/11/12...) — DA length 字段按 GSM 03.40 §9.1.2.5 用此值, 不算半字节
+// 例: "13800001234" (11 位) → 写入 12 hex char, 返回 11
+//     "1380000123"  (10 位) → 写入 10 hex char, 返回 10
+// 返回 -1 = phone_in/out 空 / 长度 0 或 > 20 / 含非法字符
+int bcd_encode_phone(const char* phone_in, char* out, size_t out_cap);
+
+// 构造 CMGS TPDU hex (不含 SCA, 从 PDU-type 开始, 大写 hex, null-terminated)
+// phone: "13800001234" / "+8613800001234"
+// body:  UTF-8 短信内容
+// seg_idx: < 0 → 单条 (≤70 UCS-2 char, 不带 UDH)
+//         >= 0 → 拼接第 seg_idx 段, parts[]/total 由 sms_split_for_send 输出
+// ref:    8-bit concat reference (caller 自选, 避免 +CMS ERROR 331 重复)
+// pdu_out / out_cap: 输出缓冲 (建议 ≥ 600 字节)
+// 返: 写入 hex 字符数 (UDL 那段按 byte 数算); -1 = 失败 (phone/body/pdu_out 空 / 缓冲不够 / UTF-8 非法)
+//
+// 布局 (hex chars):
+//   PDU-type(2) MR(2) DA-len(2) ToA(2) DA-digits(2*da_digits) PID(2) DCS(2) VP(2)
+//   [UDH(10) if concat] UDL(2) UD-hex(2*UD_bytes)
+//
+// ToA 固定 0x81 (unknown, ISDN); 国际号需 0x91 + 剥前缀 — v4.0.6 范围外, 留 P1 (F4)
+int cmgs_build_pdu(const char* phone, const char* body,
+                   int seg_idx, const SmsPart parts[], int total,
+                   uint8_t ref, char* pdu_out, size_t out_cap);
+
 }  // namespace pdu

@@ -3,6 +3,7 @@
 
 #include "pdu_codec.h"
 
+#include <cstdio>    // snprintf (cmgs_build_pdu hex 字段格式化)
 #include <stdlib.h>  // strtol (host 上 Arduino.h 不存在, 必须显式 include)
 #include <string.h>
 
@@ -241,6 +242,178 @@ bool looks_like_ucs2_be(const char* hex, size_t hexLen) {
   }
   // 至少 4 对 (8 个 UCS-2 字符) + 80% 高频区命中
   return pairHits >= 4 && (hiHits * 100 / pairHits) >= 80;
+}
+
+// =================== 发送侧 (v4.0.6+) ===================
+
+int ucs2_encode(const char* utf8, char* ucs2_hex_out, size_t out_cap) {
+  if (!utf8 || !ucs2_hex_out || out_cap < 5) return -1;
+  static const char H[] = "0123456789ABCDEF";
+  size_t pos = 0;        // byte pos in utf8
+  size_t out_pos = 0;    // char pos in ucs2_hex_out (每 codepoint 4 hex)
+
+  while (utf8[pos]) {
+    uint32_t cp = 0;
+    uint8_t b0 = (uint8_t)utf8[pos];
+    int extra = 0;
+    if      (b0 < 0x80)  { cp = b0;          extra = 0; }
+    else if (b0 < 0xC0)  { return -1; }                     // lone continuation
+    else if (b0 < 0xE0)  { cp = b0 & 0x1F;   extra = 1; }
+    else if (b0 < 0xF0)  { cp = b0 & 0x0F;   extra = 2; }
+    else                 { return -1; }                     // 4-byte UCS, 不在 BMP
+
+    pos++;
+    for (int i = 0; i < extra; i++) {
+      uint8_t bc = (uint8_t)utf8[pos];
+      if (bc < 0x80 || bc >= 0xC0) return -1;               // 期望 continuation byte
+      cp = (cp << 6) | (bc & 0x3F);
+      pos++;
+    }
+    // 跳过 surrogate (UTF-8 合法输入不应有, 但防御一下)
+    if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+    if (cp > 0xFFFF) return -1;                             // 非 BMP
+
+    if (out_pos + 4 >= out_cap) return -1;                   // 需要 4 hex + 1 null
+    ucs2_hex_out[out_pos++] = H[(cp >> 12) & 0xF];
+    ucs2_hex_out[out_pos++] = H[(cp >> 8)  & 0xF];
+    ucs2_hex_out[out_pos++] = H[(cp >> 4)  & 0xF];
+    ucs2_hex_out[out_pos++] = H[cp & 0xF];
+  }
+
+  ucs2_hex_out[out_pos] = 0;
+  return (int)out_pos;     // 写入的 hex 字符数 (不含 \0); 1 codepoint = 4 hex
+}
+
+int sms_split_for_send(int total_chars, int max_chars_per_seg,
+                       SmsPart out_parts[], int max_parts) {
+  if (total_chars <= 0 || max_chars_per_seg <= 0 || !out_parts || max_parts <= 0) return 0;
+
+  // ceil(total / max) — GSM UDH ref 8-bit 最大 255 段
+  int n = (total_chars + max_chars_per_seg - 1) / max_chars_per_seg;
+  if (n > 255 || n > max_parts) return 0;
+
+  int offset = 0;
+  int remaining = total_chars;
+  for (int i = 0; i < n; i++) {
+    int len = (remaining > max_chars_per_seg) ? max_chars_per_seg : remaining;
+    out_parts[i].offset_chars = offset;
+    out_parts[i].len_chars = len;
+    offset += len;
+    remaining -= len;
+  }
+  return n;
+}
+
+// BCD 翻转编码 (GSM 04.08 §10.5.4.7) — 输出 hex, 返回 digit count (DA length 用)
+int bcd_encode_phone(const char* phone_in, char* out, size_t out_cap) {
+  if (!phone_in || !out) return -1;
+  char digits[32];
+  int n = 0;
+  for (const char* p = phone_in; *p && n < (int)sizeof(digits) - 1; p++) {
+    if (*p >= '0' && *p <= '9') digits[n++] = *p;
+    else if (*p == '+' || *p == '-' || *p == ' ') continue;
+    else return -1;  // 非数字字符 → 拒绝
+  }
+  if (n == 0 || n > 20) return -1;
+  size_t pos = 0;
+  for (int i = 0; i < n; i += 2) {
+    if (pos + 2 >= out_cap) return -1;
+    if (i + 1 < n) {
+      out[pos++] = digits[i + 1];   // 高 nibble = 原偶数位
+      out[pos++] = digits[i];       // 低 nibble = 原奇数位
+    } else {
+      out[pos++] = 'F';             // 奇数位: 高 nibble = F 填充
+      out[pos++] = digits[i];       // 低 nibble = 末位奇数位
+    }
+  }
+  out[pos] = 0;
+  return n;  // decimal digit count (DA length 字段用此值, 不是 hex char 数)
+}
+
+// 构造 CMGS TPDU hex (不含 SCA)
+int cmgs_build_pdu(const char* phone, const char* body,
+                   int seg_idx, const SmsPart parts[], int total,
+                   uint8_t ref, char* pdu_out, size_t out_cap) {
+  if (!phone || !body || !pdu_out) return -1;
+  // 1. BCD 编码 phone → DA digits + digit count
+  char da_digits[32];
+  int da_digits_count = bcd_encode_phone(phone, da_digits, sizeof(da_digits));
+  if (da_digits_count < 0) return -1;
+  int da_hex_len = (int)strlen(da_digits);  // hex chars 数 (= BCD bytes × 2)
+  // 2. UCS2 编码 body
+  char ucs2[1024];
+  int ucs2_n = ucs2_encode(body, ucs2, sizeof(ucs2));
+  if (ucs2_n < 0) return -1;
+  int total_chars = ucs2_n / 4;
+  // 3. 拼 PDU (hex 大写, 不含 SCA)
+  // 单条: PDU-type 0x11 (submit + UDHI=0 + relative VP)
+  // 拼接: PDU-type 0x51 (submit + UDHI=1 + relative VP) — UDH = 05 00 03 RR TT SS
+  bool concat = (seg_idx >= 0 && parts && total > 1);
+  size_t pos = 0;
+  // PDU-type
+  if (pos + 2 >= out_cap) return -1;
+  pdu_out[pos++] = concat ? '5' : '1';
+  pdu_out[pos++] = '1';
+  // MR
+  pdu_out[pos++] = '0';
+  pdu_out[pos++] = '0';
+  // DA length (decimal digit count, 不是 hex char 数 — GSM 03.40 §9.1.2.5)
+  char tmp[16];
+  snprintf(tmp, sizeof(tmp), "%02X", da_digits_count);
+  if (pos + 2 >= out_cap) return -1;
+  pdu_out[pos++] = tmp[0];
+  pdu_out[pos++] = tmp[1];
+  // ToA (固定 0x81 unknown/ISDN; 国际号需 0x91 — F4 留 P1)
+  pdu_out[pos++] = '8';
+  pdu_out[pos++] = '1';
+  // DA digits (hex)
+  for (int i = 0; i < da_hex_len; i++) {
+    if (pos + 1 >= out_cap) return -1;
+    char c = da_digits[i];
+    if (c >= 'a' && c <= 'f') c -= 32;
+    pdu_out[pos++] = c;
+  }
+  // PID
+  pdu_out[pos++] = '0';
+  pdu_out[pos++] = '0';
+  // DCS: 0x08 = UCS2
+  pdu_out[pos++] = '0';
+  pdu_out[pos++] = '8';
+  // VP: 0xAA = 4 days (relative)
+  pdu_out[pos++] = 'A';
+  pdu_out[pos++] = 'A';
+  // 4. UDH (拼接时)
+  int udh_bytes = 0;
+  if (concat) {
+    // 8-bit concat: 05 00 03 RR TT SS (5 bytes = 10 hex)
+    udh_bytes = 5;
+    if (pos + 10 >= out_cap) return -1;
+    pdu_out[pos++] = '0'; pdu_out[pos++] = '5';
+    pdu_out[pos++] = '0'; pdu_out[pos++] = '0';
+    pdu_out[pos++] = '0'; pdu_out[pos++] = '3';
+    snprintf(tmp, sizeof(tmp), "%02X", ref);
+    pdu_out[pos++] = tmp[0]; pdu_out[pos++] = tmp[1];
+    snprintf(tmp, sizeof(tmp), "%02X", total);
+    pdu_out[pos++] = tmp[0]; pdu_out[pos++] = tmp[1];
+    snprintf(tmp, sizeof(tmp), "%02X", seg_idx + 1);
+    pdu_out[pos++] = tmp[0]; pdu_out[pos++] = tmp[1];
+  }
+  // 5. UDL = UD 字节数 (UDH bytes + UCS2 user bytes = udh_bytes + part_len*2)
+  int part_len = (seg_idx >= 0 && parts) ? parts[seg_idx].len_chars : total_chars;
+  int ud_bytes = udh_bytes + part_len * 2;
+  snprintf(tmp, sizeof(tmp), "%02X", ud_bytes);
+  pdu_out[pos++] = tmp[0]; pdu_out[pos++] = tmp[1];
+  // 6. UD: UDH hex (拼接时已写) + 本段 UCS2 hex
+  const char* ud_start = ucs2 + ((seg_idx >= 0 && parts) ? parts[seg_idx].offset_chars * 4 : 0);
+  int ud_hex_len = part_len * 4;
+  for (int i = 0; i < ud_hex_len; i++) {
+    if (pos + 1 >= out_cap) return -1;
+    char c = ud_start[i];
+    if (c >= 'a' && c <= 'f') c -= 32;
+    pdu_out[pos++] = c;
+  }
+  pdu_out[pos] = 0;
+  return pos;
 }
 
 }  // namespace pdu
