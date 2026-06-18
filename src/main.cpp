@@ -831,6 +831,15 @@ static void sms_task(void* /*param*/) {
         }
         // else: cmt_length 不可信, 默认 UCS-2
       }
+      // 兜底 2: 即使 DCS 标 7-bit (含 DCS=0), raw body 若呈 UCS-2 BE 模式 → 强制走 UCS-2
+      //   is_strict_utf8 兜底不靠谱 (GSM7 扩展字符 è/ø/Å/ò 都是合法 2-byte UTF-8)
+      //   提前 sniff 避免跑 7-bit decode 浪费 + 防乱码推送
+      if (is7bit && pdu::looks_like_ucs2_be(msg.body_hex, bodyHexLen)) {
+        ESP_LOGW(TAG, "SMS: raw body UCS-2 BE pattern, bypass 7-bit decode (dcs=%u cmt_len=%u bodyBytes=%u)",
+                 msg.dcs, msg.cmt_length, (unsigned)bodyBytes);
+        is7bit = false;
+        is8bitData = false;  // 强制走 else 分支 (decode_body_field = UCS-2)
+      }
       size_t bodyN = 0;
       if (is7bit) {
         // 7-bit: numChars (user septets) 推导
