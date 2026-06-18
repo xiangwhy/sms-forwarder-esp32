@@ -55,7 +55,7 @@ static const char* TAG_USB = "USBH";
 
 #define G4_PWR_GPIO        8
 #define BOOT_BUTTON_PIN    0
-#define BOOT_HOLD_MS       60000   // 长按 60s 才 wipe (避免 GPIO0 抖动 / 浮空误触发)
+#define BOOT_HOLD_MS       15000   // 长按 15s wipe (v4.0.5 翔哥改回; 注: v4.0.4 实测 GPIO0 浮空会误触, BOOT_DEBOUNCE_N=5 + 30s grace 可缓解)
 #define BOOT_GRACE_MS      30000   // 启动后 30s 不响应 BOOT (避开 GPIO0 strapping 抖动)
 #define BOOT_DEBOUNCE_N    5       // 连续 5 个 100ms 采样 = 500ms 才算真按下
 
