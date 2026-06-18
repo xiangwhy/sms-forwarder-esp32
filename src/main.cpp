@@ -95,12 +95,12 @@ struct Config {
 // 硬编码默认配置 (v4.0.4 patch, 烧板/重启后直接可用, 避免反复进 AP 配网)
 // NVS 优先, NVS 为空时回落到这里的默认值
 static Config g_cfg = {
-  "LYRD2.4G",                          // ssid
-  "lyrd@2022",                          // pass
-  "49b6fce94afe49c2b5cf7cb59873800f",  // token
-  "",                                  // topic (空 = 个人推送)
-  "admin",                             // otaUser
-  "Admin@123"                          // otaPass
+  "YOUR_WIFI_SSID",                     // ssid  — 改为你自己的 WiFi SSID, 或 web 配网覆盖
+  "YOUR_WIFI_PASS",                     // pass  — 改为你自己的 WiFi 密码, 或 web 配网覆盖
+  "YOUR_PUSHPLUS_TOKEN",                // token — 32 hex, pushplus 控制台拿, 或 web 配网覆盖
+  "",                                   // topic (空 = 个人推送), 通过 web 配网设置
+  "admin",                              // otaUser (默认), 配网时改
+  "change-me"                           // otaPass (默认), 配网时改
 };
 
 static void loadConfig() {
