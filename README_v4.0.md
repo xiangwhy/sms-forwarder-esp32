@@ -113,7 +113,7 @@ pio device monitor -b 115200 -p /dev/cu.usbserial-XXXX
 | Web OTA | ✅ | BasicAuth,密码存 NVS |
 | AP 配网 | ✅ | 无密码或默认 `12345678` |
 | LED 状态 | ✅ | 3 灯 |
-| BOOT 长按 60s 清 NVS | ✅ | GPIO0 长按 60s + 500ms debounce 触发(防 GPIO0 抖动误 wipe) |
+| BOOT 长按 15s 清 NVS | ✅ | GPIO0 长按 15s 触发(+ 500ms debounce + 30s 启动 grace 防误触) |
 | RNDIS 4G 上网 | ❌ | 长期搁置,iot_eth 0.1.x 的 `stack_input` 没接好会 NULL deref panic |
 | ArduinoOTA | ❌ | 用 web OTA 替代 |
 | 数据用量统计 | ❌ | 不要 |
