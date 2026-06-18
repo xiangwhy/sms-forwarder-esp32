@@ -23,3 +23,7 @@ src/main.cpp.v4.0
 
 # host test CMake build (tests/host/ 源码在, build 重新生成)
 tests/host/build/
+
+# factory.bin 由 PIO 自动生成, 通过 GitHub Release 分发, 不入 git
+*.factory.bin
+firmware.factory.bin
