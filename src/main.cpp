@@ -65,7 +65,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.11.19"  // +cmgs 分段 wait + dashboard 顺序对调 + 最近发送 RAM + 接收清空按钮 + .actions 圆角
+#define FW_VERSION         "v4.0.11.20"  // +.app-nav 圆角卡片化 (修 v4.0.11.19 改错位置 — 用户要的外层 SPA 头部按钮, 不是 iframe .actions)
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -2586,7 +2586,7 @@ static const char APP_PAGE_HTML[] PROGMEM = R"HTML(
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
 .app-shell{display:flex;flex-direction:column;height:100vh}
-.app-header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--card);border-bottom:1px solid var(--border);gap:16px;flex-shrink:0;max-width:880px;width:100%;margin:0 auto;box-sizing:border-box}
+.app-header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:transparent;gap:16px;flex-shrink:0;max-width:880px;width:100%;margin:0 auto;box-sizing:border-box}  /* v4.0.11.20: 去背景 + 去 border-bottom, 跟 .app-nav 圆角 card 视觉统一 */
 .app-header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-0.01em;display:flex;align-items:center;gap:10px}
 .app-header h1 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--muted);transition:background .3s}
 .app-header h1 .dot.ok{background:var(--accent);box-shadow:0 0 8px rgba(74,222,128,.5)}
@@ -2596,7 +2596,7 @@ html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,
 .app-header .fw-tag{font-size:11px;color:var(--muted);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .app-header .btn-restart{font-size:12px;color:var(--muted);text-decoration:none;padding:4px 10px;border:1px solid var(--border);border-radius:6px;transition:all .15s;cursor:pointer;font-family:inherit;background:var(--card2)}
 .app-header .btn-restart:hover{color:var(--err);border-color:rgba(248,113,113,.4);background:rgba(248,113,113,.1)}
-.app-nav{display:flex;gap:8px;flex-wrap:wrap;padding:12px 24px;background:var(--card);border-bottom:1px solid var(--border);flex-shrink:0;max-width:880px;width:100%;margin:0 auto;box-sizing:border-box;position:relative}
+.app-nav{display:flex;gap:8px;flex-wrap:wrap;padding:12px 24px;background:var(--card);border:1px solid var(--border);border-radius:12px;flex-shrink:0;max-width:880px;width:100%;margin:0 auto 16px;box-sizing:border-box;position:relative}  /* v4.0.11.20: 加 border + 圆角 + margin-bottom, 跟下面 .card 一致 (用户: "UI 头部按钮下边背景里也和下面一样用圆角") */
 .app-nav .burger{display:none;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px 12px;font-size:18px;cursor:pointer;font-family:inherit;line-height:1}
 .app-nav .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 14px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;color:var(--text);background:var(--card2);border:1px solid var(--border);transition:background .15s;cursor:pointer;font-family:inherit}
 .app-nav .btn:hover{background:#2c3744;border-color:#384454}
@@ -2606,7 +2606,7 @@ html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,
 .app-content{flex:1;overflow:auto;background:var(--bg)}
 .app-content iframe{width:100%;height:100%;border:0;display:block;background:var(--bg)}
 @media (max-width: 640px){
-  .app-nav{padding:8px 16px}
+  .app-nav{padding:8px 16px;margin:0 16px 12px}
   .app-nav .burger{display:inline-flex}
   .app-nav .menu{display:none;flex-direction:column;width:100%;gap:6px;margin-top:8px}
   .app-nav.open .menu{display:flex}
