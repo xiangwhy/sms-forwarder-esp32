@@ -64,7 +64,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.9"
+#define FW_VERSION         "v4.0.11.2"
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -480,20 +480,31 @@ static bool stash_udh_part(const SmsMsg* msg) {
   if (!r) r = alloc_udh_slot(refId, total, msg->phone_hex);
   if (!r) return false;
   if (strcmp(r->phone, msg->phone_hex) != 0) {
-    // phone mismatch, 重新建
-    clear_udh_ref(refId);
-    r = alloc_udh_slot(refId, total, msg->phone_hex);
-    if (!r) return false;
+    // phone mismatch.
+    // v4.0.11 fix: 如果 r->phone 已有 alphanumeric sender (v4.0.10.1 OA decode 写进去),
+    //   且 msg->phone_hex 是空 (ML307 在 +CMT 头 oa 字段填空, 正常) → 保留 r->phone, 不重 alloc
+    //   否则 (真 mismatch, 例如不同 refId 复用槽位) → 重 alloc
+    bool keep_r_phone = (r->phone[0] != 0 && msg->phone_hex[0] == 0);
+    if (!keep_r_phone) {
+      clear_udh_ref(refId);
+      r = alloc_udh_slot(refId, total, msg->phone_hex);
+      if (!r) return false;
+    }
   }
-  // UDH 头长度: 用 pdu_udh_offset 走 PDU header 链 (SCA+FO+OA+PID+DCS+SCTS+UDL) 跳到 UDHL byte 位置
-  // 修前 bug: 旧逻辑用 strstr("0804"/"0003") + p16<=body+2, "0804" 实际在 body 深处 (UDH IE),
-  //   条件永远 false → udhSkip=0 → stashed = 整段 PDU body (含 header) → 拼接/decode 全失败 → 死锁
-  // 修后: 走 PDU 头链 + 读 UDHL byte 算 UDH 段长度, 兼容 ML307 标准 (UDHL 在 body) 和剥 UDHL 罕见场景
+  // UDH 头长度: pdu_udh_offset 用 UDH IE pattern ("0804" 16-bit / "0003" 8-bit concat) 反查位置
+  //   直接返回 UD 起点 hex offset, caller 用作 partBody 偏移
+  // v4.0.9 旧 bug 1: pdu_udh_offset 用 oaLen 算 OA value 长度, 但 ML307 alphanumeric sender
+  //   (ToA=0xD0 TON=6 非标) oaLen 单位 = packed octets × 2, 跟 GSM7/BCD 公式都不匹配 → 跳错位
+  // v4.0.9 旧 bug 2: API 返回 UDHL byte 位置, caller 算 udhSkip 算成 udhBytes*2 (应为 udhOff + udhBytes*2)
+  //   → partBody 起点错位到 SCA 数据段尾部, 拼接/decode 全失败, 60s partial 循环
+  // v4.0.10 fix: 用 UDH IE pattern 反查位置, 跳过 oaLen 单位歧义
+  //   限定: 仅 concat SMS 有效 (parse_udh 已成功 → 必有 concat IE), 单条 SMS 走 fallback
+  // v4.0.10.1 fix: stash 时解 alphanumeric OA sender 写 r->phone, 拼接收齐时直接用, 不再依赖 +CMT 头 oa 字段
   size_t udhBytes = 0;
   size_t udhOff = pdu::pdu_udh_offset(msg->body_hex, strlen(msg->body_hex), &udhBytes);
   size_t udhSkip = 0;
-  if (udhOff > 0 && udhBytes > 0) {
-    udhSkip = udhBytes * 2;  // UDH 段 = UDHL + IEs, hex chars = bytes * 2
+  if (udhOff > 0) {
+    udhSkip = udhOff;  // udhOff 已是 UD 起点 hex offset
   } else {
     // pdu_udh_offset 失败 (PDU header 异常), 兜底用旧启发式 (已知 0804/0003 在 body 头)
     // 真出这条 = 模组给了非标 PDU, 应现场抓 PDU 抓 bug
@@ -507,6 +518,32 @@ static bool stash_udh_part(const SmsMsg* msg) {
     }
   }
   const char* partBody = msg->body_hex + udhSkip;
+  // v4.0.10.1: 解 alphanumeric OA sender 写 r->phone (ML307 在 +CMT 头 oa 字段填空, 真 sender 在 PDU OA 段)
+  // 只第 1 个 part 解一次 (避免重复覆盖), 后续 part 用 phone mismatch 校验
+  if (seq == 1 && r->phone[0] == 0) {
+    bool isAlpha = false;
+    size_t oaValueOctets = 0;
+    size_t oaOff = pdu::pdu_oa_offset(msg->body_hex, strlen(msg->body_hex), &isAlpha, &oaValueOctets);
+    if (oaOff > 0 && isAlpha && oaValueOctets > 0) {
+      uint8_t raw[12] = {0};
+      size_t maxOctets = oaValueOctets < sizeof(raw) ? oaValueOctets : sizeof(raw);
+      for (size_t i = 0; i < maxOctets; i++) {
+        char h0 = msg->body_hex[oaOff + i*2], h1 = msg->body_hex[oaOff + i*2 + 1];
+        auto v = [](char c) -> uint8_t {
+          return (c<='9')?(c-'0'):((c<='F')?(c-'A'+10):(c-'a'+10));
+        };
+        raw[i] = (uint8_t)((v(h0) << 4) | v(h1));
+      }
+      size_t nchars = (oaValueOctets * 8) / 7;
+      char senderBuf[64] = {0};
+      size_t senderN = pdu::decode_gsm7_alpha_oa((const char*)raw, maxOctets, nchars, senderBuf, sizeof(senderBuf)-1);
+      if (senderN > 0) {
+        senderBuf[senderN] = 0;
+        strncpy(r->phone, senderBuf, sizeof(r->phone)-1);
+        ESP_LOGI(TAG, "concat OA sender → '%s'", r->phone);
+      }
+    }
+  }
   if (seq < 1 || seq > MAX_UDH_PARTS) return false;
   if (r->parts[seq-1].present) return false;  // dup
   strncpy(r->parts[seq-1].body, partBody, sizeof(r->parts[seq-1].body)-1);
@@ -1642,11 +1679,12 @@ static void sms_task(void* /*param*/) {
       };
       // 1) 跳 PDU 头 (SCA+FO+OA+PID+DCS+SCTS+UDL), 切出 UD 段 — decode 函数只该吃 UD
       //    之前把整条 PDU (含 SCA 等) 喂进 decode, SCA bytes 被当 UCS-2 codepoint 输出
-      //    dcs7 只能从 msg.dcs 粗判 (用于 UDL 单位), sniff 后可能再覆盖
-      bool dcsSays7bit = dcs7(msg.dcs);
+      // v4.0.11: DCS 真相在 TPDU DCS byte (不信 +CMT 头 dcs 字段 — ML307 quirk 经常填错)
+      //          pdu_ud_offset_ex 内部从 TPDU 读 DCS byte + reserved 时 sniff UD bytes
+      bool is7bit = false, isUcs2 = false;
       size_t udHexOff = 0, udBytes = 0, udHexLen = 0;
       if (bodyHexLen >= 4) {
-        udHexOff = pdu::pdu_ud_offset(msg.body_hex, bodyHexLen, dcsSays7bit, &udBytes);
+        udHexOff = pdu::pdu_ud_offset_ex(msg.body_hex, bodyHexLen, &isUcs2, &is7bit, &udBytes);
       }
       if (udHexOff > 0 && udHexOff + udBytes * 2 <= bodyHexLen) {
         udHexLen = udBytes * 2;
@@ -1657,20 +1695,32 @@ static void sms_task(void* /*param*/) {
         udHexLen = bodyHexLen;
       }
       const char* udHex = msg.body_hex + udHexOff;
-      bool is7bit = dcs7(msg.dcs);
-      bool is8bitData = !is7bit && dcs8(msg.dcs);
-      if (!is7bit && !is8bitData) {
-        // UCS-2 / reserved / 未知 → 启发, 默认 UCS-2 (更安全)
+      // is7bit / isUcs2 已从 TPDU 真相 DCS 判定 (concat/partial path 无 PDU header → 全 false)
+      bool is8bitData = !is7bit && !isUcs2;
+      // v4.0.11 fix: concat/partial path (udHexOff=0) 强制走 fallback 启发式
+      //   真单条 SMS + reserved DCS (0x0C-0x0F / 0xFF 等) 也走这里 sniff
+      if (!is7bit && !isUcs2) {
+        // 兜底: 既不是 7-bit 也不是 UCS-2 → sniff
         if (pdu::looks_like_ucs2_be(udHex, udHexLen)) {
-          // DCS=0xFF (或 reserved) 但实际 UCS-2 (gateway 标错, 泰文 0E23...) → 落 UCS-2 路径
-          // is7bit = false → 落到下面 else 分支调 decode_body_field
-          is7bit = false;
-        } else if (msg.cmt_length > 0) {
-          // 7-bit: udBytes ≈ cmt_len*7/8 ±2
+          isUcs2 = true;
+          is8bitData = false;
+        } else if (msg.cmt_length > 0 && udBytes > 0) {
+          // 7-bit: udBytes ≈ cmt_len*7/8 ±2 (concat/partial path 也走这条 — numChars 已 sum)
           size_t expect = (msg.cmt_length * 7 + 7) / 8;
-          is7bit = (udBytes >= expect - 2 && udBytes <= expect + 2);
+          if (udBytes >= expect - 2 && udBytes <= expect + 2) {
+            is7bit = true;
+            is8bitData = false;
+          }
+        } else if (udBytes > 0 && udBytes < 300) {
+          // v4.0.11.1 fix: concat path cmt_len=0 (ML307 len=0 quirk) 时无 cmt_length 可信
+          //   经验: TRUE/DTAC/Verify/AIS/KBank 拼接短信 99% 是 7-bit (≤200 octets)
+          //   真 concat UCS-2 短信极罕见 (泰国运营商走 7-bit 优先)
+          //   → 短 UD (10..200 octets) 且不像 UCS-2 → 默认 7-bit
+          //   numChars ≈ udBytes * 8 / 7 (7-bit packed 密度)
+          is7bit = true;
+          is8bitData = false;
         }
-        // else: cmt_length 不可信, 默认 UCS-2
+        // else: 太长或 cmt_length 不可信, 默认 8-bit raw
       }
       // 兜底 2: 即使 DCS 标 7-bit (含 DCS=0), raw body 若呈 UCS-2 BE 模式 → 强制走 UCS-2
       //   is_strict_utf8 兜底不靠谱 (GSM7 扩展字符 è/ø/Å/ò 都是合法 2-byte UTF-8)

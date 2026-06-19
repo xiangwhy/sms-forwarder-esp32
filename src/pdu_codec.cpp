@@ -307,9 +307,98 @@ size_t pdu_ud_offset(const char* hex, size_t hexLen, bool is7bit, size_t* outUdB
   return pos;
 }
 
-// 从完整 PDU 跳过 SCA+FO+OA+PID+DCS+SCTS+UDL, 返回 UDH 起始 (UDHL byte 位置, hex 偏移)
-// *outUdhByteLen: UDH 段总字节数 (UDHL byte 1 + IEs bytes = UDHL+1)
-// 返回 0 = PDU 太短/格式错
+// v4.0.11: 同 pdu_ud_offset, 但 DCS 自动从 TPDU DCS byte 读 (不信 +CMT 头 dcs 字段)
+// ML307 quirk: +CMT 头 dcs=255 / dcs=0 是错的, 真相在 TPDU DCS byte (SCTS 之前 2 hex)
+// reserved DCS (0x10-0x1F, 0x20-0xFF 等) 时 sniff UD bytes: 偶数 + 泰/中高字节密集 → 判 UCS-2
+// *outIsUcs2: caller 据此选 ucs2_hex_to_utf8 (UCS-2) / decode_7bit_packed (7-bit) / 原样 (8-bit)
+// *outIs7bit: DCS=0x00 才是真 7-bit; 其他按 8-bit/UCS-2 算 (octets=UDL)
+size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
+                       bool* outIsUcs2, bool* outIs7bit, size_t* outUdByteLen) {
+  if (outIsUcs2) *outIsUcs2 = false;
+  if (outIs7bit) *outIs7bit = false;
+  if (outUdByteLen) *outUdByteLen = 0;
+  if (!hex || hexLen < 4) return 0;
+
+  auto nib = [](char c) -> int {
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='A'&&c<='F') return c-'A'+10;
+    if (c>='a'&&c<='f') return c-'a'+10;
+    return -1;
+  };
+  auto byte = [&](size_t pos) -> int {
+    if (pos + 2 > hexLen) return -1;
+    int hi = nib(hex[pos]), lo = nib(hex[pos+1]);
+    if (hi < 0 || lo < 0) return -1;
+    return (hi<<4) | lo;
+  };
+
+  // SCA
+  int scaLen = byte(0);
+  if (scaLen < 0 || scaLen > 12) return 0;
+  size_t pos = 2 + (size_t)scaLen * 2;
+
+  // FO
+  if (byte(pos) < 0) return 0;
+  pos += 2;
+
+  // OA
+  int oaLen = byte(pos);
+  if (oaLen < 0 || oaLen > 20) return 0;
+  pos += 2;                              // OA length byte
+  pos += 2;                              // OA type byte
+  pos += ((oaLen + 1) / 2) * 2;         // OA value bytes (hex)
+
+  // PID (1) + DCS (1) + SCTS (7)
+  if (pos + 2 + 2 + 14 > hexLen) return 0;
+  pos += 2;  // PID
+  int dcs = byte(pos);
+  pos += 2;  // DCS
+  pos += 14; // SCTS
+
+  // UDL (1 byte)
+  int udl = byte(pos);
+  if (udl < 0 || udl > 255) return 0;
+  pos += 2;
+
+  // DCS 真相 + 算 UD byte 数
+  bool is7bit = (dcs == 0x00);
+  bool isUcs2 = (dcs == 0x08);
+  // 算 UD byte 数 (基于真 DCS)
+  size_t udByteLen = is7bit ? ((size_t)udl * 7 + 7) / 8 : (size_t)udl;
+
+  // DCS reserved / 未知 (0x10-0x1F, 0x20-0xFF, 0x0C-0x0F 等) 时 sniff UD
+  if (!is7bit && !isUcs2) {
+    if (pos + udByteLen * 2 <= hexLen && udByteLen >= 4) {
+      // 把 UD 当 UCS-2 BE 试解 + sniff 高字节
+      if (looks_like_ucs2_be(hex + pos, udByteLen * 2)) {
+        isUcs2 = true;
+      }
+    }
+  }
+
+  if (outIs7bit) *outIs7bit = is7bit;
+  if (outIsUcs2) *outIsUcs2 = isUcs2;
+  if (outUdByteLen) *outUdByteLen = udByteLen;
+
+  // 注: 不严格检查 UD 越界, 允许 truncated body (caller concat 测试 body 不一定填全 UD)
+  // caller 据 outUdByteLen + hexLen 自行 decide UD 是否越界
+  return pos;
+}
+
+// 从完整 PDU 跳过 SCA+FO+OA+PID+DCS+SCTS+UDL+UDHL+UDH, 返回 UD 起点 (hex 偏移)
+// *outUdhByteLen: UDH 段总字节数 (UDHL byte 1 + IEs bytes = UDHL+1), 仅诊断用
+// 返回 0 = PDU 太短/格式错 (caller 兜底用全 body 当 UD)
+//
+// 修前 bug v4.0.9: 旧版用 oaLen 字段算 OA value 长度, 但实测 ML307 alphanumeric sender ToA=0xD0
+//   时 oaLen 字段单位 = packed octets × 2 (非标准!), 导致 OA GSM7 跳错, 后续 PID/SCTS/UDL 全错位
+// 修前 bug v4.0.9: 旧版返回 UDHL byte 位置, caller 算 udhSkip = udhOff + udhBytes*2 容易算错
+// v4.0.10 fix: 改用 UDH IE pattern "0804" (16-bit concat) 或 "0003" (8-bit concat) 反查位置
+//   - concat SMS 必有 0804 或 0003 IE, 找它就是 UDH IE 起点 (UDHL byte 之后)
+//   - 然后向前反推: UDHL byte = UDH IE 起点 - 2 hex chars (UDHL + IEI byte)
+//   - PDU header 总长 = UDHL byte 位置 = UDH IE 起点 - 2
+//   - 读 UDHL byte 算 UDH 段总长, UD 起点 = UDHL 位置 + (UDHL+1)*2
+//
+//   局限: 只对 concat SMS 有效 (单条 SMS 没 UDH IE pattern)。单条走 fallback。
 size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen) {
   if (outUdhByteLen) *outUdhByteLen = 0;
   if (!hex || hexLen < 4 || !outUdhByteLen) return 0;
@@ -330,35 +419,41 @@ size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen) {
     return (hi<<4) | lo;
   };
 
-  // SCA
-  int scaLen = byte(0);
-  if (scaLen < 0 || scaLen > 12) return 0;
-  size_t pos = 2 + (size_t)scaLen * 2;
+  // 找 concat UDH IE: "0804" (16-bit, IEI=08 + IEDL=04) 或 "0003" (8-bit, IEI=00 + IEDL=03)
+  const char* udhIe = NULL;
+  size_t udhIeLen = 0;  // IE 段总长 (UDHL+IE) = 2+IEI+IEDL+...
+  for (size_t i = 0; i + 4 <= hexLen; i += 2) {
+    if (hex[i]=='0' && hex[i+1]=='8' && hex[i+2]=='0' && hex[i+3]=='4') {
+      udhIe = hex + i;
+      // UDHL byte 在 udhIe 之前 2 hex chars
+      // IEI=08 IEDL=04 → IEI+IEDL+refH+refL+total+seq = 6 bytes (含 IEI/IEDL)
+      // 整 UDH 段 = UDHL(1) + 6 bytes = 7 bytes = 14 hex
+      udhIeLen = 14;
+      break;
+    }
+    if (hex[i]=='0' && hex[i+1]=='0' && hex[i+2]=='0' && hex[i+3]=='3') {
+      udhIe = hex + i;
+      // IEI=00 IEDL=03 → IEI+IEDL+ref+total+seq = 5 bytes
+      // 整 UDH 段 = UDHL(1) + 5 = 6 bytes = 12 hex
+      udhIeLen = 12;
+      break;
+    }
+  }
+  if (!udhIe) return 0;
 
-  // FO
-  if (byte(pos) < 0) return 0;
-  pos += 2;
+  // UDHL byte 位置 = udhIe - 2 hex chars
+  size_t udhlPos = (size_t)(udhIe - hex) - 2;
+  if (udhlPos + 2 > hexLen) return 0;
 
-  // OA
-  int oaLen = byte(pos);
-  if (oaLen < 0 || oaLen > 20) return 0;
-  pos += 2 + 2 + ((size_t)oaLen + 1) / 2 * 2;
+  // UDHL byte 值 (UDH 段总长不含 UDHL 自身? 3GPP: UDHL = UDH IE 总字节数,不含 UDHL)
+  // UDHL=05 + IE 5 bytes = UDH 段 6 bytes
+  int udhl = byte(udhlPos);
+  if (udhl < 0 || udhl > 140) return 0;
 
-  // PID + DCS + SCTS
-  if (pos + 2 + 2 + 14 > hexLen) return 0;
-  pos += 2 + 2 + 14;
-
-  // UDL
-  int udl = byte(pos);
-  if (udl < 0 || udl > 255) return 0;
-  pos += 2;
-
-  // UDH 起始 (UDHL byte 位置)
-  if (pos + 2 > hexLen) return 0;
-  int udhl = byte(pos);
-  if (udhl < 0 || udhl > 140) return 0;  // UDHL 范围 0..140 (3GPP 23.040 §9.2.3.24)
-  *outUdhByteLen = (size_t)(udhl + 1);
-  return pos;
+  *outUdhByteLen = (size_t)(udhl + 1);  // UDH 段总字节数 = UDHL + IEs
+  size_t udStart = udhlPos + (size_t)(udhl + 1) * 2;  // UD 起点 = UDHL 后跳 (UDHL+1) bytes
+  if (udStart > hexLen) return 0;  // UD 越界 (允许 ==, body 末)
+  return udStart;
 }
 
 // 从完整 PDU hex 跳过 SCA + FO, 返回 OA 起始 (hex 偏移)

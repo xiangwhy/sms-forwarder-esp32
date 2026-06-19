@@ -1063,16 +1063,9 @@ static void test_pdu_udh_offset_8bit_concat() {
   size_t bodyLen = std::strlen(body);
   size_t udhBytes = 0;
   size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, &udhBytes);
-  // SCA 0: pos=2
-  // FO 1:   pos=4
-  // OA 6:   pos=4 + 2 + 2 + 12 = 20
-  // PID 1:  pos=22
-  // DCS 1:  pos=24
-  // SCTS 7: pos=38
-  // UDL 1:  pos=40
-  // UDHL:   pos=40 (UDHL byte 位置)
-  // (UDHL=05, IE 5 bytes → udhBytes=6)
-  CHECK_EQ_INT(udhOff, 40);
+  // UDHL byte at pos 40 (UDHL=05), UDH 段 6 bytes (UDHL+5 IE) = 12 hex chars
+  // UD 起点 = 40 + 12 = 52
+  CHECK_EQ_INT(udhOff, 52);
   CHECK_EQ_INT(udhBytes, 6);
 }
 
@@ -1099,15 +1092,9 @@ static void test_pdu_udh_offset_16bit_concat() {
   size_t bodyLen = std::strlen(body);
   size_t udhBytes = 0;
   size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, &udhBytes);
-  // SCA 8: pos=2 + 14 = 16
-  // FO 1: pos=18
-  // OA 6: pos=18 + 2 + 2 + 12 = 34
-  // PID 1: pos=36
-  // DCS 1: pos=38
-  // SCTS 7: pos=52
-  // UDL 1: pos=54
-  // UDHL: pos=54
-  CHECK_EQ_INT(udhOff, 54);
+  // UDHL byte at pos 54 (UDHL=06), UDH 段 7 bytes = 14 hex chars
+  // UD 起点 = 54 + 14 = 68
+  CHECK_EQ_INT(udhOff, 68);
   CHECK_EQ_INT(udhBytes, 7);  // UDHL=06 + 6 IEs
 }
 
@@ -1133,14 +1120,41 @@ static void test_pdu_udh_offset_invalid_oa_len() {
   CHECK_EQ_INT(udhBytes, 0);
 }
 
-// 无 UDH 场景 (单条 SMS): UDHL=0, udhBytes=1
-//   SCA=00 FO=04 OA=0B ... DCS=00 SCTS=7B UDL=10 UD=...
+//   + PID 00 + DCS 00 (7-bit) + SCTS 62609180851182 + UDL 8F=143 + UDHL 06 (16-bit concat)
+// v4.0.9 bug: pdu_udh_offset 返回 UDHL 位置 56, caller 算 udhSkip = udhBytes*2 = 14 错
+//   (应该 udhOff + udhBytes*2 = 70) → partBody 起点 body_hex[14] = SCA 数据段尾部 ("F0400ed0...")
+//   → 拼接/decode 全失败 → 60s partial 又触发同 bug → 死循环 partial
+// v4.0.10 fix: pdu_udh_offset 直接返回 UD 起点 hex offset
+static void test_pdu_udh_offset_e2e_true_concat() {
+  const char* body =
+    "07916649520080F0"       // SCA len 7, type 91, BCD 6649520080F0
+    "40"                     // FO SMS-DELIVER + UDHI flag
+    "0E" "D0" "5479BD0C0AC2E100"  // OA len 14 ToA=D0 GSM7 sender (14 hex)
+    "00"                     // PID
+    "00"                     // DCS 7-bit
+    "62609180851182"         // SCTS
+    "8F"                     // UDL 143 septets
+    "06" "08" "04" "5A" "A7" "02" "01";  // UDH 16-bit: UDHL=06 IEI=08 IEDL=04 ref=5AA7 total=2 seq=1
+  size_t bodyLen = std::strlen(body);
+  size_t udhBytes = 0;
+  size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, &udhBytes);
+  // body 长 72 hex chars, 布局:
+  //   SCA 16 + FO 2 + OA-len 2 + OA-ToA 2 + OA-BCD 14 + PID 2 + DCS 2 + SCTS 14 + UDL 2 = 56
+  //   UDHL byte 58 (=0x06), IEI+IEDL 4, ref/total/seq 8 → UDH IE 12 hex, UDH 段共 14 hex (含 UDHL)
+  //   UDHL 位置 58 + UDH 段 14 hex = UD 起点 72
+  // 注意: ML307 OA GSM7 packed 14 hex 是实测, v4.0.10 改用 "0804" pattern 反查避开 oaLen 单位歧义
+  CHECK_EQ_INT(udhOff, 72);
+  CHECK_EQ_INT(udhBytes, 7);
+  CHECK_EQ_INT(udhOff, bodyLen);  // UD 起点 = body 末尾 (此 E2E 用例没填 UD, 真 SMS 后续接 UD)
+}
+// 单条 SMS 场景: 没 UDH IE pattern (没 0804 / 0003), pdu_udh_offset 找不到 IE, 应返回 0
+//   caller 兜底用全 body 当 UD (或用 pdu_ud_offset)
+// v4.0.10 改: 用 UDH IE pattern 找位置, 单条 SMS 无 IE → 返回 0 (旧版能算 42)
 static void test_pdu_udh_offset_no_udh() {
-  // body hex 总长 60: SCA=2, FO=2, OA=16, PID=2, DCS=2, SCTS=14, UDL=2, UDHL=2, UD=18
   const char* body =
     "00"                                                  // SCA len 0
     "04"                                                  // FO
-    "0B" "81" "860914000900"                             // OA
+    "0B" "81" "860914000900"                              // OA
     "00"                                                  // PID
     "00"                                                  // DCS 7-bit
     "62609120506082"                                      // SCTS
@@ -1148,11 +1162,81 @@ static void test_pdu_udh_offset_no_udh() {
     "00"                                                  // UDHL=0, 无 UDH IE
     "C8329BFD065DDF7236";                                 // UD 7-bit 16 chars
   size_t bodyLen = std::strlen(body);
-  size_t udhBytes = 0;
+  size_t udhBytes = 99;  // 应被清 0
   size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, &udhBytes);
-  // UDHL pos = 40 (跟 8bit concat 同样 header 布局, 只差 UDHL=0)
-  CHECK_EQ_INT(udhOff, 40);
-  CHECK_EQ_INT(udhBytes, 1);  // UDHL=0 + 0 IE = 1 byte, caller udhSkip=2 hex chars
+  CHECK_EQ_INT(udhOff, 0);    // 单条 SMS 没 concat IE, 找不到
+  CHECK_EQ_INT(udhBytes, 0);  // 清 0
+}
+
+// =================== v4.0.11: 翔哥 6/19 抓的实战短信 (TDD red→green) ===================
+// 翔哥 directive: "必须测试这两条短信能正常解码. 他们两个是不同编码"
+// 修前 bug: +CMT 头 dcs=255 / dcs=0 是错的 (ML307 quirk), 真实 DCS 在 TPDU DCS byte
+//           TRUE 是 7-bit DCS=0x00, 翔哥新发那条是 UCS-2 DCS=0x08 (网关标对了, 但 v4.0.10 用 7-bit 错)
+// 解法: pdu_ud_offset_ex 内部从 TPDU 读 DCS byte (outIsUcs2 + outIs7bit), caller 据此选 decoder
+//
+// Case 1 (TRUE 7-bit DCS=0x00, 翔哥 6/19 实测 v4.0.10.1 跑出 "Kddo sghr bncd rdbtqd..."):
+//   SCA len=7 + type=91 + BCD +496694520008 + FO=0x40(UDHI) + OA len=14 ToA=D0 GSM7
+//   + PID=00 + DCS=0x00 + SCTS + UDL=143 septets + UDH (concat ref=23207)
+//   关键: TPDU DCS byte = 0x00 (7-bit 真), 但 +CMT 头 dcs=255 (错的)
+//   期望: outIs7bit=true, outIsUcs2=false
+static void test_pdu_e2e_true_7bit_dcs_truth() {
+  const char* body =
+    "07916649520080F0"                    // SCA len=7 + type=91 + BCD 6649520080 + type nibble (16 hex)
+    "40"                                  // FO SMS-DELIVER + UDHI (2)
+    "0E" "D0" "5479BD0C0AC2E1"            // OA len=14 ToA=D0 GSM7 (14 hex = 7 octets = "True App" ceil 8 chars) (18)
+    "00"                                  // PID (2)
+    "00"                                  // DCS=0x00 (7-bit 真相, 翔哥 6/19 实测) (2)
+    "62609180851182"                      // SCTS (14)
+    "8F"                                  // UDL=143 septets (2)
+    "06" "08" "04" "5A" "A7" "02" "01";   // UDH 16-bit concat ref=23207 total=2 seq=1 (14)
+  // 总: 16+2+18+2+2+14+2+14 = 70 hex
+  size_t bodyLen = std::strlen(body);
+
+  // pdu_ud_offset_ex: 跳过 SCA(16) + FO(2) + OA-len(2) + ToA(2) + OA-BCD(14) + PID(2) + DCS(2) + SCTS(14) + UDL(2) = 56 hex
+  bool isUcs2 = false;
+  bool is7bit = false;
+  size_t udByteLen = 0;
+  size_t udOff = pdu::pdu_ud_offset_ex(body, bodyLen, &isUcs2, &is7bit, &udByteLen);
+  CHECK_EQ_INT(udOff, 56);    // UD 起点
+  CHECK(is7bit);
+  CHECK(!isUcs2);
+  CHECK_EQ_INT(udByteLen, 126);  // ceil(143*7/8) = 126 octets (UDL=143 septets)
+  // 注: body 实际 UD 区只有 0 bytes (没填 UD), 但我们只测 pdu_ud_offset_ex 算的 byte 数
+}
+
+// Case 2 (翔哥 6/19 新发 UCS-2 短信, 21 chars 泰文 "รหัสยืนยันของคุณ:559629"):
+//   SCA len=0 + FO=0x04 (DELIVER no UDHI) + OA len=11 ToA=81 numeric (国内 "Verify" 风格) + PID=00
+//   + DCS=0x08 (UCS-2) + SCTS + UDL=42 bytes + UD 42 bytes UCS-2 BE 泰文
+//   关键: TPDU DCS byte = 0x08 (UCS-2), v4.0.10 fallback dcs=0 错走 7-bit 解出乱码
+//   期望: outIsUcs2=true, outIs7bit=false
+static void test_pdu_e2e_thai_ucs2_dcs_truth() {
+  const char* body =
+    "00"                                  // SCA len=0
+    "04"                                  // FO SMS-DELIVER (no UDHI)
+    "0B" "81" "860914000900"              // OA len=11 ToA=81 numeric "13800001234" BCD
+    "00"                                  // PID
+    "08"                                  // DCS=0x08 (UCS-2)
+    "62609120506082"                      // SCTS
+    "2E"                                  // UDL=46 bytes (23 UCS-2 chars)
+    "0E230E2B0E310E2A0E220E370E190E220E310E190E020E2D0E070E040E380E13003A003500350039003600320039";
+  // UD 46 bytes UCS-2 BE = 23 chars 泰文 "รหัสยืนยันของคุณ:559629"
+  size_t bodyLen = std::strlen(body);
+
+  // 跳过 SCA(2) + FO(2) + OA-len(2) + ToA(2) + OA-BCD(12) + PID(2) + DCS(2) + SCTS(14) + UDL(2) = 40 hex
+  bool isUcs2 = false;
+  bool is7bit = false;
+  size_t udByteLen = 0;
+  size_t udOff = pdu::pdu_ud_offset_ex(body, bodyLen, &isUcs2, &is7bit, &udByteLen);
+  CHECK_EQ_INT(udOff, 40);
+  CHECK(isUcs2);    // DCS=0x08 → UCS-2
+  CHECK(!is7bit);
+  CHECK_EQ_INT(udByteLen, 46);
+
+  // 解 UCS-2 → "รหัสยืนยันของคุณ:559629"
+  char utf8[128] = {0};
+  size_t n = pdu::ucs2_hex_to_utf8(body + udOff, udByteLen * 2, utf8, sizeof(utf8)-1);
+  utf8[n] = 0;
+  CHECK_EQ_STR(utf8, "รหัสยืนยันของคุณ:559629");
 }
 
 int main() {
@@ -1281,9 +1365,19 @@ int main() {
   test_pdu_udh_offset_too_short();
   test_pdu_udh_offset_invalid_oa_len();
   test_pdu_udh_offset_no_udh();
+  test_pdu_udh_offset_e2e_true_concat();
+
+  // v4.0.11: 翔哥 6/19 实战 2 条 E2E (TDD red→green)
+  test_pdu_e2e_true_7bit_dcs_truth();
+  test_pdu_e2e_thai_ucs2_dcs_truth();
 
   std::printf("============================================================\n");
   std::printf("Result: %d passed, %d failed\n", g_pass, g_fail);
   std::printf("============================================================\n");
   return g_fail == 0 ? 0 : 1;
 }
+
+// =================== v4.0.10: 真实 TRUE concat SMS 端到端 (修前 bug) ===================
+// 翔哥 6/19 实战抓的 TRUE concat SMS, refId=23207 total=2
+// body 长度 308 hex (part 1), 含:
+//   SCA len 7 (07 916649520080F0) + FO 40 (UDHI) + OA len 14 ToA=D0 GSM7 sender (5479BD0C0AC2E100)

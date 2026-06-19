@@ -60,11 +60,21 @@ bool looks_like_ucs2_be(const char* hex, size_t hexLen);
 // 返回 0 = PDU 太短/格式错 (caller 兜底用全 body 当 UD)
 size_t pdu_ud_offset(const char* hex, size_t hexLen, bool is7bit, size_t* outUdByteLen);
 
-// 从完整 PDU 跳过 SCA+FO+OA+PID+DCS+SCTS+UDL, 返回 UDH 起始 (UDHL byte 位置, hex 偏移)
-// *outUdhByteLen: UDH 段总字节数 (UDHL byte 1 + IEs bytes = UDHL+1)
-//   调用方 udhSkip = *outUdhByteLen * 2 (hex chars) → 跳过 UDH 进 UD
+// v4.0.11: 同 pdu_ud_offset, 但 DCS 自动从 TPDU DCS byte 读 (不信 +CMT 头 dcs 字段)
+// *outIsUcs2: true=UCS-2 (DCS=0x08 或 reserved+sniff 命中), false=7-bit 或 8-bit
+//             caller 据此选 ucs2_hex_to_utf8 / decode_7bit_packed / 原样
+// *outIs7bit: DCS=0x00 才是真 7-bit; 其他按 8-bit/UCS-2 算 (octets=UDL)
+// *outUdByteLen: UD 字节数 (7-bit 按 ceil(UDL*7/8), 其他按 UDL)
+// 返回 0 = PDU 太短/格式错
+size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
+                       bool* outIsUcs2, bool* outIs7bit, size_t* outUdByteLen);
+
+// 从完整 PDU 跳过 SCA+FO+OA+PID+DCS+SCTS+UDL+UDHL+UDH, 返回 UD 起点 (hex 偏移)
+// *outUdhByteLen: UDH 段总字节数 (UDHL byte 1 + IEs bytes = UDHL+1), 仅诊断用
 // 返回 0 = PDU 太短/格式错 (caller 兜底用全 body 当 UD)
 // 配套 stash_udh_part: 用于切出 concat SMS part 的纯 UD body (剥 UDH 头)
+// 修前 bug: 旧版本返回 UDHL byte 位置 + 让 caller 算 udhSkip = udhOff + udhBytes*2,容易算错 (v4.0.9)
+//   现版本直接返回 UD 起点, caller 直接用 udhOff 作为 partBody 偏移
 size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen);
 
 // 从完整 PDU (SCA+FO+OA+PID+...) hex 跳过 SCA+FO, 返回 OA 起始 (hex 偏移)
