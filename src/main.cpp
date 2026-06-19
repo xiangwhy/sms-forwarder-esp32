@@ -65,7 +65,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.11.9"  // +nvsSentList isKey("s0") 早返 (60s 一次 32 个 sX NOT_FOUND noise)
+#define FW_VERSION         "v4.0.11.19"  // +cmgs 分段 wait + dashboard 顺序对调 + 最近发送 RAM + 接收清空按钮 + .actions 圆角
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -271,6 +271,18 @@ static UdhRef g_udhTable[MAX_UDH_REFS];
 
 // =================== AT 行解析 ===================
 static void handle_at_line(const char* line) {
+  // v4.0.11.14 P0: CMGS prompt "> " 必须在 CMT body 检查**之前**判断
+  //   原因: v4.0.11.13 日志显示 RX[4]: \n> \n 在 154626 到达, 但 3s 后仍 timeout,
+  //   根因: 如果 g_waitingCmtBody=true (例如 +CMT 头到达但 body 被错过), line[0]='>' != '+',
+  //   走 else 分支被误判为 CMT body, 直接 return, 永远到不了 prompt check。
+  //   移到前面: 无论 g_waitingCmtBody 状态, "> " 优先触发 g_atPrompt。
+  if (g_waitingCmgsPrompt && line[0] == '>' && (line[1] == ' ' || line[1] == 0)) {
+    g_waitingCmgsPrompt = false;
+    if (g_atPrompt) xSemaphoreGive(g_atPrompt);
+    ESP_LOGD(TAG, "CMGS prompt matched");   // v4.0.11.18: HAL debug 降为 ESP_LOGD (默认不刷屏, 出问题开 verbose 即可)
+    return;   // "> " 行不入 reply
+  }
+
   // +CMT 头/body 配对
   if (g_waitingCmtBody) {
     if (line[0] == '+') {
@@ -359,7 +371,11 @@ static void handle_at_line(const char* line) {
   // 其他 URC (如 +CEREG +CSQ) → g_urcQ
   if (line[0] == '+') {
     // v4.0.7 P0 fix: send_atcmd 期间, + 行双写到 g_atReply (AT 查询 reply 格式就是 +CSQ:/+CIMI:/+CCID:/+CNUM:/+COPS:)
-    if (g_inAtReply) {
+    // v4.0.11.15 P0: cmgs 期间也双写 +CMS ERROR/+CMGS: (这两个也是 '+' 起, 必须入 g_atReply)
+    //   之前只有 g_inAtReply=true 时双写, cmgs 时 g_inAtReply=false → +CMS ERROR: 500 走 URC 分支没入 g_atReply
+    //   g_atDone 没被 give → 10s timeout → rc=-2 (实际 -1) + outErr=0 (实际 500)
+    bool isCmgsOrError = (strncmp(line, "+CMS ERROR:", 11) == 0 || strncmp(line, "+CMGS:", 6) == 0);
+    if (g_inAtReply || isCmgsOrError) {
       size_t _l = strlen(line);
       size_t _old = g_atReplyLen;
       if (_old + _l + 2 < sizeof(g_atReply)) {
@@ -367,6 +383,11 @@ static void handle_at_line(const char* line) {
         g_atReply[_old + _l] = '\n';
         g_atReplyLen = _old + _l + 1;
         g_atReply[g_atReplyLen] = 0;
+      }
+      if (isCmgsOrError) {
+        // +CMGS: = OK (0), +CMS ERROR: = ERROR (-1) — 立即给 g_atDone
+        g_atResult = (line[1] == 'C' && line[2] == 'M' && line[3] == 'G' && line[4] == 'S') ? 0 : -1;
+        xSemaphoreGive(g_atDone);
       }
     }
     if (xQueueSend(g_urcQ, line, 0) != pdTRUE) {
@@ -381,12 +402,8 @@ static void handle_at_line(const char* line) {
   }
 
   // v4.0.6: CMGS prompt "> " → 触发 g_atPrompt 让 cmgs_send_pdu 写 PDU
+  // v4.0.11.14: 移到函数开头 (在 CMT body 检查之前) — 见函数首注释
   // ("> " 不以 + 开头, 走这里而不是 URC 分支)
-  if (g_waitingCmgsPrompt && line[0] == '>' && (line[1] == ' ' || line[1] == 0)) {
-    g_waitingCmgsPrompt = false;
-    if (g_atPrompt) xSemaphoreGive(g_atPrompt);
-    return;   // "> " 行不入 reply
-  }
 
   // 普通行 → 累加到 reply (行末加 '\n' 方便多行响应排错)
   size_t l = strlen(line);
@@ -742,11 +759,66 @@ static void rx_log_write(const char* phone, const char* body) {
   portEXIT_CRITICAL(&g_rxLogMux);
 }
 
+// v4.0.11.19: 加清空函数 (前端清空按钮调)
+static void rx_log_clear() {
+  portENTER_CRITICAL(&g_rxLogMux);
+  g_rxLogHead = 0;
+  g_rxLogCount = 0;
+  memset(g_rxLog, 0, sizeof(g_rxLog));
+  portEXIT_CRITICAL(&g_rxLogMux);
+}
+
+// v4.0.11.19: 最近发送 ring buffer (对齐 g_rxLog 模式, 纯 RAM 不写 NVS, 重启丢失)
+//   旧实现写 NVS "sent" namespace, 重启保留; 用户希望跟接收对齐, 重启丢
+//   跟 g_rxLog 不同: 多存 ref/ok/err (CMGS 返回), body 短一点 (只是 preview)
+#define TX_LOG_CAP 32
+typedef struct {
+  uint32_t ms;         // boot millis (与 g_rxLog[].ms 单位一致)
+  char     phone[24];
+  char     body[80];   // preview
+  uint8_t  ref;        // CMGS mr (0 if 失败)
+  bool     ok;
+  int8_t   err;        // +CMS ERROR code (0 if ok or -1)
+} TxLogEntry;
+static TxLogEntry g_txLog[TX_LOG_CAP] = {{0}};
+static volatile uint16_t g_txLogHead  = 0;
+static volatile uint16_t g_txLogCount = 0;
+static portMUX_TYPE     g_txLogMux    = portMUX_INITIALIZER_UNLOCKED;
+
+static void tx_log_write(const char* phone, const char* body_preview,
+                         uint8_t ref, bool ok, int err_code) {
+  portENTER_CRITICAL(&g_txLogMux);
+  uint16_t idx = g_txLogHead;
+  g_txLog[idx].ms = millis();
+  strncpy(g_txLog[idx].phone, phone, sizeof(g_txLog[idx].phone) - 1);
+  g_txLog[idx].phone[sizeof(g_txLog[idx].phone) - 1] = 0;
+  strncpy(g_txLog[idx].body, body_preview, sizeof(g_txLog[idx].body) - 1);
+  g_txLog[idx].body[sizeof(g_txLog[idx].body) - 1] = 0;
+  g_txLog[idx].ref = ref;
+  g_txLog[idx].ok  = ok;
+  g_txLog[idx].err = (int8_t)err_code;
+  g_txLogHead = (idx + 1) % TX_LOG_CAP;
+  uint16_t cnt = g_txLogCount;
+  if (cnt < TX_LOG_CAP) g_txLogCount = cnt + 1;
+  portEXIT_CRITICAL(&g_txLogMux);
+}
+
+static void tx_log_clear() {
+  portENTER_CRITICAL(&g_txLogMux);
+  g_txLogHead = 0;
+  g_txLogCount = 0;
+  memset(g_txLog, 0, sizeof(g_txLog));
+  portEXIT_CRITICAL(&g_txLogMux);
+}
+
 // =================== STK (SIM ToolKit) ===================
 // v4.0.7: SIM 信息查询 (CIMI/CCID/CNUM/COPS) + STK URC 监听 (+STKPRO/+STKENV/+STKCNF) + AT+STKTR 终端响应
 // AT 命令串行化靠 g_atMutex (send_atcmd 自带), URC 靠 g_urcQ (handle_at_line 已写)
 // 日志走 ring buffer (256 行), 前端 2s 轮询拉
-#if 0  // STK Proactive 暂停 (2026-06-19)
+// v4.0.11.12: 取消 #if 0 — SIM 读取 (CIMI/CCID/CNUM/COPS) 需要 stk_query_task 编译进 binary
+//   STK Proactive 暂停方式改为: 不创 stk_event_task (line 3938 仍注释) + 路由仍注释 (line 3593+)
+//   AT+STKTR 发送只在 stk_event_task 内, task 不跑 = 不发 = Proactive 暂停保持
+#if 1  // v4.0.11.12: 取消 STK 块 #if 0 (原 "STK Proactive 暂停 2026-06-19")
 
 #define STK_LOG_CAP 256
 #define STK_LOG_LEN 96
@@ -930,23 +1002,32 @@ static void parse_ccid_reply(const char* reply) {
   }
 }
 
-// 解析 AT+CNUM / +CNUM: "号码","145",...  → 写 g_sim_msisdn
+// 解析 AT+CNUM / +CNUM: "alpha","+66813079348",145 → 写 g_sim_msisdn
+// v4.0.11.17: 跳到第二个引号段 (alpha + number)
+// v4.0.11.18 P0 fix: memcpy 起点从 q3 改为 q3+1 — v4.0.11.17 输出 '"+6681307934' 少末位 + 带开头引号
+//   n = r - q3 - 1 算的是 number 字符数 (不含两端引号), 但 memcpy 从 q3 复制 = 第 1 字节是 " → 越界
+//   修: memcpy(dst, q3+1, n) → 复制纯 number 内容
+//   参考: docs/sms-pdu-references.md §1.3 ESP-SMS-Relay 4-引号 解析模式
 static void parse_cnum_reply(const char* reply) {
   const char* p = strstr(reply, "+CNUM:");
   if (!p) return;
   p += 6;
-  const char* q = strchr(p, '"');          // 第一个 "
-  if (!q) return;
-  q++;                                     // 进入号码
-  const char* r = strchr(q, '"');           // 结束 "
-  if (!r || r <= q) return;
-  int n = r - q;
+  // 跳两个完整引号段: alpha (可空) + number
+  const char* q1 = strchr(p, '"');
+  if (!q1) return;
+  const char* q2 = strchr(q1 + 1, '"');          // alpha 结束
+  if (!q2) return;
+  const char* q3 = strchr(q2 + 1, '"');          // number 起点 "
+  if (!q3) return;
+  const char* r  = strchr(q3 + 1, '"');          // number 结束 "
+  if (!r || r <= q3 + 1) return;
+  int n = r - q3 - 1;                             // number 字符数 (不含两端引号)
   if (n > 0 && n < 16) {
     portENTER_CRITICAL(&g_sim_mux);
-    memcpy(g_sim_msisdn, q, n);
+    memcpy(g_sim_msisdn, q3 + 1, n);              // v4.0.11.18: q3+1 跳过开引号
     g_sim_msisdn[n] = 0;
     portEXIT_CRITICAL(&g_sim_mux);
-    ESP_LOGI(TAG, "MSISDN=%.*s", n, q);
+    ESP_LOGI(TAG, "MSISDN=%.*s", n, q3 + 1);      // log 也从 q3+1 打
   }
 }
 
@@ -1024,6 +1105,27 @@ static void stk_query_task(void* /*param*/) {
     if (send_atcmd("AT+CCID\r\n", 3000) == 0) parse_ccid_reply(g_atReply);
     if (send_atcmd("AT+CNUM\r\n", 3000) == 0) parse_cnum_reply(g_atReply);
     if (send_atcmd("AT+COPS?\r\n", 5000) == 0) parse_cops_reply(g_atReply);
+    // v4.0.11.14 P1: 查询短信中心号 (CSCA) — 4G LTE 没设 CSCA 会 +CMS ERROR: 500
+    //   AT+CSCA? → +CSCA: "+8613800010500",145
+    //   如果 SIM 已有 CSCA, 不用设; 没有就用中国移动默认 +8613800010500
+    if (send_atcmd("AT+CSCA?\r\n", 3000) == 0) {
+      const char* p = strstr(g_atReply, "+CSCA:");
+      if (p) {
+        const char* q1 = strchr(p, '"');
+        const char* q2 = q1 ? strchr(q1+1, '"') : NULL;
+        if (q1 && q2 && (q2 - q1 - 1) < 32) {
+          char csca[32] = {0};
+          int n = q2 - q1 - 1;
+          memcpy(csca, q1+1, n);
+          ESP_LOGI(TAG, "CSCA from SIM: %s", csca);
+        } else {
+          ESP_LOGW(TAG, "CSCA parse fail: %.80s", g_atReply);
+        }
+      } else {
+        ESP_LOGW(TAG, "CSCA missing in reply, set China Mobile default");
+        send_atcmd("AT+CSCA=\"+8613800010500\",145\r\n", 3000);
+      }
+    }
     g_sim_queryMs = millis();
     stk_log_write("[INFO] SIM info refreshed");
 
@@ -1133,7 +1235,7 @@ static void handleApiStkCmd(AsyncWebServerRequest* r, uint8_t* data, size_t len,
   String out; serializeJson(resp, out);
   r->send(rc == 0 ? 200 : 502, "application/json", out);
 }
-#endif  // STK Proactive 暂停结束 (2026-06-19)
+#endif  // v4.0.11.12: STK 块结束 (原 "STK Proactive 暂停 2026-06-19")
 
 // =================== 最近收到 SMS API (v4.0.7, dashboard 显示用) ===================
 // 之前误放进上面 STK #if 0 块导致编译失败, 挪出来
@@ -1443,60 +1545,12 @@ static uint32_t s_sendTs[SEND_RL_CAP] = {0};
 static int      s_sendIdx = 0;
 static portMUX_TYPE s_sendMux = portMUX_INITIALIZER_UNLOCKED;
 static bool smsRateLimitOk() {
-  // TODO: 修完 nvsSentList 噪声 + log 级别后, 恢复限频 (翔哥 2026-06-18 拍板先关闭)
+  // TODO: 修完发送记录噪声 + log 级别后, 恢复限频 (翔哥 2026-06-18 拍板先关闭)
   return true;
 }
 
-// NVS "sent" 命名空间, 32 条滚动 (仿 pqueue 模式)
-namespace { constexpr const char* NVS_NS_SENT = "sent"; constexpr int SENT_CAP = 32; }
-
-static void nvsSentEnqueue(const char* phone, const char* body_preview,
-                           uint8_t ref, bool ok, int err_code) {
-  Preferences p;
-  p.begin(NVS_NS_SENT, false);
-  uint8_t head = p.getUChar("head", 0);
-  char key[8]; snprintf(key, sizeof(key), "s%u", head);
-  char val[256];
-  // body_preview 已 truncate ≤ 40 字符, phone ≤ 16
-  snprintf(val, sizeof(val),
-    "{\"ts\":%lu,\"ph\":\"%.16s\",\"bp\":\"%.40s\",\"ref\":%u,\"ok\":%d,\"c\":%d}",
-    (unsigned long)millis(), phone, body_preview, ref, ok ? 1 : 0, err_code);
-  p.putString(key, val);
-  p.putUChar("head", (head + 1) % SENT_CAP);
-  p.end();
-}
-// v4.0.6 P14: 清空 sent 历史 (翔哥 2026-06-18 加, dashboard 列表清掉)
-static void nvsSentClear() {
-  Preferences p;
-  p.begin(NVS_NS_SENT, false);
-  p.clear();    // 整 namespace 擦 (32 keys + head)
-  p.end();
-}
-
-// 把 NVS "sent" 32 条返成 JSON 数组 (新 → 旧)
-static void nvsSentList(String& out) {
-  Preferences p;
-  if (!p.begin(NVS_NS_SENT, true)) { p.end(); out = "[]"; return; }   // v4.0.11.9: namespace 不存在返空
-  // v4.0.11.9: s0 key 不存在 = 工厂清 NVS 后空 history, 跳过 32 scan (getString 失败会 ESP_LOGE 32 个)
-  // isKey 走 nvs_get_str 不 log_e (vs getString log_e), 安全检查
-  if (!p.isKey("s0")) { p.end(); out = "[]"; return; }
-  uint8_t head = p.getUChar("head", 0);
-  JsonDocument doc;
-  JsonArray arr = doc.to<JsonArray>();
-  // 从 head-1 倒着读 32 条 (新 → 旧)
-  for (int i = 0; i < SENT_CAP; i++) {
-    int idx = ((int)head - 1 - i + SENT_CAP) % SENT_CAP;
-    char key[8]; snprintf(key, sizeof(key), "s%d", idx);
-    String s = p.getString(key, "");
-    if (s.length() == 0) continue;
-    JsonDocument item;
-    if (deserializeJson(item, s) == DeserializationError::Ok) {
-      arr.add(item);
-    }
-  }
-  p.end();
-  serializeJson(arr, out);
-}
+// v4.0.11.19: "最近发送" 改纯 RAM ring buffer (g_txLog + tx_log_write/clear), 跟"最近接收"对齐, 重启丢失
+//   旧 NVS "sent" namespace + nvsSentEnqueue/Clear/List 函数 (8.3KB flash / 3 函数) 已删, 节省 NVS 写磨损
 
 // CMGS 走完整流程: 写 AT+CMGS=<n> → 等 "> " → 写 PDU+Ctrl-Z → 等 OK/ERROR
 // 返: 0 = OK (outRef 已写), -1 = ERROR (outErr 已写), -2 = timeout
@@ -1504,7 +1558,9 @@ static void nvsSentList(String& out) {
 static int cmgs_send_pdu(const char* pdu_hex, uint8_t& outRef, int& outErr, uint32_t timeout_ms) {
   outRef = 0; outErr = 0;
   if (!g_cdc) return -2;
-  if (xSemaphoreTake(g_atMutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return -2;
+  // v4.0.11.12: g_atMutex wait 20000ms (原 timeout_ms+500=10500) — stk_query_task 跑 4 个 send_atcmd 持 mutex 20s
+  //   cmgs 跟 stk 抢 mutex 时 10.5s 超时返 -2, 没真写 AT+CMGS, 用户看到 rc=-2 err=0 假超时
+  if (xSemaphoreTake(g_atMutex, pdMS_TO_TICKS(20000)) != pdTRUE) return -2;
 
   // drain
   size_t dummy = 0;
@@ -1531,10 +1587,12 @@ static int cmgs_send_pdu(const char* pdu_hex, uint8_t& outRef, int& outErr, uint
   usbh_cdc_write_bytes(g_cdc, (uint8_t*)cmd, strlen(cmd), pdMS_TO_TICKS(100));
 
   int rc = -2;
-  // v4.0.6 P6b: ML307 PDU 模式可能不回 ">" 提示 (Quectel 风格: AT+CMGS=n 后直接进入 PDU 接收)
-  // 先等 200ms, 拿到 > 就走老路; 拿不到就直接发 PDU+CtrlZ
-  bool gotPrompt = (xSemaphoreTake(g_atPrompt, pdMS_TO_TICKS(200)) == pdTRUE);
-  if (!gotPrompt) ESP_LOGW(TAG, "CMGS no '>' prompt, send PDU directly (ML307 quirk?)");
+  // v4.0.11.15: 3s → 8s — v4.0.11.14 日志显示 4G 模组 +CMS ERROR: 500 之前先发 '>' prompt (HAL debug line='> ' 78558 到, 但 78551 已 timeout)
+  //   实际 ML307 4G 短信中心注册后 '>' 来得慢 (~3s), 3s 太短 → fallback 写 PDU → 模组拒
+  //   8s 留余量, < 32s handler timeout
+  // v4.0.11.18: ESP_LOGE — 8s 没 prompt 是 P0 失败模式 (模组拒/没注册/USB 卡), 写 PDU 之前要让用户看到
+  bool gotPrompt = (xSemaphoreTake(g_atPrompt, pdMS_TO_TICKS(8000)) == pdTRUE);
+  if (!gotPrompt) ESP_LOGE(TAG, "CMGS no '>' prompt after 8s, writing PDU anyway (modem may reject)");
   // 写 PDU + Ctrl-Z
   size_t n = strlen(pdu_hex);
   char buf[600];
@@ -1568,66 +1626,66 @@ static int cmgs_send_pdu(const char* pdu_hex, uint8_t& outRef, int& outErr, uint
 //
 // 一次只能跑一个 CMGS (g_atMutex 串行化), handler 排队等 worker 通知, 不抢 USB。
 
+// v4.0.11.10: CmgsJob 改静态单例 — 原栈 job + 堆 outRc 在 handler 32s 超时后 vPortFree → worker 仍写 *job->outRc = UAF/crash
+// 静态后: g_cmgsJob 字段生命周期 = 进程, handler 32s 超时不再 free 任何东西, worker 写完给 done 信号量; 32s 内 worker 必返 (cmgs_send_pdu 内部 wait 都有 timeout),
+// 唯一 race 是 worker 真卡死 (USB 挂), 那种情况 handler 等满返 -2, 下次同 g_cmgsJob 字段被新 handler 覆盖, 旧 worker 终返时给 done 唤醒新 handler — 仍正确 (旧 worker 用新字段 = 当作新 job 跑完)
 typedef struct {
   const char* pdu_hex;
   uint8_t*    outRef;
   int*        outErr;
-  int*        outRc;
   uint32_t    timeout_ms;
-  SemaphoreHandle_t done;       // binary, 1 = 通知
+  int         rcLocal;   // worker 写完, handler 读 (替代原 outRc 堆指针)
 } CmgsJob;
+
+// 静态单例: CmgsJob + 通知信号量, 必须在 cmgs_worker_task 和 cmgs_send_pdu_async 之前声明
+static TaskHandle_t    g_cmgsWorker   = NULL;
+static TaskHandle_t    g_netWorker    = NULL;   // v4.0.11.3: 给 setup 踢 TWDT 用
+static CmgsJob         g_cmgsJob;                 // v4.0.11.10: 静态单例, 替原栈 job + 堆 outRc
+static SemaphoreHandle_t g_cmgsJobDone = NULL;    // v4.0.11.10: 静态 done, 替原 xSemaphoreCreateBinary/delete 反复
 
 // 单 worker task, 死循环接 job
 // v4.0.11.3: cmgs_send_pdu 同步跑 10-20s, 远大于 TWDT=5s, 在 setup() 创完 task 后统一踢出 (task 体内 delete 失败: task 还没注册 TWDT)
+// v4.0.11.10: job 改静态单例 &g_cmgsJob, task notification 仅作唤醒用, 值无意义
 static void cmgs_worker_task(void* /*param*/) {
   for (;;) {
-    CmgsJob* job = NULL;
-    // 等 job (来自 web handler 的 xTaskCreate 投递用通知的方式不行, 这里用计数信号量当 mailbox)
-    // 简化: 用 ulTaskNotifyTake 当 mailbox (值 = job ptr)
-    uint32_t n = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    job = (CmgsJob*)n;
-    if (!job) continue;
-    *job->outRc = cmgs_send_pdu(job->pdu_hex, *job->outRef, *job->outErr, job->timeout_ms);
-    xSemaphoreGive(job->done);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // 等唤醒, 值不用
+    g_cmgsJob.rcLocal = cmgs_send_pdu(g_cmgsJob.pdu_hex, *g_cmgsJob.outRef, *g_cmgsJob.outErr, g_cmgsJob.timeout_ms);
+    xSemaphoreGive(g_cmgsJobDone);
   }
 }
 
-static TaskHandle_t    g_cmgsWorker = NULL;
-static TaskHandle_t    g_netWorker  = NULL;   // v4.0.11.3: 给 setup 踢 TWDT 用
-static SemaphoreHandle_t g_cmgsJobSem = NULL;  // 通知 worker 有 job
-
 // 异步版本: 派 worker, 等 done 信号量 (worker 自己跑 cmgs_send_pdu, 自己拿/放 mutex)
+// v4.0.11.19 P0: 分段 wait + 每 1s 调 esp_task_wdt_reset() — 之前 32s 一次性 xSemaphoreTake,
+//   async_tcp task 挂起不喂 WDT → 5s 后 TWDT 触发 "async_tcp" panic (回 ack 都没回)
+//   修法: 1s 分段 wait, 每段 reset WDT, 总时长不变 (32s 变 32 次 1s)
 static int cmgs_send_pdu_async(const char* pdu_hex, uint8_t& outRef, int& outErr, uint32_t timeout_ms) {
   outRef = 0; outErr = 0;
-  if (!g_cmgsWorker) return -2;  // 还没起来
+  if (!g_cmgsWorker || !g_cmgsJobDone) return -2;  // setup() 还没起来
 
-  SemaphoreHandle_t done = xSemaphoreCreateBinary();
-  if (!done) return -2;
+  // 清残留 done (上一轮已 take, 应该是 0; 保险起见非阻塞 drain)
+  xSemaphoreTake(g_cmgsJobDone, 0);
 
-  CmgsJob job;
-  job.pdu_hex   = pdu_hex;
-  job.outRef    = &outRef;
-  job.outErr    = &outErr;
-  job.outRc     = (int*)pvPortMalloc(sizeof(int));   // worker 写完, handler 读; 用堆避免 stack 失效
-  job.timeout_ms = timeout_ms;
-  job.done      = done;
-  if (!job.outRc) { vSemaphoreDelete(done); return -2; }
+  g_cmgsJob.pdu_hex    = pdu_hex;
+  g_cmgsJob.outRef     = &outRef;
+  g_cmgsJob.outErr     = &outErr;
+  g_cmgsJob.timeout_ms = timeout_ms;
+  g_cmgsJob.rcLocal    = -2;  // 防止 stale (worker 写前 handler 读 = 0 = 误认成功)
 
-  // 把 job ptr 给 worker (task notification 当 mailbox)
-  xTaskNotify(g_cmgsWorker, (uint32_t)&job, eSetValueWithOverwrite);
-  // 等 worker 完成 (给足时间 + 缓冲)
+  xTaskNotify(g_cmgsWorker, 0, eNoAction);  // 仅唤醒, 值不用
+  // v4.0.11.19: 1s 分段 wait, 每段 reset WDT (handler 跑在 async_tcp task 里, 32s 一次性 wait 会触发 TWDT 5s 超时)
   uint32_t total_wait = timeout_ms * 3 + 2000;  // 3x 单段超时就够, 加 2s buffer
-  BaseType_t got = xSemaphoreTake(done, pdMS_TO_TICKS(total_wait));
-  vSemaphoreDelete(done);
-
-  int rc = -2;
-  if (got == pdTRUE) {
-    rc = *job.outRc;
-  } else {
-    ESP_LOGE(TAG, "CMGS worker 超时未返回 (handler 端等了 %ums)", total_wait);
+  uint32_t waited = 0;
+  while (waited < total_wait) {
+    uint32_t slice = (total_wait - waited > 1000) ? 1000 : (total_wait - waited);
+    if (xSemaphoreTake(g_cmgsJobDone, pdMS_TO_TICKS(slice)) == pdTRUE) {
+      return g_cmgsJob.rcLocal;  // done 信号到了, 立即返
+    }
+    // 1s 内没信号, 喂 WDT 避免 async_tcp task 被 TWDT 杀
+    esp_task_wdt_reset();
+    waited += slice;
   }
-  vPortFree(job.outRc);
-  return rc;
+  ESP_LOGE(TAG, "CMGS worker 超时未返回 (handler 端等了 %ums)", total_wait);
+  return -2;
 }
 
 // =================== SmsTask ===================
@@ -2018,7 +2076,7 @@ header h1 .dot.bad{background:var(--err)}
 .tag-bad{background:rgba(248,113,113,.12);color:var(--err)}
 .tag-warn{background:rgba(251,191,36,.12);color:var(--warn)}
 .tag-mute{background:var(--card2);color:var(--muted)}
-.actions{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px;align-items:center}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px;align-items:center;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 16px}  /* v4.0.11.19: 圆角 + 卡片背景, 跟下面 .card 视觉统一 (用户: "UI 头部按钮下边背景里也和下面一样用圆角") */
 .actions .restart{margin-left:auto}
 @media(max-width:600px){.actions .restart{margin-left:0;width:100%;order:99}}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 14px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;color:var(--text);background:var(--card2);border:1px solid var(--border);transition:background .15s,border-color .15s,transform .05s;cursor:pointer;font-family:inherit}
@@ -2124,21 +2182,24 @@ footer .refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;
 
   <div class="card">
     <div class="section-title">
-      <h2>最近发送</h2>
+      <h2>最近接收 SMS</h2>
+      <div style="display:flex;gap:8px">
+        <button class="btn mute" onclick="loadRecent()">刷新</button>
+        <button class="btn warn" onclick="clearRecent()">清空</button>
+      </div>
+    </div>
+    <ul class="history" id="rx"><li class="empty">暂无</li></ul>
+  </div>
+
+  <div class="card">
+    <div class="section-title">
+      <h2>最近发送 SMS</h2>
       <div style="display:flex;gap:8px">
         <button class="btn mute" onclick="loadHist()">刷新</button>
         <button class="btn warn" onclick="clearHist()">清空</button>
       </div>
     </div>
     <ul class="history" id="hist"><li class="empty">加载中...</li></ul>
-  </div>
-
-  <div class="card">
-    <div class="section-title">
-      <h2>最近接收 SMS</h2>
-      <button class="btn mute" onclick="loadRecent()">刷新</button>
-    </div>
-    <ul class="history" id="rx"><li class="empty">暂无</li></ul>
   </div>
   </div>
 
@@ -2254,18 +2315,19 @@ async function loadHist() {
   const ul = document.getElementById('hist');
   try {
     const r = await fetch('/api/sent', {cache:'no-store'});
-    const arr = await r.json();
-    if (!Array.isArray(arr) || !arr.length) {
+    const j = await r.json();
+    if (!j.items || !j.items.length) {
       ul.innerHTML = '<li class="empty">暂无发送记录</li>';
       return;
     }
-    ul.innerHTML = arr.slice(-32).reverse().map(it => {
+    // v4.0.11.19: items 已是新→旧 (server emit 倒序), 直接 map; 字段 ts→ageMs, ph→phone, bp→body, ok→ok, c→err
+    ul.innerHTML = j.items.map(it => {
       const ok = it.ok ? '<span class="st ok">OK</span>' : '<span class="st bad">FAIL</span>';
-      const ts = it.ts ? fmtUtc(it.ts) : '-';
+      const ago = agoShort(it.ageMs);
       return '<li>'
-        + '<span class="ts">' + ts + '</span>'
-        + '<span class="ph">' + (it.phone||'-') + '</span>'
-        + '<span class="bd">' + (it.body||'').replace(/[<>]/g,'') + '</span>'
+        + '<span class="ts">' + ago + '</span>'
+        + '<span class="ph">' + escapeHtml(it.phone||'-') + '</span>'
+        + '<span class="bd">' + escapeHtml(it.body||'').slice(0,60) + '</span>'
         + ok + '</li>';
     }).join('');
   } catch (e) {
@@ -2317,11 +2379,23 @@ function agoShort(ms){
 function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 async function clearHist() {
-  if (!confirm('确认清空所有最近发送记录?')) return;
+  if (!confirm('确认清空所有最近发送记录? (重启就丢, 不会恢复)')) return;
   try {
     const r = await fetch('/api/sent/clear', {method:'POST'});
     if (!r.ok) throw new Error('HTTP '+r.status);
     loadHist();
+  } catch (e) {
+    alert('清空失败: ' + e.message);
+  }
+}
+
+// v4.0.11.19: 对称 sent, 清空最近接收 SMS (RAM, 重启本来就丢)
+async function clearRecent() {
+  if (!confirm('确认清空最近接收 SMS? (重启就丢, 不会恢复)')) return;
+  try {
+    const r = await fetch('/api/recent/clear', {method:'POST'});
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    loadRecent();
   } catch (e) {
     alert('清空失败: ' + e.message);
   }
@@ -3066,7 +3140,7 @@ static void handleApiSend(AsyncWebServerRequest* r) {
   char ucs2[1024];
   int ucs2_n = pdu::ucs2_encode(body.c_str(), ucs2, sizeof(ucs2));
   if (ucs2_n < 0) {
-    nvsSentEnqueue(phone.c_str(), "[invalid_utf8]", 0, false, -1);
+    tx_log_write(phone.c_str(), "[invalid_utf8]", 0, false, -1);
     r->send(400, "application/json", "{\"ok\":false,\"err\":\"invalid_utf8\"}");
     return;
   }
@@ -3076,7 +3150,7 @@ static void handleApiSend(AsyncWebServerRequest* r) {
   int max_per = (total_chars > 70) ? 67 : 70;
   int segs = pdu::sms_split_for_send(total_chars, max_per, parts, 8);
   if (segs < 1) {
-    nvsSentEnqueue(phone.c_str(), "[body_too_long]", 0, false, 0);
+    tx_log_write(phone.c_str(), "[body_too_long]", 0, false, 0);
     r->send(413, "application/json", "{\"ok\":false,\"err\":\"body_too_long\"}");
     return;
   }
@@ -3096,7 +3170,7 @@ static void handleApiSend(AsyncWebServerRequest* r) {
                                     parts, segs, ref,
                                     pdu, sizeof(pdu));
     if (pdu_n < 0) {
-      nvsSentEnqueue(phone.c_str(), body.c_str(), 0, false, 0);
+      tx_log_write(phone.c_str(), body.c_str(), 0, false, 0);
       r->send(500, "application/json", "{\"ok\":false,\"err\":\"pdu_build\"}");
       return;
     }
@@ -3113,30 +3187,54 @@ static void handleApiSend(AsyncWebServerRequest* r) {
   }
 
   if (seg_idx_fail >= 0) {
-    nvsSentEnqueue(phone.c_str(), body.c_str(), 0, false, lastErr);
+    tx_log_write(phone.c_str(), body.c_str(), 0, false, lastErr);
     char out[128];
     snprintf(out, sizeof(out), "{\"ok\":false,\"err\":\"cmgs_error\",\"code\":%d}", lastErr);
     r->send(502, "application/json", out);
     return;
   }
   // 成功
-  nvsSentEnqueue(phone.c_str(), body.c_str(), lastRef, true, 0);
+  tx_log_write(phone.c_str(), body.c_str(), lastRef, true, 0);
   g_ledNet.flashTrig = true;   // NET LED 闪一下
   char out[128];
   snprintf(out, sizeof(out), "{\"ok\":true,\"ref\":%u,\"parts\":%d}", lastRef, segs);
   r->send(200, "application/json", out);
 }
 
+// v4.0.11.19: 读 g_txLog RAM ring, 返 {uptimeMs, items:[{ageMs,phone,body,ok,err}]} 对象 (跟 /api/recent 格式对齐)
 static void handleApiSent(AsyncWebServerRequest* r) {
-  String out;
-  nvsSentList(out);
+  JsonDocument doc;
+  uint32_t now = millis();
+  doc["uptimeMs"] = (uint32_t)(now - g_bootMs);
+  JsonArray arr = doc["items"].to<JsonArray>();
+  portENTER_CRITICAL(&g_txLogMux);
+  uint16_t cnt  = g_txLogCount;
+  uint16_t head = g_txLogHead;
+  portEXIT_CRITICAL(&g_txLogMux);
+  uint16_t start = (cnt < TX_LOG_CAP) ? 0 : head;
+  uint16_t emit  = (cnt < 20) ? cnt : 20;
+  for (uint16_t i = 0; i < emit; i++) {
+    uint16_t idx = (start + cnt - 1 - i + TX_LOG_CAP) % TX_LOG_CAP;
+    JsonObject o = arr.add<JsonObject>();
+    o["ageMs"] = (uint32_t)(now - g_txLog[idx].ms);
+    o["phone"] = g_txLog[idx].phone;
+    o["body"]  = g_txLog[idx].body;
+    o["ok"]    = g_txLog[idx].ok;
+    o["err"]   = (int)g_txLog[idx].err;
+  }
+  String out; serializeJson(doc, out);
   r->send(200, "application/json", out);
 }
 
-// v4.0.6 P14: POST /api/sent/clear  清空最近发送 (BasicAuth, 改持久数据)
+// v4.0.11.19: 清空最近发送 (纯 RAM, 不需 BasicAuth, 重启本来就丢)
 static void handleApiSentClear(AsyncWebServerRequest* r) {
-  if (!check_dashboard_auth(r)) return;
-  nvsSentClear();
+  tx_log_clear();
+  r->send(200, "application/json", "{\"ok\":true}");
+}
+
+// v4.0.11.19: 清空最近接收 (对称 sent, RAM 不需 BasicAuth)
+static void handleApiRecentClear(AsyncWebServerRequest* r) {
+  rx_log_clear();
   r->send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -3610,6 +3708,8 @@ static void register_web_routes(AsyncWebServer* srv) {
   //   handleApiStkCmd);
   // v4.0.7: 最近收到 SMS 列表 + uptime (dashboard 显示, 不需 auth — 只读)
   srv->on("/api/recent",       HTTP_GET,  handleApiRecent);
+  // v4.0.11.19: 清空最近接收 (对称 sent, RAM 不需 auth)
+  srv->on("/api/recent/clear", HTTP_POST, handleApiRecentClear);
   // v4.0.7: STK 当前菜单 (从最近 +STKPRO SETUP_MENU URC 解析, 只读无 auth) — 暂停 (2026-06-19)
   // srv->on("/api/stk/menu",     HTTP_GET,  handleApiStkMenu);
   srv->on("/api/bootPush",     HTTP_POST,
@@ -3782,6 +3882,10 @@ static bool modem_init_at() {
       // PDU 模式用 hex, 不需要 charset 设置
       send_atcmd("AT+CSDH=1\r\n",         2000);   // 显示 UDH (长短信拼接)
       send_atcmd("AT+CNMI=2,2,0,0,0\r\n", 2000);   // 主动推 +CMT
+      // v4.0.11.15 P0: 强制设 CSCA — 4G LTE 不设 CSCA 会 +CMS ERROR: 500
+      //   中国移动默认 +8613800010500, 145=国际号格式
+      //   即使 SIM 已有 CSCA, 覆盖设也没坏处 (避免 SIM 缺 CSCA 的边角 case)
+      send_atcmd("AT+CSCA=\"+8613800010500\",145\r\n", 2000);
       // v4.0.7: STK (SIM ToolKit) — 暂停 (2026-06-19 翔哥决定)
       //   启用主动命令 (SIM 卡菜单会推 +STKPRO: URC) — 现在不要
       //   参考 waybyte/logicromsdk/ril_stk.h: AT+STKENV / AT+STKR / AT+STKTR
@@ -3829,7 +3933,7 @@ void setup() {
   nvsEnsureNamespace("cfg");  // v4.0.11.8: 防 loadConfig 1 次 NOT_FOUND
   loadConfig();
   nvsQSanityCheck();
-  nvsEnsureNamespace("sent"); // v4.0.11.8: 防 nvsSentList 60s 一次 NOT_FOUND (loadHist)
+  // v4.0.11.19: sent 改 RAM ring, 删 nvsEnsureNamespace("sent") — sent 不再写 NVS
 
   // 启动次数 +1 持久化
   {
@@ -3861,10 +3965,11 @@ void setup() {
   g_atMutex = xSemaphoreCreateMutex();
   g_atDone  = xSemaphoreCreateBinary();
   g_atPrompt = xSemaphoreCreateBinary();
+  g_cmgsJobDone = xSemaphoreCreateBinary();  // v4.0.11.10: 静态 done, 替原 xSemaphoreCreateBinary/delete 反复
   g_smsQ    = xQueueCreate(SMS_QUEUE_LEN, sizeof(SmsMsg));
   g_pushQ   = xQueueCreate(SMS_QUEUE_LEN, sizeof(PushItem));
   g_urcQ    = xQueueCreate(16, URC_LINE_BUF);
-  if (!g_atMutex || !g_atDone || !g_atPrompt || !g_smsQ || !g_pushQ || !g_urcQ) {
+  if (!g_atMutex || !g_atDone || !g_atPrompt || !g_cmgsJobDone || !g_smsQ || !g_pushQ || !g_urcQ) {
     ESP_LOGE(TAG, "FATAL: FreeRTOS primitive create failed");
     delay(100); ESP.restart();
   }
@@ -3937,9 +4042,12 @@ void setup() {
   xTaskCreate(net_task,    "net",    8192, NULL, 4, &g_netWorker);
   // v4.0.7: CSQ 后台轮询 (5s 间隔, 写 g_4g_csq/g_4g_dbm 供前端)
   xTaskCreate(csq_poll_task, "csq_poll", 4096, NULL, 2, NULL);  // 4096 同 usb_rx: send_atcmd + usbh_cdc + ESP_LOGW "%.200s" 实际用 ~1.5KB, 2048 边界 + boot 早期 USBH 重叠会 overflow
-  // v4.0.7 P0-debug: STK task 临时关 (用户担心影响 4G SMS 接收)
+  // v4.0.7 P0-debug: STK event task 临时关 (用户担心影响 4G SMS 接收) — STK Proactive 暂停 (2026-06-19)
   // xTaskCreate(stk_event_task, "stk_event", 4096, NULL, 3, NULL);
-  // xTaskCreate(stk_query_task, "stk_query", 3072, NULL, 2, NULL);
+  // v4.0.11.12: 恢复 stk_query_task (SIM 信息 CIMI/CCID/CNUM/COPS) — 跟 STK event task 不同, 这个不发 AT+STKR, 只查 SIM
+  //   之前注释掉连带 SIM 读取也没了 → /api/status simImsi="" simAgeMs=-1 → 4G 模组没注册网络指示 → CMGS +CMS ERROR: 500
+  //   修法: 恢复 stk_query_task, STK event task 仍注释 (Proactive 菜单继续暂停)
+  xTaskCreate(stk_query_task, "stk_query", 3072, NULL, 2, NULL);
 
   // v4.0.11.3: cmgs_worker / net_task 长阻塞 (10-30s) 踢出 TWDT 监控, 防 5s 超时触发 esp_restart
   // 必须在 task 创完 + 调度后调 (task 体内 delete 失败: "task not found", task 还没注册 TWDT)
