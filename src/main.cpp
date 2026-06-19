@@ -45,6 +45,7 @@
 
 #include <esp_netif_sntp.h>   // v4.0.6 P11: 时间同步, 让 lastSms/lastPush 显示真实时间
 #include <esp_heap_caps.h>    // v4.0.6 P13: heap_caps_get_total_size 拿总内存
+#include <esp_task_wdt.h>     // v4.0.11.3: cmgs_worker / net_task 长阻塞(10-30s) 踢出 TWDT 监控, 防 esp_restart
 
 #include "iot_usbh_cdc.h"
 #include "usbh_helper.h"
@@ -64,7 +65,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.11.2"
+#define FW_VERSION         "v4.0.11.9"  // +nvsSentList isKey("s0") 早返 (60s 一次 32 个 sX NOT_FOUND noise)
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -1325,10 +1326,19 @@ static void nvsQNoteErr(const char* op) {
   nvsQErrCount++;
   uint32_t now = millis();
   if (now - nvsQErrLast > 5000) {
-    ESP_LOGW(TAG, "PushQueue NVS %s 失败 %u 次 (5s 内, 刷屏已节流)", op, (unsigned)nvsQErrCount);
+    ESP_LOGW(TAG, "PushQueue NVS %s 失败 %u 次 (5s 内) task=%s", op, (unsigned)nvsQErrCount, pcTaskGetName(NULL));
     nvsQErrLast = now;
     nvsQErrCount = 0;
   }
+}
+
+// v4.0.11.8: 工厂清 NVS 后 namespace 不存在 → readwrite 兜底创建空 namespace, 防后续 readonly begin 刷屏
+// 已在 nvsQSanityCheck 内做 pqueue, 这里给 cfg / sent 复用
+static void nvsEnsureNamespace(const char* ns) {
+  Preferences p;
+  if (p.begin(ns, true)) { p.end(); return; }  // 已存在, 跳过
+  ESP_LOGI(TAG, "NVS %s namespace 不存在, lazy create", ns);
+  if (p.begin(ns, false)) p.end();
 }
 
 static void nvsQEnqueue(const char* payload, size_t len) {
@@ -1387,7 +1397,15 @@ static int nvsQDrain() {
 // 扫描 p0..p(N-1) 实际非空数, 与 count 对比, 不一致就修
 static void nvsQSanityCheck() {
   Preferences p;
-  if (!p.begin("pqueue", true)) { nvsQNoteErr("sanity"); return; }
+  if (!p.begin("pqueue", true)) {
+    // 工厂清 NVS 后 namespace 不存在 → lazy create 写 head=0 count=0, 否则 handleApiStatus / nvsQDrain 5s 一次 readonly begin 刷屏
+    ESP_LOGI(TAG, "NVS pqueue namespace 不存在, lazy create");
+    if (!p.begin("pqueue", false)) { nvsQNoteErr("sanity"); return; }
+    p.putUChar("head", 0);
+    p.putUChar("count", 0);
+    p.end();
+    return;  // 干净初始状态, 后续 scan 必然一致
+  }
   uint8_t head = p.getUChar("head", 0);
   uint8_t count = p.getUChar("count", 0);
   p.end();
@@ -1458,7 +1476,10 @@ static void nvsSentClear() {
 // 把 NVS "sent" 32 条返成 JSON 数组 (新 → 旧)
 static void nvsSentList(String& out) {
   Preferences p;
-  p.begin(NVS_NS_SENT, true);
+  if (!p.begin(NVS_NS_SENT, true)) { p.end(); out = "[]"; return; }   // v4.0.11.9: namespace 不存在返空
+  // v4.0.11.9: s0 key 不存在 = 工厂清 NVS 后空 history, 跳过 32 scan (getString 失败会 ESP_LOGE 32 个)
+  // isKey 走 nvs_get_str 不 log_e (vs getString log_e), 安全检查
+  if (!p.isKey("s0")) { p.end(); out = "[]"; return; }
   uint8_t head = p.getUChar("head", 0);
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
@@ -1557,6 +1578,7 @@ typedef struct {
 } CmgsJob;
 
 // 单 worker task, 死循环接 job
+// v4.0.11.3: cmgs_send_pdu 同步跑 10-20s, 远大于 TWDT=5s, 在 setup() 创完 task 后统一踢出 (task 体内 delete 失败: task 还没注册 TWDT)
 static void cmgs_worker_task(void* /*param*/) {
   for (;;) {
     CmgsJob* job = NULL;
@@ -1571,6 +1593,7 @@ static void cmgs_worker_task(void* /*param*/) {
 }
 
 static TaskHandle_t    g_cmgsWorker = NULL;
+static TaskHandle_t    g_netWorker  = NULL;   // v4.0.11.3: 给 setup 踢 TWDT 用
 static SemaphoreHandle_t g_cmgsJobSem = NULL;  // 通知 worker 有 job
 
 // 异步版本: 派 worker, 等 done 信号量 (worker 自己跑 cmgs_send_pdu, 自己拿/放 mutex)
@@ -3265,6 +3288,7 @@ static void handleApiCfgPost(AsyncWebServerRequest* r, uint8_t* data, size_t len
 }
 
 // =================== NetTask: 推送 + NVS drain + ping ===================
+// v4.0.11.3: post_pushplus_raw 走 esp_http_client_perform HTTPS, 5-30s 不等, 远大于 TWDT=5s, 在 setup() 创完 task 后统一踢出
 static void net_task(void* /*param*/) {
   uint32_t lastDrain = 0;
   uint32_t lastPing  = 0;
@@ -3802,8 +3826,10 @@ void setup() {
   // LED 任务 (独立)
   xTaskCreate(led_task, "led", 2048, NULL, 3, NULL);
 
+  nvsEnsureNamespace("cfg");  // v4.0.11.8: 防 loadConfig 1 次 NOT_FOUND
   loadConfig();
   nvsQSanityCheck();
+  nvsEnsureNamespace("sent"); // v4.0.11.8: 防 nvsSentList 60s 一次 NOT_FOUND (loadHist)
 
   // 启动次数 +1 持久化
   {
@@ -3908,12 +3934,18 @@ void setup() {
   // 启 task
   xTaskCreate(usb_rx_task, "usb_rx", 4096, NULL, 5, NULL);
   xTaskCreate(sms_task,    "sms",    6144, NULL, 4, NULL);
-  xTaskCreate(net_task,    "net",    8192, NULL, 4, NULL);
+  xTaskCreate(net_task,    "net",    8192, NULL, 4, &g_netWorker);
   // v4.0.7: CSQ 后台轮询 (5s 间隔, 写 g_4g_csq/g_4g_dbm 供前端)
-  xTaskCreate(csq_poll_task, "csq_poll", 2048, NULL, 2, NULL);
+  xTaskCreate(csq_poll_task, "csq_poll", 4096, NULL, 2, NULL);  // 4096 同 usb_rx: send_atcmd + usbh_cdc + ESP_LOGW "%.200s" 实际用 ~1.5KB, 2048 边界 + boot 早期 USBH 重叠会 overflow
   // v4.0.7 P0-debug: STK task 临时关 (用户担心影响 4G SMS 接收)
   // xTaskCreate(stk_event_task, "stk_event", 4096, NULL, 3, NULL);
   // xTaskCreate(stk_query_task, "stk_query", 3072, NULL, 2, NULL);
+
+  // v4.0.11.3: cmgs_worker / net_task 长阻塞 (10-30s) 踢出 TWDT 监控, 防 5s 超时触发 esp_restart
+  // 必须在 task 创完 + 调度后调 (task 体内 delete 失败: "task not found", task 还没注册 TWDT)
+  esp_task_wdt_delete(g_cmgsWorker);
+  esp_task_wdt_delete(g_netWorker);
+  ESP_LOGI(TAG, "TWDT: cmgs_worker + net_task 踢出监控");
 
   // 等 4G 模组到达 (最多 15s)
   for (int i = 0; i < 150 && g_cdc == NULL; i++) vTaskDelay(pdMS_TO_TICKS(100));
