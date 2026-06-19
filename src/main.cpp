@@ -65,7 +65,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.11.21"  // +.app-header/.app-nav padding 24→16 (外层跟 iframe 内 .container/.card 宽度统一, 用户: "现在外层和内层宽度不一致")
+#define FW_VERSION         "v4.0.12"     // STK 读路径解禁 v2: 主页卡回滚 + /stk 控制台启用 (精简,只放 SIM 卡主动菜单) + 4 处 fw-tag bump
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -2141,7 +2141,7 @@ footer .refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;
 <div class="container">
   <header id="page-head">
     <h1><span id="status-dot" class="dot"></span>SMS Forwarder</h1>
-    <span class="fw-tag">FW v4.0.7</span>
+    <span class="fw-tag">FW v4.0.12</span>
   </header>
   <div class="actions" id="page-nav">
     <a class="btn" href="/dashboard">Dashboard</a>
@@ -2617,7 +2617,7 @@ html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,
   <div class="app-header">
     <h1><span id="status-dot" class="dot"></span>SMS Forwarder</h1>
     <div style="display:flex;align-items:center;gap:10px">
-      <span class="fw-tag">FW v4.0.7</span>
+      <span class="fw-tag">FW v4.0.12</span>
       <a href="javascript:doRestart()" class="btn-restart" title="重启设备">↻ 重启</a>
     </div>
   </div>
@@ -2749,11 +2749,13 @@ static void handle_restart(AsyncWebServerRequest* r) {
   ESP.restart();
 }
 
-// =================== STK 控制台页面 (v4.0.7) ===================
+// =================== STK 控制台页面 (v4.0.12 部分解禁) ===================
 // 风格统一 dashboard (暗色 + --bg/--card/--card2/--accent 等 CSS 变量)
-// 顶部导航 + SIM 信息卡 + 手动刷新按钮 + AT 命令输入 + URC 日志区
-// STK Proactive 暂停 (2026-06-19): STK_PAGE_HTML + handleStkPage 也注释, 防止 -Wunused-function
-#if 0
+// v4.0.12: 主页不放 STK 菜单卡了 (翔哥: "放到 STK 控制台按钮里面"), /stk 页启用
+//   - 只读展示 SIM 卡主动菜单 (调 /api/stk/menu)
+//   - 不发任何 AT+STKR / AT+STKTR (stk-paused 响应规则)
+//   - 不暴露 SIM 信息 / 手动 AT 命令 (避免 /api/stk/refresh + /api/stk/cmd 破 stk-paused)
+//   - 主页 [STK 控制台] 按钮 (main.cpp:2149) 现在能跳到本页
 static const char STK_PAGE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -2762,7 +2764,7 @@ static const char STK_PAGE_HTML[] PROGMEM = R"HTML(
 :root{--bg:#0f1419;--card:#1a2028;--card2:#232b35;--border:#2a3440;--text:#e6edf3;--muted:#8b95a5;--accent:#4ade80;--warn:#fbbf24;--err:#f87171;--info:#60a5fa;--shadow:0 1px 2px rgba(0,0,0,.4),0 4px 12px rgba(0,0,0,.25)}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
-.container{max-width:880px;margin:0 auto;padding:8px 16px 48px}  /* v4.0.11.21: padding-top 24→8 跟 .app-nav margin-bottom 16→8 配对, 总间距 40→16px (用户: 外层和内层之间的宽度调小一些) */
+.container{max-width:880px;margin:0 auto;padding:8px 16px 48px}
 header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:24px;gap:16px}
 header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-0.01em}
 header .fw-tag{font-size:11px;color:var(--muted);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -2770,27 +2772,16 @@ nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
 .btn{display:inline-block;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:var(--card2);color:var(--text);text-decoration:none;font-size:13px;cursor:pointer;font-family:inherit}
 .btn:hover{background:var(--border)}
 .btn.primary{background:var(--accent);color:#0a1014;border-color:transparent;font-weight:600}
-.btn.warn{background:rgba(248,113,113,.12);color:var(--err);border-color:rgba(248,113,113,.25)}
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;box-shadow:var(--shadow);margin-bottom:16px}
 .card h3{margin:0 0 12px;font-size:14px;font-weight:600;color:var(--text);display:flex;align-items:center;justify-content:space-between}
-.kv{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px;gap:12px}
-.kv:last-child{border-bottom:none}
-.k{color:var(--muted);flex-shrink:0}
-.v{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--text);text-align:right;word-break:break-all}
-input[type=text]{width:100%;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;margin-bottom:8px}
-input[type=text]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(74,222,128,.15)}
-.log{background:#0a0e13;border:1px solid var(--border);border-radius:6px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;height:340px;overflow-y:auto;white-space:pre-wrap;color:var(--muted)}
-.log .info{color:var(--info)}.log .cmd{color:var(--warn)}.log .urc{color:var(--accent)}
-.log::-webkit-scrollbar{width:8px}.log::-webkit-scrollbar-track{background:var(--card)}.log::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
 .status-line{margin-top:8px;font-size:12px;color:var(--muted)}
 .status-line.ok{color:var(--accent)}.status-line.err{color:var(--err)}
-.help{font-size:12px;color:var(--muted);margin-bottom:8px}
 </style></head>
 <body>
 <div class="container">
   <header id="page-head">
     <h1>STK 控制台</h1>
-    <span class="fw-tag">v4.0.7</span>
+    <span class="fw-tag">v4.0.12</span>
   </header>
   <nav id="page-nav">
     <a href="/dashboard" class="btn">Dashboard</a>
@@ -2801,110 +2792,20 @@ input[type=text]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 
   </nav>
 
   <div class="card">
-    <h3>SIM 卡信息</h3>
-    <div class="kv"><span class="k">运营商</span><span class="v" id="op">-</span></div>
-    <div class="kv"><span class="k">IMSI</span><span class="v" id="imsi">-</span></div>
-    <div class="kv"><span class="k">ICCID</span><span class="v" id="iccid">-</span></div>
-    <div class="kv"><span class="k">本机号 (MSISDN)</span><span class="v" id="msisdn">-</span></div>
-    <div class="kv"><span class="k">刷新时间</span><span class="v" id="age">-</span></div>
-    <div style="margin-top:10px">
-      <button class="btn primary" onclick="refresh()">立即刷新</button>
-      <span class="status-line" id="ref_status"></span>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3>手动 AT 命令</h3>
-    <div class="help">允许: AT+CIMI / AT+CCID / AT+CNUM / AT+COPS / AT+STK* (STKR/STKENV/STKTR/STKPCMD/STKMENU)</div>
-    <input type=text id="cmd" placeholder="AT+CIMI" value="AT+CIMI">
-    <button class="btn primary" onclick="sendCmd()">发送</button>
-    <span class="status-line" id="cmd_status"></span>
-    <div class="log" id="cmd_reply" style="height:120px;margin-top:8px"></div>
-  </div>
-
-  <div class="card">
     <h3>SIM 卡主动菜单 (SETUP_MENU 0x25) <span class="status-line" id="menu_status" style="margin:0">等待 SIM 推送…</span></h3>
     <div id="menu_title" style="font-weight:600;margin-bottom:8px;color:var(--info)"></div>
     <ul id="menu_list" style="list-style:none;margin:0;padding:0"></ul>
-  </div>
-
-  <div class="card">
-    <h3>STK URC 日志 <span class="status-line" id="log_status" style="margin:0">加载中…</span></h3>
-    <div class="log" id="log"></div>
+    <p style="font-size:12px;color:var(--muted);margin:10px 0 0">只读模式: 显示 SIM 推的 SETUP_MENU, 不发任何 AT+STKR / AT+STKTR 终端响应 (stk-paused 规则)。</p>
   </div>
 </div>
 <script>
-function ageStr(sec){ if(sec<0) return '从未'; if(sec<60) return sec+'s 前'; if(sec<3600) return Math.floor(sec/60)+'m 前'; return Math.floor(sec/3600)+'h 前'; }
-
-async function loadInfo(){
-  const r = await fetch('/api/stk');
-  if(!r.ok){ document.getElementById('ref_status').textContent='加载失败 HTTP '+r.status; return; }
-  const j = await r.json();
-  document.getElementById('op').textContent     = j.operator || '(未知)';
-  document.getElementById('imsi').textContent   = j.imsi     || '(未知)';
-  document.getElementById('iccid').textContent  = j.iccid    || '(未知)';
-  document.getElementById('msisdn').textContent = j.msisdn   || '(未读取)';
-  document.getElementById('age').textContent    = ageStr(Math.floor(j.ageMs/1000));
-}
-
-async function refresh(){
-  const s = document.getElementById('ref_status');
-  s.className='status-line'; s.textContent='刷新中…';
-  try{
-    const r = await fetch('/api/stk/refresh',{method:'POST'});
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    s.className='status-line ok'; s.textContent='已触发, 等 5s';
-    setTimeout(loadInfo, 5000);
-  }catch(e){
-    s.className='status-line err'; s.textContent='失败: '+e.message;
-  }
-}
-
-async function sendCmd(){
-  const cmd = document.getElementById('cmd').value.trim();
-  if(!cmd){ alert('命令不能空'); return; }
-  const s = document.getElementById('cmd_status');
-  const rep = document.getElementById('cmd_reply');
-  s.className='status-line'; s.textContent='发送中…';
-  try{
-    const r = await fetch('/api/stk/cmd',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({cmd})
-    });
-    const j = await r.json();
-    s.className='status-line ' + (j.ok?'ok':'err');
-    s.textContent = j.ok ? 'OK' : 'FAIL rc=' + j.rc;
-    rep.textContent = j.reply || '(空)';
-  }catch(e){
-    s.className='status-line err'; s.textContent='失败: '+e.message;
-  }
-}
-
-async function loadLog(){
-  const r = await fetch('/api/stk');
-  if(!r.ok) return;
-  const j = await r.json();
-  const log = document.getElementById('log');
-  if(j.logs && j.logs.length){
-    log.innerHTML = j.logs.map(e => {
-      const t = new Date(e.t * 1000).toLocaleTimeString();
-      const cls = e.l.startsWith('[CMD]') ? 'cmd' : (e.l.startsWith('[INFO]') ? 'info' : 'urc');
-      return '<span class="'+cls+'">['+t+'] '+e.l+'</span>';
-    }).join('\n');
-    log.scrollTop = log.scrollHeight;
-  }
-  document.getElementById('log_status').textContent = '共 ' + (j.logs?j.logs.length:0) + ' 条 · 2s 自动';
-}
-
-loadInfo(); loadLog();
-// v4.0.7: SIM 卡主动菜单 (SETUP_MENU 0x25 → 自动列 items, 点选 → 自动发 AT+STKR=id)
+function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 async function loadMenu(){
   const ul = document.getElementById('menu_list');
   const title = document.getElementById('menu_title');
   const status = document.getElementById('menu_status');
   try{
-    const r = await fetch('/api/stk/menu');
+    const r = await fetch('/api/stk/menu',{cache:'no-store'});
     if(!r.ok) throw new Error('HTTP '+r.status);
     const j = await r.json();
     if(!j.count){
@@ -2914,39 +2815,30 @@ async function loadMenu(){
       return;
     }
     title.textContent = j.title || '(无标题)';
-    status.textContent = '共 '+j.count+' 项 · 点选自动发 AT+STKR';
+    status.textContent = '共 '+j.count+' 项';
     ul.innerHTML = j.items.map(it =>
       `<li style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:12px">
          <span style="flex:1"><b style="color:var(--info)">${it.id}.</b> ${escapeHtml(it.text)}</span>
-         <button class="btn primary" onclick="stkSelect(${it.id})">选</button>
+         <span style="color:var(--muted);font-size:12px">id=${it.id}</span>
        </li>`
     ).join('');
   }catch(e){
     status.textContent='加载失败: '+e.message;
   }
 }
-async function stkSelect(id){
-  // 自动填到 AT 输入框 + 发送 (与手动发 AT+STKR=id 等价, 但走 sendCmd 路径能记录日志)
-  document.getElementById('cmd').value = 'AT+STKR=' + id;
-  await sendCmd();
-  setTimeout(loadMenu, 1500);   // 菜单可能变化, 1.5s 后重新拉
-}
-function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-loadInfo(); loadLog(); loadMenu();
-setInterval(()=>{loadInfo();loadLog();loadMenu();}, 2000);
+loadMenu();
+setInterval(loadMenu, 10000);
 </script>
 <script>if(self!==top){['page-head','page-nav'].forEach(function(id){var h=document.getElementById(id); if(h)h.style.display='none';});}</script>
 </body></html>
 )HTML";
 
-// v4.0.7: STK (SIM ToolKit) 控制台页 — 必须放在 STK_PAGE_HTML 之后
+// v4.0.12: STK 控制台页 handler — 顶层访问 redirect SPA, iframe 内返回完整页
 static void handleStkPage(AsyncWebServerRequest* r) {
-  // 顶层访问 → redirect SPA; iframe 内 → 返回完整页 (子页 script 隐藏 nav)
   String ref = r->header("Referer");
   if (ref.indexOf("/app") < 0) { r->redirect("/app?p=stk"); return; }
   r->send_P(200, "text/html; charset=utf-8", STK_PAGE_HTML);
 }
-#endif  // STK_PAGE_HTML + handleStkPage 暂停结束 (2026-06-19)
 
 // =================== SMS 发送 Web (v4.0.6+) ===================
 // 页面: 表单 + 发送结果 + 最近发送历史
@@ -2987,7 +2879,7 @@ nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
 <div class="container">
   <header id="page-head">
     <h1>📤 SMS 发送</h1>
-    <span class="fw-tag">v4.0.7</span>
+    <span class="fw-tag">v4.0.12</span>
   </header>
   <nav id="page-nav">
     <a href="/dashboard" class="btn">Dashboard</a>
@@ -3694,11 +3586,17 @@ static void register_web_routes(AsyncWebServer* srv) {
   srv->on("/restart",          HTTP_GET,  handle_restart);
   srv->on("/send",             HTTP_GET,  handleSendPage);
   srv->on("/config",           HTTP_GET,  handleConfigPage);
-  // srv->on("/stk",              HTTP_GET,  handleStkPage);   // STK Proactive 暂停 (2026-06-19)
+  // v4.0.12: STK 控制台页启用 (主页 [STK 控制台] 按钮跳这里, 精简版只显示 SIM 卡主动菜单)
+  srv->on("/stk",              HTTP_GET,  handleStkPage);
   srv->on("/api/send",         HTTP_POST, handleApiSend, nullptr, handleApiSendBody);
   srv->on("/api/sent",         HTTP_GET,  handleApiSent);
   srv->on("/api/sent/clear",   HTTP_POST, handleApiSentClear);
-  // v4.0.7: STK (SIM ToolKit) API — 全部暂停 (2026-06-19)
+  // v4.0.7: STK (SIM ToolKit) API — 大部分暂停 (2026-06-19)
+  //   v4.0.12: 部分解禁 — 只启用 /api/stk/menu (只读, 无 auth), /api/stk (info 日志) /refresh /cmd 仍暂停
+  //   禁用项说明:
+  //     - /api/stk          → handleApiStkInfo 返回 g_stkLog[] (调试用, 公开敏感, 仍禁)
+  //     - /api/stk/refresh  → 手动触发 stk_query_task 重查 (同 SIM 信息按钮冗余, 仍禁)
+  //     - /api/stk/cmd      → 用户手动发 AT+STK* 白名单 (会发 AT+STKR/STKTR, 破 stk-paused 响应规则, 仍禁)
   // srv->on("/api/stk",          HTTP_GET,  handleApiStkInfo);
   // srv->on("/api/stk/refresh",  HTTP_POST,
   //   [](AsyncWebServerRequest* r) { if (!check_dashboard_auth(r)) return; handleApiStkRefresh(r); });
@@ -3710,8 +3608,8 @@ static void register_web_routes(AsyncWebServer* srv) {
   srv->on("/api/recent",       HTTP_GET,  handleApiRecent);
   // v4.0.11.19: 清空最近接收 (对称 sent, RAM 不需 auth)
   srv->on("/api/recent/clear", HTTP_POST, handleApiRecentClear);
-  // v4.0.7: STK 当前菜单 (从最近 +STKPRO SETUP_MENU URC 解析, 只读无 auth) — 暂停 (2026-06-19)
-  // srv->on("/api/stk/menu",     HTTP_GET,  handleApiStkMenu);
+  // v4.0.12: STK 当前菜单 (从最近 +STKPRO SETUP_MENU URC 解析, 只读无 auth, 主页卡用)
+  srv->on("/api/stk/menu",     HTTP_GET,  handleApiStkMenu);
   srv->on("/api/bootPush",     HTTP_POST,
     [](AsyncWebServerRequest* r) { if (!check_dashboard_auth(r)) return; },
     nullptr,
@@ -3886,11 +3784,12 @@ static bool modem_init_at() {
       //   中国移动默认 +8613800010500, 145=国际号格式
       //   即使 SIM 已有 CSCA, 覆盖设也没坏处 (避免 SIM 缺 CSCA 的边角 case)
       send_atcmd("AT+CSCA=\"+8613800010500\",145\r\n", 2000);
-      // v4.0.7: STK (SIM ToolKit) — 暂停 (2026-06-19 翔哥决定)
-      //   启用主动命令 (SIM 卡菜单会推 +STKPRO: URC) — 现在不要
-      //   参考 waybyte/logicromsdk/ril_stk.h: AT+STKENV / AT+STKR / AT+STKTR
+      // v4.0.7: STK (SIM ToolKit) — 部分解除 (2026-06-19 翔哥决定)
+      //   v4.0.12: 解禁 AT+STKPCMD=1 (让 SIM 推 +STKPRO: URC), 仍不发 AT+STKR/STKTR
+      //   只读路径: URC → stk_event_task → parse_stkpro_setup_menu → g_stkMenu[] → /api/stk/menu → 主页卡
       //   Quectel 启用方式: AT+STKPCMD=1 (1=启用, 0=禁用)
-      // send_atcmd("AT+STKPCMD=1\r\n",     2000);
+      //   参考 waybyte/logicromsdk/ril_stk.h: AT+STKENV / AT+STKR / AT+STKTR
+      send_atcmd("AT+STKPCMD=1\r\n",     2000);
       ESP_LOGI(TAG, "SMS engine configured");
       return true;
     }
@@ -4042,8 +3941,10 @@ void setup() {
   xTaskCreate(net_task,    "net",    8192, NULL, 4, &g_netWorker);
   // v4.0.7: CSQ 后台轮询 (5s 间隔, 写 g_4g_csq/g_4g_dbm 供前端)
   xTaskCreate(csq_poll_task, "csq_poll", 4096, NULL, 2, NULL);  // 4096 同 usb_rx: send_atcmd + usbh_cdc + ESP_LOGW "%.200s" 实际用 ~1.5KB, 2048 边界 + boot 早期 USBH 重叠会 overflow
-  // v4.0.7 P0-debug: STK event task 临时关 (用户担心影响 4G SMS 接收) — STK Proactive 暂停 (2026-06-19)
-  // xTaskCreate(stk_event_task, "stk_event", 4096, NULL, 3, NULL);
+  // v4.0.7 P0-debug: STK event task 临时关 (用户担心影响 4G SMS 接收)
+  //   v4.0.12: 恢复 stk_event_task (消费 +STKPRO URC, 写 g_stkMenu[]), 仍不主动响应
+  //   优先级 3 不订阅 TWDT (同 stk_query_task 模式 — 长 xQueueReceive 不阻塞 boot)
+  xTaskCreate(stk_event_task, "stk_event", 4096, NULL, 3, NULL);
   // v4.0.11.12: 恢复 stk_query_task (SIM 信息 CIMI/CCID/CNUM/COPS) — 跟 STK event task 不同, 这个不发 AT+STKR, 只查 SIM
   //   之前注释掉连带 SIM 读取也没了 → /api/status simImsi="" simAgeMs=-1 → 4G 模组没注册网络指示 → CMGS +CMS ERROR: 500
   //   修法: 恢复 stk_query_task, STK event task 仍注释 (Proactive 菜单继续暂停)
