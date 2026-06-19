@@ -2166,8 +2166,8 @@ footer .refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;
       <div class="kv"><span class="k">成功</span><span class="v" style="color:var(--accent)" id="ok">0</span></div>
       <div class="kv"><span class="k">失败</span><span class="v" style="color:var(--err)" id="fal">0</span></div>
       <div class="kv"><span class="k">待推队列</span><span class="v" id="q">0</span></div>
-      <div class="kv"><span class="k">上次推送</span><span class="v" id="lp">-</span></div>
       <div class="kv"><span class="k">上次短信</span><span class="v" id="ls">-</span></div>
+      <div class="kv"><span class="k">上次推送</span><span class="v" id="lp">-</span></div>
     </div>
 
     <div class="card"><h3>系统</h3>
