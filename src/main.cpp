@@ -1137,6 +1137,21 @@ static void stk_query_task(void* /*param*/) {
   }
 }
 
+// v4.0.13: /api/stk/siminfo — 读 g_sim_* (stk_query_task 已采集), 仅 SIM 信息无 g_stkLog
+//   stk-paused 守: 不解禁 handleApiStkInfo (含 g_stkLog 公开敏感), 独立新路由只暴露 SIM 字段
+static void handleApiStkSiminfo(AsyncWebServerRequest* r) {
+  JsonDocument doc;
+  portENTER_CRITICAL(&g_sim_mux);
+  doc["imsi"]     = g_sim_imsi;
+  doc["iccid"]    = g_sim_iccid;
+  doc["msisdn"]   = g_sim_msisdn;
+  doc["operator"] = g_sim_operator;
+  portEXIT_CRITICAL(&g_sim_mux);
+  doc["ageMs"] = (int32_t)((g_sim_queryMs && millis() >= g_sim_queryMs) ? (millis() - g_sim_queryMs) : -1);
+  String out; serializeJson(doc, out);
+  r->send(200, "application/json", out);
+}
+
 // /api/stk — 返回 SIM 信息 + 最近 N 条 STK 日志
 static void handleApiStkInfo(AsyncWebServerRequest* r) {
   JsonDocument doc;
@@ -2512,8 +2527,6 @@ footer{margin-top:24px;text-align:center;font-size:12px;color:var(--muted)}
     </div>
     <p class="warn-text">⚠ 烧录中请勿断电;成功后设备将自动重启,约 5s 后可用</p>
   </div>
-
-  <footer>FW v4.0.7</footer>
 </div>
 <script>
 async function upload() {
@@ -2792,6 +2805,15 @@ nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
   </nav>
 
   <div class="card">
+    <h3>SIM 卡信息</h3>
+    <div class="kv"><span class="k">运营商</span><span class="v" id="simOp">-</span></div>
+    <div class="kv"><span class="k">IMSI</span><span class="v" id="simImsi">-</span></div>
+    <div class="kv"><span class="k">ICCID</span><span class="v" id="simIccid">-</span></div>
+    <div class="kv"><span class="k">本机号 (MSISDN)</span><span class="v" id="simMsisdn">-</span></div>
+    <div class="kv"><span class="k">刷新时间</span><span class="v" id="simAge">-</span></div>
+  </div>
+
+  <div class="card">
     <h3>SIM 卡主动菜单 (SETUP_MENU 0x25) <span class="status-line" id="menu_status" style="margin:0">等待 SIM 推送…</span></h3>
     <div id="menu_title" style="font-weight:600;margin-bottom:8px;color:var(--info)"></div>
     <ul id="menu_list" style="list-style:none;margin:0;padding:0"></ul>
@@ -2826,8 +2848,25 @@ async function loadMenu(){
     status.textContent='加载失败: '+e.message;
   }
 }
+function ageStr(sec){ if(sec<0) return '从未'; if(sec<60) return sec+'s 前'; if(sec<3600) return Math.floor(sec/60)+'m 前'; return Math.floor(sec/3600)+'h 前'; }
+async function loadSimInfo(){
+  try{
+    const r = await fetch('/api/stk/siminfo',{cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const j = await r.json();
+    document.getElementById('simOp').textContent     = j.operator || '-';
+    document.getElementById('simImsi').textContent   = j.imsi     || '-';
+    document.getElementById('simIccid').textContent  = j.iccid    || '-';
+    document.getElementById('simMsisdn').textContent = j.msisdn   || '-';
+    document.getElementById('simAge').textContent    = ageStr(Math.floor((j.ageMs<0?-1:j.ageMs)/1000));
+  }catch(e){
+    /* fetch 失败, 静默保留旧值, 不显 "加载失败" (SIM 信息不突变) */
+  }
+}
 loadMenu();
+loadSimInfo();          // v4.0.13: 首屏拉一次
 setInterval(loadMenu, 10000);
+setInterval(loadSimInfo, 5000);   // v4.0.13: 5s 跟 loadMenu 异步刷
 </script>
 <script>if(self!==top){['page-head','page-nav'].forEach(function(id){var h=document.getElementById(id); if(h)h.style.display='none';});}</script>
 </body></html>
@@ -3415,8 +3454,6 @@ footer{margin-top:24px;text-align:center;font-size:12px;color:var(--muted)}
     </div>
     <div id="f_status" class="status-line"></div>
   </div>
-
-  <footer>FW v4.0.6</footer>
 </div>
 <script>
 async function doFactory() {
@@ -3610,6 +3647,8 @@ static void register_web_routes(AsyncWebServer* srv) {
   srv->on("/api/recent/clear", HTTP_POST, handleApiRecentClear);
   // v4.0.12: STK 当前菜单 (从最近 +STKPRO SETUP_MENU URC 解析, 只读无 auth, 主页卡用)
   srv->on("/api/stk/menu",     HTTP_GET,  handleApiStkMenu);
+  // v4.0.13: SIM 信息 (从 stk_query_task 已有 g_sim_* 读, 不含 g_stkLog, 不破 stk-paused)
+  srv->on("/api/stk/siminfo",  HTTP_GET,  handleApiStkSiminfo);
   srv->on("/api/bootPush",     HTTP_POST,
     [](AsyncWebServerRequest* r) { if (!check_dashboard_auth(r)) return; },
     nullptr,
