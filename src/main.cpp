@@ -48,6 +48,7 @@
 #include "web/ota.h"
 #include "web/app.h"
 #include "web/stk.h"
+#include "stk_validate.h"     // v4.0.15: validate_stk_select inline 函数
 #include "web/send.h"
 #include "web/config.h"
 
@@ -73,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.14"     // v4.0.14: main.cpp HTML 物理抽到 src/web/*.h; v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.15"     // v4.0.15: STK 响应路径解禁 MVP (仅 AT+STKR, /stk 页'选'按钮 → POST /api/stk/select); v4.0.14 main.cpp HTML 物理抽 / v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -1213,6 +1214,42 @@ static void handleApiStkMenu(AsyncWebServerRequest* r) {
   portEXIT_CRITICAL(&g_stkMenuMux);
   String out; serializeJson(doc, out);
   r->send(200, "application/json", out);
+}
+
+// v4.0.15: /api/stk/select — POST {itemId:N}, 发 AT+STKR=N
+//   stk-paused 守: 仅 AT+STKR; AT+STKTR/STKENV /api/stk/cmd 仍禁
+//   复用: g_stkMenuMux (跟 handleApiStkMenu 同) + send_atcmd (2000ms timeout) + stk_log_write (ring buffer)
+static void handleApiStkSelect(AsyncWebServerRequest* r, uint8_t* data, size_t len,
+                               size_t /*index*/, size_t /*total*/) {
+  JsonDocument doc;
+  if (len == 0 || deserializeJson(doc, data, len) != DeserializationError::Ok) {
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"bad json\"}");
+    return;
+  }
+  int itemId = doc["itemId"] | 0;
+  uint8_t cmd, count;
+  portENTER_CRITICAL(&g_stkMenuMux);
+  cmd   = g_stkMenuCmd;
+  count = g_stkMenuCount;
+  portEXIT_CRITICAL(&g_stkMenuMux);
+  StkSelectResult v = validate_stk_select(itemId, cmd, count);
+  if (!v.ok) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"err\":\"%s\",\"code\":%d}", v.err, v.code);
+    r->send(400, "application/json", buf);
+    return;
+  }
+  char atcmd[24];
+  snprintf(atcmd, sizeof(atcmd), "AT+STKR=%d\r\n", itemId);
+  int rc = send_atcmd(atcmd, 2000);
+  char logline[STK_LOG_LEN];
+  snprintf(logline, sizeof(logline), "[TX] AT+STKR=%d → rc=%d", itemId, rc);
+  stk_log_write(logline);
+  if (rc != 0) {
+    r->send(400, "application/json", "{\"ok\":false,\"err\":\"AT fail\",\"code\":3}");
+    return;
+  }
+  r->send(200, "application/json", "{\"ok\":true}");
 }
 
 // /api/stk/cmd — POST {"cmd":"..."} 透传 AT (限 STK* 命令, 安全)
@@ -2596,6 +2633,10 @@ static void register_web_routes(AsyncWebServer* srv) {
   srv->on("/api/stk/menu",     HTTP_GET,  handleApiStkMenu);
   // v4.0.13: SIM 信息 (从 stk_query_task 已有 g_sim_* 读, 不含 g_stkLog, 不破 stk-paused)
   srv->on("/api/stk/siminfo",  HTTP_GET,  handleApiStkSiminfo);
+  // v4.0.15: 解禁响应路径 MVP — POST {itemId:N} → AT+STKR=N
+  //   AT+STKTR / AT+STKENV / /api/stk/cmd 仍禁
+  //   no auth 跟 /api/stk/menu /api/stk/siminfo 一致 (读路径无 auth, 响应路径本 spec 也无 auth)
+  srv->on("/api/stk/select", HTTP_POST, [](AsyncWebServerRequest* r){}, nullptr, handleApiStkSelect);
   srv->on("/api/bootPush",     HTTP_POST,
     [](AsyncWebServerRequest* r) { if (!check_dashboard_auth(r)) return; },
     nullptr,

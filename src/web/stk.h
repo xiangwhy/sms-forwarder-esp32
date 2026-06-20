@@ -14,6 +14,9 @@ nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
 .btn{display:inline-block;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:var(--card2);color:var(--text);text-decoration:none;font-size:13px;cursor:pointer;font-family:inherit}
 .btn:hover{background:var(--border)}
 .btn.primary{background:var(--accent);color:#0a1014;border-color:transparent;font-weight:600}
+.btn-select{display:inline-block;padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:var(--card2);color:var(--text);font-size:12px;cursor:pointer;font-family:inherit;margin-left:8px}
+.btn-select:hover{background:var(--accent);color:#0a1014;border-color:transparent}
+.btn-select:disabled{opacity:.5;cursor:not-allowed}
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;box-shadow:var(--shadow);margin-bottom:16px}
 .card h3{margin:0 0 12px;font-size:14px;font-weight:600;color:var(--text);display:flex;align-items:center;justify-content:space-between}
 .status-line{margin-top:8px;font-size:12px;color:var(--muted)}
@@ -70,6 +73,7 @@ async function loadMenu(){
       `<li style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:12px">
          <span style="flex:1"><b style="color:var(--info)">${it.id}.</b> ${escapeHtml(it.text)}</span>
          <span style="color:var(--muted);font-size:12px">id=${it.id}</span>
+         <button class="btn-select" data-id="${it.id}">选</button>
        </li>`
     ).join('');
   }catch(e){
@@ -95,6 +99,37 @@ loadMenu();
 loadSimInfo();          // v4.0.13: 首屏拉一次
 setInterval(loadMenu, 10000);
 setInterval(loadSimInfo, 5000);   // v4.0.13: 5s 跟 loadMenu 异步刷
+
+// v4.0.15: 选菜单 item → POST /api/stk/select
+//   事件委托到 #menu_list ul (loadMenu 每 10s 重建 li, 委托避免重建后失效)
+async function selectItem(btn) {
+  const id = parseInt(btn.dataset.id, 10);
+  const status = document.getElementById('menu_status');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/stk/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemId: id })
+    });
+    const j = await r.json();
+    if (j.ok) {
+      status.textContent = `已选 #${id}, 等待 SIM 响应 (最多 10s)…`;
+      status.className = 'status-line ok';
+    } else {
+      status.textContent = `失败 #${id}: ${j.err}` + (j.code !== undefined ? ` (code=${j.code})` : '');
+      status.className = 'status-line err';
+    }
+  } catch (e) {
+    status.textContent = '网络错误: ' + e.message;
+    status.className = 'status-line err';
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 1500);  // 防连点
+  }
+}
+document.getElementById('menu_list').addEventListener('click', function(e){
+  if (e.target.classList && e.target.classList.contains('btn-select')) selectItem(e.target);
+});
 </script>
 <script>if(self!==top){['page-head','page-nav'].forEach(function(id){var h=document.getElementById(id); if(h)h.style.display='none';});}</script>
 </body></html>
