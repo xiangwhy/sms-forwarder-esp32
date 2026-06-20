@@ -10,6 +10,7 @@
 // 每个 case 用宏 CHECK / CHECK_EQ_INT / CHECK_EQ_STR 跑, 通过数累计, 最后 exit 0/1
 
 #include "pdu_codec.h"
+#include "stk_validate.h"
 
 #include <cstdio>
 #include <cstring>
@@ -1239,6 +1240,56 @@ static void test_pdu_e2e_thai_ucs2_dcs_truth() {
   CHECK_EQ_STR(utf8, "รหัสยืนยันของคุณ:559629");
 }
 
+// =================== v4.0.15: STK select 校验 ===================
+// 6 case cover validate_stk_select 的 3 类失败 + 2 类边界 + 1 类正常
+
+static void test_stk_select_normal() {
+  g_current = "test_stk_select_normal (itemId=1 cmd=0x25 cnt=3 → ok)";
+  auto v = validate_stk_select(1, 0x25, 3);
+  CHECK(v.ok);
+  CHECK(v.code == 0);
+  CHECK(v.err == nullptr);
+}
+
+static void test_stk_select_max_boundary() {
+  g_current = "test_stk_select_max_boundary (itemId=3 cmd=0x25 cnt=3 → ok)";
+  auto v = validate_stk_select(3, 0x25, 3);
+  CHECK(v.ok);
+  CHECK(v.code == 0);
+}
+
+static void test_stk_select_min_boundary_zero() {
+  g_current = "test_stk_select_min_boundary_zero (itemId=0 cmd=0x25 cnt=3 → err code:1)";
+  auto v = validate_stk_select(0, 0x25, 3);
+  CHECK(!v.ok);
+  CHECK(v.code == 1);
+  CHECK(std::string(v.err) == "out of range");
+}
+
+static void test_stk_select_above_max() {
+  g_current = "test_stk_select_above_max (itemId=4 cmd=0x25 cnt=3 → err code:1)";
+  auto v = validate_stk_select(4, 0x25, 3);
+  CHECK(!v.ok);
+  CHECK(v.code == 1);
+  CHECK(std::string(v.err) == "out of range");
+}
+
+static void test_stk_select_wrong_cmd() {
+  g_current = "test_stk_select_wrong_cmd (itemId=1 cmd=0x21 cnt=3 → err code:2)";
+  auto v = validate_stk_select(1, 0x21, 3);
+  CHECK(!v.ok);
+  CHECK(v.code == 2);
+  CHECK(std::string(v.err) == "not SETUP_MENU");
+}
+
+static void test_stk_select_no_menu() {
+  g_current = "test_stk_select_no_menu (itemId=1 cmd=0 cnt=0 → err code:1 err='no menu')";
+  auto v = validate_stk_select(1, 0, 0);
+  CHECK(!v.ok);
+  CHECK(v.code == 1);
+  CHECK(std::string(v.err) == "no menu");
+}
+
 int main() {
   std::printf("============================================================\n");
   std::printf("pdu_codec host test\n");
@@ -1370,6 +1421,14 @@ int main() {
   // v4.0.11: 翔哥 6/19 实战 2 条 E2E (TDD red→green)
   test_pdu_e2e_true_7bit_dcs_truth();
   test_pdu_e2e_thai_ucs2_dcs_truth();
+
+  // v4.0.15: STK select 校验
+  test_stk_select_normal();
+  test_stk_select_max_boundary();
+  test_stk_select_min_boundary_zero();
+  test_stk_select_above_max();
+  test_stk_select_wrong_cmd();
+  test_stk_select_no_menu();
 
   std::printf("============================================================\n");
   std::printf("Result: %d passed, %d failed\n", g_pass, g_fail);
