@@ -10,7 +10,6 @@ html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,
 .container{max-width:880px;margin:0 auto;padding:8px 16px 48px}  /* v4.0.11.21: padding-top 24→8 跟 .app-nav margin-bottom 16→8 配对, 总间距 40→16px (用户: 外层和内层之间的宽度调小一些) */
 header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:24px;gap:16px}
 header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-0.01em}
-header .fw-tag{font-size:11px;color:var(--muted);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 14px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;color:var(--text);background:var(--card2);border:1px solid var(--border);transition:background .15s;cursor:pointer;font-family:inherit}
 .btn:hover{background:#2c3744;border-color:#384454}
@@ -36,7 +35,6 @@ nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
 <div class="container">
   <header id="page-head">
     <h1>📤 SMS 发送</h1>
-    <span class="fw-tag">v4.0.12</span>
   </header>
   <nav id="page-nav">
     <a href="/dashboard" class="btn">Dashboard</a>

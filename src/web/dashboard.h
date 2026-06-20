@@ -13,7 +13,6 @@ header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-0.01em}
 header h1 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--muted);margin-right:8px;vertical-align:middle;transition:background .3s}
 header h1 .dot.ok{background:var(--accent);box-shadow:0 0 8px rgba(74,222,128,.5)}
 header h1 .dot.bad{background:var(--err)}
-.fw-tag{font-size:12px;padding:4px 10px;border-radius:999px;background:var(--card2);color:var(--muted);border:1px solid var(--border)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:24px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:var(--shadow)}
 .card h3{margin:0 0 12px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted)}
@@ -92,7 +91,6 @@ footer .refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;
 <div class="container">
   <header id="page-head">
     <h1><span id="status-dot" class="dot"></span>SMS Forwarder</h1>
-    <span class="fw-tag">FW v4.0.12</span>
   </header>
   <div class="actions" id="page-nav">
     <a class="btn" href="/dashboard">Dashboard</a>

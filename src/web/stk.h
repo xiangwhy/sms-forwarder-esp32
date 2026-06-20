@@ -10,7 +10,6 @@ html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,
 .container{max-width:880px;margin:0 auto;padding:8px 16px 48px}
 header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:24px;gap:16px}
 header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-0.01em}
-header .fw-tag{font-size:11px;color:var(--muted);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
 .btn{display:inline-block;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:var(--card2);color:var(--text);text-decoration:none;font-size:13px;cursor:pointer;font-family:inherit}
 .btn:hover{background:var(--border)}
@@ -24,7 +23,6 @@ nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
 <div class="container">
   <header id="page-head">
     <h1>STK 控制台</h1>
-    <span class="fw-tag">v4.0.12</span>
   </header>
   <nav id="page-nav">
     <a href="/dashboard" class="btn">Dashboard</a>
