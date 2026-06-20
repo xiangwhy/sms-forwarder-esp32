@@ -73,7 +73,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.12"     // STK 读路径解禁 v2: 主页卡回滚 + /stk 控制台启用 (精简,只放 SIM 卡主动菜单) + 4 处 fw-tag bump
+#define FW_VERSION         "v4.0.14"     // v4.0.14: main.cpp HTML 物理抽到 src/web/*.h; v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
