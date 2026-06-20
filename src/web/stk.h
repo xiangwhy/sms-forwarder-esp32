@@ -48,7 +48,7 @@ nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}
     <h3>SIM 卡主动菜单 (SETUP_MENU 0x25) <span class="status-line" id="menu_status" style="margin:0">等待 SIM 推送…</span></h3>
     <div id="menu_title" style="font-weight:600;margin-bottom:8px;color:var(--info)"></div>
     <ul id="menu_list" style="list-style:none;margin:0;padding:0"></ul>
-    <p style="font-size:12px;color:var(--muted);margin:10px 0 0">只读模式: 显示 SIM 推的 SETUP_MENU, 不发任何 AT+STKR / AT+STKTR 终端响应 (stk-paused 规则)。</p>
+    <p style="font-size:12px;color:var(--muted);margin:10px 0 0">显示 SIM 推的 SETUP_MENU; 点"选"发送 AT+STKR=N (响应路径 MVP, 仅菜单选择)。</p>
   </div>
 </div>
 <script>
