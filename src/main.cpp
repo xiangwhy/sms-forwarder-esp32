@@ -74,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.21"     // v4.0.21: 主页最近接收 SMS 长短信完整显示 (RxLogEntry.body 160→512 + 取消 60 字符预览, CSS word-wrap); v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 + sniff udFullHexLen (dtac 缅甸文/泰文乱码 fix) / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽 / v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.21.1"   // v4.0.21.1: fix /api/recent body 含 raw 控制字符 (dtac 乱码产物) → JSON.parse SyntaxError → loadRecent catch → "加载失败"。sanitizeForJson helper, 保留 printable + tab, 其余 → 空格 / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽 / v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -1297,6 +1297,23 @@ static void handleApiStkCmd(AsyncWebServerRequest* r, uint8_t* data, size_t len,
 }
 #endif  // v4.0.11.12: STK 块结束 (原 "STK Proactive 暂停 2026-06-19")
 
+// v4.0.21.1: sanitize 控制字符 → JSON 安全
+// dtac gateway garbled body 含 raw 0x00-0x1F (错位 7-bit 解码产物), ArduinoJson 6.x 不自动 escape
+//   → 浏览器 JSON.parse SyntaxError "Bad control character in string literal"
+//   → loadRecent catch → ul 显示 "加载失败" (翔哥 console 红字提示)
+// 修: printable ASCII (>=0x20) + tab (\t) 保留, 其他 control char 替换为空格
+static String sanitizeForJson(const char* s) {
+  if (!s) return String();
+  String out;
+  out.reserve(strlen(s) + 1);
+  for (const char* p = s; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c >= 0x20 || c == '\t') out += (char)c;
+    else out += ' ';
+  }
+  return out;
+}
+
 // =================== 最近收到 SMS API (v4.0.7, dashboard 显示用) ===================
 // 之前误放进上面 STK #if 0 块导致编译失败, 挪出来
 static void handleApiRecent(AsyncWebServerRequest* r) {
@@ -1316,8 +1333,8 @@ static void handleApiRecent(AsyncWebServerRequest* r) {
     uint16_t idx = (start + cnt - 1 - i + RX_LOG_CAP) % RX_LOG_CAP;
     JsonObject o = arr.add<JsonObject>();
     o["ageMs"] = (uint32_t)(now - g_rxLog[idx].ms);
-    o["phone"] = g_rxLog[idx].phone;
-    o["body"]  = g_rxLog[idx].body;
+    o["phone"] = sanitizeForJson(g_rxLog[idx].phone);  // v4.0.21.1: 防 alpha sender 含 garbage byte
+    o["body"]  = sanitizeForJson(g_rxLog[idx].body);   // v4.0.21.1: dtac 乱码含 raw CR/LF
   }
   String out; serializeJson(doc, out);
   r->send(200, "application/json", out);
