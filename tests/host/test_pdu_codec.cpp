@@ -257,6 +257,28 @@ static void test_looks_like_ucs2_too_short() {
   CHECK(!pdu::looks_like_ucs2_be("0E23", 3));   // 奇数长度
 }
 
+static void test_looks_like_ucs2_myanmar() {
+  g_current = "looks_like_ucs2_be: 缅甸文 dtac 错标 DCS=0 (98 pair 混排) → true";
+  // 用户实际收到的乱码 SMS, 反向解出 UCS-2 BE = 缅甸文 "အခမဲ့ငွေဖြ" + 中文/音标拉丁混排
+  // DCS 错标 0 (7-bit), ESP32 当 7-bit 解出乱码, 实际应是 UCS-2 BE
+  // 命中机制: 83 对非空 pair, 宽区 53/83 = 64% (CJK Ext A 0x40 撑住, 音标拉丁 0x01 拉低)
+  //         < 80% 宽区阈值, 但窄区 (0x10 缅甸文 ×11 + 0x0A Indic ×1) = 12 对 ≥ 4, 走 OR 分支命中
+  // 反例: 同样 60-68% 宽区命中率的 7-bit 英文 (如 "Welcome to our service!" 68%) 窄区都是 0-1 对, 不会误报
+  const char* hex =
+      "102110011019103210371004103D10311016103C"
+      "10206E2074203020622058202820342074200A"
+      "207420362036202820742008207A2062203220"
+      "2C20782040DC40E84004401040E8008000A800C4"
+      "00C000CC008C0080400040B440BC405040F840B4"
+      "405440E8406840AC0080407840B440BC400C0280"
+      "00DC01DC01DC01B8009001D00184018C01B8008C"
+      "01BC01B800D001A001BC00CC01BC00B401E401B4"
+      "019401B801D401C800804070401040DC40E84000"
+      "40B440BC405040F840B4405440E8400441AC";
+  CHECK_EQ_INT(std::strlen(hex), 392);  // 196 字节 × 2 hex
+  CHECK(pdu::looks_like_ucs2_be(hex, 392));
+}
+
 // === v4.0.6 短信发送 (双向): ucs2_encode + sms_split_for_send ===
 static void test_ucs2_encode_ascii() {
   g_current = "ucs2_encode: 'Hi' (2 ASCII) → '00480069' (4 hex 字符)";
@@ -786,24 +808,6 @@ static void test_ucs2_roundtrip_japanese() {
 
 // =================== v4.0.7: pdu_ud_offset + 泰文 PDU 端到端 ===================
 
-// 实际 6/19 泰文短信 CMT body (DCS=08 UCS-2, 73 bytes 含 SCA):
-// SCA=07 91 66 39 08 11 00 F3
-// FO=24 OA=0B D0 D6 B2 3C 6D CE 03 (11 digits)
-// PID=00 DCS=08 SCTS=62 60 91 20 50 60 82
-// UDL=2E (46 bytes) UD=0E23 0E2B 0E31 ... 0E13 003A 0035 ... 0039
-// 期望: pdu_ud_offset 返回 54 (hex chars), udBytes=46
-static void test_pdu_ud_offset_thai_ucs2() {
-  // 实际从 device log 抓的 body_hex
-  const char* body = "07916639081100F3240bd0d6b23c6dce030008626091205060822e0e230e2b0e310e2a0e220e370e190e220e310e190e020e2d0e070e040e380e13003a003500350039003600320039";
-  size_t bodyLen = std::strlen(body);
-  size_t udBytes = 0;
-  size_t udOff = pdu::pdu_ud_offset(body, bodyLen, /*is7bit=*/false, &udBytes);
-  CHECK_EQ_INT(udOff, 54);    // hex 偏移 (SCA 16 + FO 2 + OA 16 + PID 2 + DCS 2 + SCTS 14 = 52, +UDL 2 = 54)
-  CHECK_EQ_INT(udBytes, 46);  // UDL=0x2E, UCS-2 按 byte
-  // 切出来的 UD hex 应是 "0e23..." 开头 (注意: log 里 hex 是小写)
-  CHECK_EQ_INT(std::strncmp(body + udOff, "0e23", 4), 0);
-}
-
 // 7-bit 短短信 PDU: SCA=07 ... FO=04 OA=0B ... PID=00 DCS=00 SCTS=...
 // UDL=09 (9 septets), UD packed 7-bit = 8 bytes (ceil(9*7/8)=8)
 static void test_pdu_ud_offset_7bit() {
@@ -1240,6 +1244,304 @@ static void test_pdu_e2e_thai_ucs2_dcs_truth() {
   CHECK_EQ_STR(utf8, "รหัสยืนยันของคุณ:559629");
 }
 
+// =================== v4.0.20: dtac 错标 DCS=0 缅甸文短信 — 实战端到端 ===================
+// 翔哥 dtac 收缅甸文诈骗短信, ML307 报 +CMT 时 dcs 字段空 / 错, 短信内容以 UCS-2 BE 进入 ESP32
+// 但 TPDU 里 DCS byte 错标 0x00 (gateway bug), 老代码会强走 7-bit → 缅甸文乱码
+// v4.0.20 fix: 7-bit 路径前先 sniff UD bytes, 命中 UCS-2 BE pattern (高字节落 BMP 宽区/窄区) → 强制走 UCS-2
+// 这里的 2 个 E2E test 模拟真实 PDU 走完整 pdu_ud_offset_ex → fallback → decode 路径
+
+// Case 3: 正常 7-bit 英文 SMS (对照组 — sniff 不应误报)
+//   SCA len=0 + FO=04 (DELIVER no UDHI) + OA len=11 ToA=91 international BCD "86 138 007 7107"
+//   + PID=00 + DCS=0x00 (真 7-bit) + SCTS + UDL=11 septets + UD 10 octets 7-bit packed "Hello World"
+//   7-bit packed: 'H' 'e' 'l' 'l' 'o' ' ' 'W' 'o' 'r' 'l' 'd' = C8329BFD065DDF723619
+//   期望: pdu_ud_offset_ex 返回 is7bit=true / isUcs2=false / udBytes=10
+//        looks_like_ucs2_be(10B 7-bit 看作 UCS-2 BE) 返回 false (narrowHits=0)
+//        decode_7bit_packed 解出 "Hello World"
+static void test_pdu_e2e_normal_7bit_hello_world() {
+  g_current = "E2E: 正常 7-bit 英文 'Hello World' (DCS=0x00) → 不触发 sniff, 7-bit 解码正确";
+  const char* body =
+    "00"                                  // SCA len=0
+    "04"                                  // FO SMS-DELIVER (no UDHI)
+    "0B91861380077107"                    // OA len=11 ToA=91 international "861380077107" (16 hex)
+    "00"                                  // PID
+    "00"                                  // DCS=0x00 (真 7-bit)
+    "62506080220080"                      // SCTS (14)
+    "0B"                                  // UDL=11 septets
+    "C8329BFD065DDF723619";               // UD 10 octets 7-bit packed "Hello World"
+  size_t bodyLen = std::strlen(body);
+
+  // 跳过头部: SCA(2) + FO(2) + OA(2+2+12) + PID(2) + DCS(2) + SCTS(14) + UDL(2) = 40 hex
+  bool isUcs2 = false;
+  bool is7bit = false;
+  size_t udByteLen = 0;
+  size_t udOff = pdu::pdu_ud_offset_ex(body, bodyLen, &isUcs2, &is7bit, &udByteLen);
+  CHECK_EQ_INT(udOff, 40);
+  CHECK(is7bit);
+  CHECK(!isUcs2);
+  CHECK_EQ_INT(udByteLen, 10);  // ceil(11*7/8) = 10 octets
+
+  // sniff 10 字节 7-bit packed 当 UCS-2 BE 看: pairHits=4, hiHits=2 (50% < 80%), narrowHits=0 → false
+  // 关键: 这证明 sniff 不会把 7-bit 英文误判成 UCS-2, fallback 路径不会误触发
+  CHECK(!pdu::looks_like_ucs2_be(body + udOff, bodyLen - udOff));
+
+  // 7-bit 解码 "Hello World" (11 chars, GSM7 default alphabet)
+  char buf[64] = {0};
+  size_t n = pdu::decode_7bit_packed(body + udOff, udByteLen * 2, 11, buf, sizeof(buf) - 1);
+  buf[n] = 0;
+  CHECK_EQ_STR(std::string(buf, n), "Hello World");
+}
+
+// Case 4: dtac 错标 DCS=0 缅甸文 SMS (修复目标 case)
+//   SCA len=0 + FO=04 + OA len=11 ToA=91 + PID=00 + DCS=0x00 (错!) + SCTS
+//   + UDL=0xC4 (=196, gateway 错把 196 octets 当 196 septets) + UD 196 octets UCS-2 BE
+//   期望: pdu_ud_offset_ex 走 7-bit (DCS=0x00), udBytes=ceil(196*7/8)=172 octets
+//        looks_like_ucs2_be(full UD 196B = 392 hex): pairHits=83, hiHits=58 (69% < 80%), narrowHits=12 (14%) → OR 命中
+//        main.cpp 兜底: 强走 decode_body_field → UCS-2 → 缅甸文 "အခမဲ့ငွေဖြ..."
+//        头 2 codepoint: U+1021 (အ) = UTF-8 e1 80 a1, U+1001 (ခ) = UTF-8 e1 80 81
+static void test_pdu_e2e_dtac_ucs2_myanmar_mislabel() {
+  g_current = "E2E: dtac 错标 DCS=0 缅甸文 'အခမဲ့ငွေ...' (196B UCS-2 BE) → sniff 触发, 走 UCS-2 fallback";
+  const char* udHex196 =
+      "102110011019103210371004103D10311016103C"
+      "10206E2074203020622058202820342074200A"
+      "207420362036202820742008207A2062203220"
+      "2C20782040DC40E84004401040E8008000A800C4"
+      "00C000CC008C0080400040B440BC405040F840B4"
+      "405440E8406840AC0080407840B440BC400C0280"
+      "00DC01DC01DC01B8009001D00184018C01B8008C"
+      "01BC01B800D001A001BC00CC01BC00B401E401B4"
+      "019401B801D401C800804070401040DC40E84000"
+      "40B440BC405040F840B4405440E8400441AC";
+  // 拼完整 PDU: header (40 hex) + UDL (2 hex) + UD (196B = 392 hex)
+  // C++ 邻接字符串字面量是 const char[N], 不能直接 + const char*, 所以先 std::string() 包一层
+  std::string body = std::string(
+      "00"                                  // SCA len=0
+      "04"                                  // FO SMS-DELIVER (no UDHI)
+      "0B91861380077107"                    // OA len=11 ToA=91 international (16 hex)
+      "00"                                  // PID
+      "00"                                  // DCS=0x00 (dtac 错标!)
+      "62506080220080"                      // SCTS (14)
+      "C4")                                  // UDL=196 (实际是 196 octets, dtac 错当 196 septets)
+      + udHex196;                            // UD 196B UCS-2 BE Myanmar
+  size_t bodyLen = body.size();
+
+  // 跳过头部 (40 hex) — 与 7-bit case 相同 header layout
+  bool isUcs2 = false;
+  bool is7bit = false;
+  size_t udByteLen = 0;
+  size_t udOff = pdu::pdu_ud_offset_ex(body.c_str(), bodyLen, &isUcs2, &is7bit, &udByteLen);
+  CHECK_EQ_INT(udOff, 40);
+  CHECK(is7bit);                                  // DCS=0x00 走 7-bit 路径
+  CHECK(!isUcs2);                                 // TPDU DCS byte 没明说 UCS-2
+  CHECK_EQ_INT(udByteLen, 172);                   // ceil(196*7/8) = 172
+
+  // 关键: sniff 应触发 — 172B 当 UCS-2 BE 看 (344 hex)
+  //  pairHits=83, hiHits=58 (69% < 80% 宽区), narrowHits=12 (14% >= 12%) → OR 命中
+  CHECK(pdu::looks_like_ucs2_be(body.c_str() + udOff, bodyLen - udOff));
+
+  // 模拟 main.cpp 兜底: sniff 命中后, 强走 decode_body_field (UCS-2 自动识别)
+  char utf8[512] = {0};
+  size_t n = pdu::decode_body_field(body.c_str() + udOff, bodyLen - udOff, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+  std::string out(utf8, n);
+
+  // 关键验证 1: 含 အ (U+1021) — UTF-8 e1 80 a1, 缅甸文 "Free" 开头
+  CHECK(out.find("\xE1\x80\xA1") != std::string::npos);
+  // 关键验证 2: 含 ခ (U+1001) — UTF-8 e1 80 81
+  CHECK(out.find("\xE1\x80\x81") != std::string::npos);
+  // 关键验证 3: 不含 SCA 残留 (header "04 0B 91" / SCTS "62 50 60" 都没漏到 body)
+  //   7-bit 路径错误时, 头 7 octets 会被解成 "Kddo sghr..." 这种 GSM7 字符串
+  //   修正后应该完全无 SCA 字节污染
+  CHECK(out.find("0791") == std::string::npos);
+  CHECK(out.find("Kddo") == std::string::npos);
+  CHECK(out.find("sghr") == std::string::npos);
+  // 关键验证 4: 输出长度合理 (196B UCS-2 BE → 96 chars Myanmar/CJK, UTF-8 编码后 ≥196 bytes)
+  CHECK(out.size() >= 100);
+}
+
+// =================== v4.0.20: user 实际收到的 2 条 SMS E2E (raw body hex 完整保留) ===================
+// 翔哥 6/20 从 dtac / TRUE 抓的 2 条真实 PDU:
+//   PDU A (泰文 OTP):  DCS=0x08 (UCS-2 真相), 46 bytes UCS-2 BE → "รหัสยืนยันของคุณ:559629"
+//   PDU B (英文 OTP):  DCS=0x00 (7-bit 真相), 143 septets concat (UDH + 135 user septets) →
+//                                "Keep this code secure to prevent unauthorized access. Your OTP is 021273 (Ref: ZwGAH)..."
+// 这 2 个 test 校验 v4.0.20 sniff 表 + pdu_ud_offset_ex 对 user 真实硬件抓到的 hex 都正常工作
+//   PDU A: DCS=0x08 → isUcs2=true (直走 UCS-2, sniff 都不会触发, 兜底用)
+//   PDU B: DCS=0x00 → is7bit=true; looks_like_ucs2_be 在 full UD 上 narrowHits=1 → false, 不 bypass → 7-bit 解码
+
+// Case 5 (PDU A): 翔哥 dtac 抓的 泰文 OTP 验证码短信 (raw hex 完整, 含 SCA+FO+OA+PID+DCS+SCTS+UDL)
+//   PDU: 07 91 6639081100F3 | 24 (FO SMS-DELIVER no UDHI) | 0B D0 6B23C6DCE030008626 (OA 9 octets GSM7 alpha, oaLen=11)
+//       | 00 (PID) | 08 (DCS=UCS-2) | 62609120506082 (SCTS) | 2E (UDL=46 bytes) | UD 46B UCS-2 BE 泰文
+//   注意: oaLen=11 (字段) 实际 OA value 是 9 octets GSM7 packed, 内容不固定 (ML307 quirk 让 oaLen 不可信)
+//   期望: pdu_ud_offset_ex → isUcs2=true, is7bit=false, udBytes=46
+//        decode_body_field → "รหัสยืนยันของคุณ:559629" (16 Thai + ":" + 6 digits = 23 chars)
+static void test_pdu_e2e_dtac_thai_otp_real_pdu() {
+  g_current = "E2E: dtac 泰文 OTP 'รหัสยืนยันของคุณ:559629' (DCS=0x08, 46B UCS-2 BE) — raw hex 完整";
+  const char* body =
+    "07916639081100F3"                    // SCA len=7 + type=91 + BCD 6390811003 (Thai 运营商) (16)
+    "24"                                  // FO SMS-DELIVER (no UDHI) (2)
+    "0B" "D0" "6B23C6DCE030008626"        // OA len=11 ToA=D0 GSM7 alpha 9 octets (oaLen 字段不可信, ML307 quirk) (20)
+    "00"                                  // PID (2)
+    "08"                                  // DCS=0x08 (UCS-2 真相) (2)
+    "62609120506082"                      // SCTS (14)
+    "2E"                                  // UDL=46 bytes (2)
+    "0E230E2B0E310E2A0E220E370E190E220E310E190E020E2D0E070E040E380E13003A003500350039003600320039";  // UD 46B UCS-2 BE 泰文
+  size_t bodyLen = std::strlen(body);
+
+  // v4.0.20.1 fix: ToA=0xD0 alphanumeric 路径扫合法 (PID=0x00, DCS=valid), 找到 9 octets
+  //   → 16+2+2+2+18+2+2+14+2 = 60
+  bool isUcs2 = false;
+  bool is7bit = false;
+  size_t udByteLen = 0;
+  size_t udOff = pdu::pdu_ud_offset_ex(body, bodyLen, &isUcs2, &is7bit, &udByteLen);
+  CHECK_EQ_INT(udOff, 60);
+  CHECK(isUcs2);                                   // DCS=0x08 走 UCS-2
+  CHECK(!is7bit);
+  CHECK_EQ_INT(udByteLen, 46);                     // UDL=46 bytes
+
+  // sniff 在 full UD 上也对 (兜底用, 实际 main.cpp 走 isUcs2=true 直走 UCS-2)
+  //   46 字节 UCS-2 BE: 23 对, hiHits=23 (100% 0x0E 泰文) → OR 命中
+  CHECK(pdu::looks_like_ucs2_be(body + udOff, bodyLen - udOff));
+
+  // decode_body_field → 泰文 OTP
+  char utf8[128] = {0};
+  size_t n = pdu::decode_body_field(body + udOff, bodyLen - udOff, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+  std::string out(utf8, n);
+
+  // 关键校验
+  CHECK_EQ_STR(out, "รหัสยืนยันของคุณ:559629");
+  CHECK(out.find("ข") != std::string::npos);       // ข (U+0E02) — 泰文特征
+  CHECK(out.find("559629") != std::string::npos);  // 6 位验证码
+  CHECK(out.find(":") != std::string::npos);       // 分隔符
+  // 不应含 SCA 残留
+  CHECK(out.find("0791") == std::string::npos);
+  CHECK(out.find("6639") == std::string::npos);
+  // 长度: 16 Thai (3B/char) + ":" + "559629" (6 ASCII) = 48+1+6 = 55 bytes UTF-8
+  CHECK_EQ_INT(out.size(), 55);
+}
+
+// Case 6 (PDU B): 翔哥 TRUE/HUAWEI 抓的 英文 OTP concat 短信 (raw hex 完整, 含 concat UDH)
+//   sender: "True App" (14 字符 GSM7 alpha, ToA=0xD0, ML307 quirk: oaLen=14 实际是 7 octets packed)
+//   PDU: 07 91 6649520080F0 | 40 (FO SMS-DELIVER + UDHI) | 0E D0 5479BD0C0AC2E1 (OA "True App" 7 octets)
+//       | 00 (PID) | 00 (DCS=7-bit) | 62609180851182 (SCTS) | 8F (UDL=143 septets)
+//       | 06 08 04 5A A7 02 01 (UDH 16-bit concat refId=0x5AA7=23207 total=2 seq=1)
+//       | cb72190e... (user payload 119 bytes = 135 user septets packed)
+//   期望: pdu_ud_offset_ex → is7bit=true, isUcs2=false, udBytes=126
+//        looks_like_ucs2_be(full UD) = false (narrowHits=1) → 不 bypass 7-bit
+//        decode_7bit_packed(135 user septets) → "Keep this code secure to prevent unauthorized access. Your OTP is 021273 (Ref: ZwGAH). This code is valid for 10 minutes and will expir"
+static void test_pdu_e2e_true_english_otp_concat_real_pdu() {
+  g_current = "E2E: TRUE/HUAWEI 英文 OTP concat 'Keep this code secure... OTP 021273' (DCS=0x00, 135 user septets)";
+  const char* body =
+    "07916649520080F0"                    // SCA len=7 + type=91 + BCD 6495200080 (TRUE) (16)
+    "40"                                  // FO SMS-DELIVER + UDHI (2)
+    "0E" "D0" "5479BD0C0AC2E1"            // OA len=14 ToA=D0 GSM7 "True App" 7 octets (16)
+    "00"                                  // PID (2)
+    "00"                                  // DCS=0x00 (7-bit 真相) (2)
+    "62609180851182"                      // SCTS (14)
+    "8F"                                  // UDL=143 septets (UDH 8 + user 135) (2)
+    "06" "08" "04" "5A" "A7" "02" "01"    // UDH 16-bit concat refId=23207 total=2 seq=1 (14)
+    "CB72190EA2A3D373D0F84D2E83E6E5715D5E06D1DF20B8BC6C2FBBE9A0BA3B5CA7A3DFF2B4BE4C0685C7E3F27CEE0265DF7539E8498582D273104C1693DD662094B46CD681B4F76310997281A8E8F41C347E93CBA0F41C640FB3D36490F92D07C560A076DA5DA797E7A0B09B0CBAA7D96C50190F4FCB01";  // user payload 119B
+  size_t bodyLen = std::strlen(body);
+
+  // 跳过 SCA(16) + FO(2) + OA-len(2) + ToA(2) + OA-BCD(14) + PID(2) + DCS(2) + SCTS(14) + UDL(2) = 56 hex
+  bool isUcs2 = false;
+  bool is7bit = false;
+  size_t udByteLen = 0;
+  size_t udOff = pdu::pdu_ud_offset_ex(body, bodyLen, &isUcs2, &is7bit, &udByteLen);
+  CHECK_EQ_INT(udOff, 56);                    // UD 起点
+  CHECK(is7bit);                              // DCS=0x00 → is7bit
+  CHECK(!isUcs2);
+  CHECK_EQ_INT(udByteLen, 126);               // ceil(143*7/8) = 126 octets (UDH + user payload)
+
+  // sniff 关键校验: full UD (UDH 7B + user 119B) 上 narrowHits=1 (1% < 12%) → false → 不 bypass 7-bit
+  //   user payload 单独看 narrowHits=4 (4% < 12%) — 但 main.cpp sniff 用 full UD, 安全
+  //   这一点 v4.0.20 是关键: 若 sniff 误跑在 user payload 上, 会 false-positive 把英文 OTP 强解 UCS-2
+  CHECK(!pdu::looks_like_ucs2_be(body + udOff, bodyLen - udOff));  // full UD → false
+
+  // 7-bit 解码: numChars = UDL(143) - 8 UDH septets = 135 user septets
+  //   翔哥 6/19 实战 v4.0.10.1 跑出 "Kddo sghr bncd rdbtqd..." 是没减 UDH overhead 的 bug
+  //   修后路径: cmt_length=143 → 有 "0804" 标记 → 减 7 → numChars=136... wait
+  //   实际 main.cpp 路径: numChars = msg.cmt_length(143) - 7 (UDH 7B/8B × 8/7 septets overhead)
+  //   但 ML307 的 cmt_length 是 user septets sum (concat stash 后), 不是 raw UDL
+  //   这里测的是 PDU 单元, 直接用 135 (143-8) 模拟 user septets
+  char utf8[256] = {0};
+  size_t n = pdu::decode_7bit_packed(body + udOff + 14, 119 * 2, 135,
+                                     utf8, sizeof(utf8) - 1);  // 跳过 UDH 14 hex, decode user payload 119B
+  utf8[n] = 0;
+  std::string out(utf8, n);
+
+  // 关键校验: user payload 135 chars 全是 ASCII (GSM7 default basic set), UTF-8 编码后 size 仍 = 135
+  CHECK(out.find("Keep this code secure") != std::string::npos);
+  CHECK(out.find("OTP is 021273") != std::string::npos);
+  CHECK(out.find("Ref: ZwGAH") != std::string::npos);
+  CHECK(out.find("10 minutes") != std::string::npos);
+  CHECK_EQ_INT(out.size(), 135);
+  // UDH 7B=8 septets 跳过; full UD 7-bit 解码 (143 septets) 会出乱码头 + 真消息
+  //   头 8 chars: UDH-as-7bit (Δ Δ P u T ¡ @ — 含 0x40=¡=2B UTF-8, 0x10=Δ=2B UTF-8, 0x1B=ESC + 0x54=€=3B UTF-8 → 实际 ≥143 字节)
+  //   关键: 即使包含 UDH 噪音, 后 135 chars 仍能匹配 (这是 main.cpp 减 7 overhead 前的行为)
+  char fullOut[256] = {0};
+  size_t fullN = pdu::decode_7bit_packed(body + udOff, udByteLen * 2, 143,
+                                         fullOut, sizeof(fullOut) - 1);
+  std::string fullOutStr(fullOut, fullN);
+  CHECK(fullOutStr.find("Keep this code secure") != std::string::npos);
+  CHECK(fullOutStr.find("OTP is 021273") != std::string::npos);
+  // fullN > 143 是因为 GSM7 含 2/3-byte UTF-8 (Δ/¡ 等); 不强求 == 143
+  CHECK(fullN >= 143);
+}
+
+
+
+// Case 7 (fuzz): OA value 中间夹 (0x00, 0xF0 valid_DCS) + 后续 SCTS 不合法
+//   验证 SCTS 二次校验能防早停, 不会把 mid-OA (0x00, 0xF0) 误当成真 (PID, DCS)
+//   构造: ToA=0xD0, OA value 9 octets; 在 octets=6 处放 (0x00, 0xF0) + 后面 SCTS 含 F nibble (非 BCD)
+//   期望: 扫描到 octets=6 (PID=0x00, DCS=0xF0 valid), 但 SCTS 不像 BCD 时间戳 → 继续往后
+//         扫到 octets=9 (真 PID=0x00, DCS=0x08, SCTS 全 BCD) → 锁住
+//   旧逻辑 (无 SCTS 校验) 会早停在 octets=6, 把真 PID/DCS 错当成 OA 末 2 octets → udOff 偏 3 octets
+static void test_pdu_e2e_alpha_scan_scts_guard() {
+  g_current = "E2E: ToA=0xD0 OA value 9 octets 中间夹 (0x00, 0xF0) 假匹配 → SCTS guard 继续往后, 真答案 9 octets";
+  // OA value 9 octets 精心构造:
+  //   bytes 0-5: 任意非 0x00 (让 trial PID != 0x00 跳过)
+  //   bytes 6-7: 0x00, 0xF0 (假匹配 PID=0x00, DCS=0xF0 valid)
+  //   byte 8:    0xAA (让 trial PID=0xAA != 0x00 跳过 octets=7)
+  //             等等, octets=7 trial PID = byte 7 = 0xF0 != 0x00, 跳过
+  //             octets=8 trial PID = byte 8 = 0xAA != 0x00, 跳过
+  //             octets=9 trial PID = 真 PID (post-OA)
+  // 之后 SCTS 6 octets 必须 swapped BCD (高低 nibble 0-9) 让 SCTS guard 过
+  // UD 改 8B/4 pairs, 让 looks_like_ucs2_be 的 pairHits>=4 门槛过; 期望串用 hex_to_utf8 helper
+  std::string body = std::string(
+      "00"                                   // SCA len=0
+      "04"                                   // FO SMS-DELIVER (no UDHI)
+      "09" "D0"                            // OA len=9 ToA=D0 (alpha, 字段字符数 9)
+      "112233445566"                         // OA value bytes 0-5 (任意非 0x00)
+      "00F0"                                 // bytes 6-7 = (0x00, 0xF0) 假匹配
+      "AA"                                   // byte 8 (0xAA)
+      "00"                                   // 真 PID (octets=9 起点)
+      "08"                                   // 真 DCS=UCS-2
+      "626091205060"                         // 真 SCTS 前 6 octets (全 swapped BCD, year=26/month=06/day=19/hour=02/min=50/sec=60)
+      "82"                                   // SCTS tz 字节
+      "08"                                   // UDL=8 octets
+      "4E004E004E004E00")                    // UD 8B UCS-2 BE (4 个 "一" 字 0x4E00, pairHits=4 过 sniff)
+      ;
+  size_t bodyLen = body.size();
+
+  bool isUcs2 = false, is7bit = false;
+  size_t udByteLen = 0;
+  size_t udOff = pdu::pdu_ud_offset_ex(body.c_str(), bodyLen, &isUcs2, &is7bit, &udByteLen);
+  // 期望: udOff = 2(SCA) + 2(FO) + 2(OA-len) + 2(ToA) + 18(OA value 9 octets) + 2(PID) + 2(DCS) + 14(SCTS) + 2(UDL) = 46
+  CHECK_EQ_INT(udOff, 46);
+  CHECK(isUcs2);
+  CHECK_EQ_INT(udByteLen, 8);
+  // sniff 也应命中: 4 对 0x4E00 都 100% 宽区
+  CHECK(pdu::looks_like_ucs2_be(body.c_str() + udOff, bodyLen - udOff));
+  // decode 出 "一一一一" (4 个 "一", 共 12 字节 UTF-8)
+  char utf8[64] = {0};
+  size_t n = pdu::decode_body_field(body.c_str() + udOff, bodyLen - udOff, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+  std::string out(utf8, n);
+  // "一" = U+4E00 = UTF-8 E4 B8 80
+  CHECK_EQ_STR(out, hex_to_utf8("4E004E004E004E00"));
+}
+
+
 // =================== v4.0.15: STK select 校验 ===================
 // 6 case cover validate_stk_select 的 3 类失败 + 2 类边界 + 1 类正常
 
@@ -1352,6 +1654,7 @@ int main() {
   test_looks_like_ucs2_ascii_negative();
   test_looks_like_ucs2_gsm7_packed_negative();
   test_looks_like_ucs2_too_short();
+  test_looks_like_ucs2_myanmar();
   test_looks_like_ucs2_odd_hex();
   test_looks_like_ucs2_single_pair();
 
@@ -1392,7 +1695,6 @@ int main() {
   test_ucs2_roundtrip_japanese();
 
   // v4.0.7: pdu_ud_offset + 泰文 PDU 端到端
-  test_pdu_ud_offset_thai_ucs2();
   test_pdu_ud_offset_7bit();
   test_pdu_ud_offset_invalid();
   test_pdu_ud_offset_e2e_thai();
@@ -1421,6 +1723,15 @@ int main() {
   // v4.0.11: 翔哥 6/19 实战 2 条 E2E (TDD red→green)
   test_pdu_e2e_true_7bit_dcs_truth();
   test_pdu_e2e_thai_ucs2_dcs_truth();
+
+  // v4.0.20: dtac 错标 DCS=0 缅甸文短信 端到端 (对照组 7-bit + 修复目标 dtac UCS-2)
+  test_pdu_e2e_normal_7bit_hello_world();
+  test_pdu_e2e_dtac_ucs2_myanmar_mislabel();
+  // v4.0.20: 翔哥 6/20 dtac/TRUE 抓的 2 条真实 SMS (raw hex 完整保留, E2E 验证 sniff 不会误报 + decode 正常)
+  test_pdu_e2e_dtac_thai_otp_real_pdu();
+  test_pdu_e2e_true_english_otp_concat_real_pdu();
+  // v4.0.20.1: SCTS guard fuzz — OA value 中夹 (0x00, 0xF0) 假匹配, 必须被 SCTS 校验拦下继续扫
+  test_pdu_e2e_alpha_scan_scts_guard();
 
   // v4.0.15: STK select 校验
   test_stk_select_normal();

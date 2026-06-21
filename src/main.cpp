@@ -1823,17 +1823,22 @@ static void sms_task(void* /*param*/) {
       // v4.0.11: DCS 真相在 TPDU DCS byte (不信 +CMT 头 dcs 字段 — ML307 quirk 经常填错)
       //          pdu_ud_offset_ex 内部从 TPDU 读 DCS byte + reserved 时 sniff UD bytes
       bool is7bit = false, isUcs2 = false;
-      size_t udHexOff = 0, udBytes = 0, udHexLen = 0;
+      size_t udHexOff = 0, udBytes = 0, udHexLen = 0, udFullHexLen = 0;
       if (bodyHexLen >= 4) {
         udHexOff = pdu::pdu_ud_offset_ex(msg.body_hex, bodyHexLen, &isUcs2, &is7bit, &udBytes);
       }
       if (udHexOff > 0 && udHexOff + udBytes * 2 <= bodyHexLen) {
         udHexLen = udBytes * 2;
+        // v4.0.20.2 fix: sniff 应该看 full UD (剩余 PDU hex), 不用 udBytes*2
+        //   udBytes 走 7-bit 公式 (UDL*7/8), 但 DCS=0 + 实际 UCS-2 时 udBytes 偏小
+        //   → sniff 在截短窗口上漏判末尾窄区字符, 缅甸文/印地文等混排会失败
+        udFullHexLen = bodyHexLen - udHexOff;
       } else {
         // PDU 格式错 / 太短 → 兜底用全 body 当 UD (跟之前行为对齐, 不退化)
         udHexOff = 0;
         udBytes = bodyBytes;
         udHexLen = bodyHexLen;
+        udFullHexLen = bodyHexLen;
       }
       const char* udHex = msg.body_hex + udHexOff;
       // is7bit / isUcs2 已从 TPDU 真相 DCS 判定 (concat/partial path 无 PDU header → 全 false)
@@ -1842,7 +1847,7 @@ static void sms_task(void* /*param*/) {
       //   真单条 SMS + reserved DCS (0x0C-0x0F / 0xFF 等) 也走这里 sniff
       if (!is7bit && !isUcs2) {
         // 兜底: 既不是 7-bit 也不是 UCS-2 → sniff
-        if (pdu::looks_like_ucs2_be(udHex, udHexLen)) {
+        if (pdu::looks_like_ucs2_be(udHex, udFullHexLen)) {
           isUcs2 = true;
           is8bitData = false;
         } else if (msg.cmt_length > 0 && udBytes > 0) {
@@ -1866,7 +1871,7 @@ static void sms_task(void* /*param*/) {
       // 兜底 2: 即使 DCS 标 7-bit (含 DCS=0), raw body 若呈 UCS-2 BE 模式 → 强制走 UCS-2
       //   is_strict_utf8 兜底不靠谱 (GSM7 扩展字符 è/ø/Å/ò 都是合法 2-byte UTF-8)
       //   提前 sniff 避免跑 7-bit decode 浪费 + 防乱码推送
-      if (is7bit && pdu::looks_like_ucs2_be(udHex, udHexLen)) {
+      if (is7bit && pdu::looks_like_ucs2_be(udHex, udFullHexLen)) {
         ESP_LOGW(TAG, "SMS: raw body UCS-2 BE pattern, bypass 7-bit decode (dcs=%u cmt_len=%u udBytes=%u)",
                  msg.dcs, msg.cmt_length, (unsigned)udBytes);
         is7bit = false;
@@ -1887,7 +1892,7 @@ static void sms_task(void* /*param*/) {
           }
         }
         if (numChars == 0) numChars = (udBytes * 8) / 7;
-        bodyN = pdu::decode_7bit_packed(udHex, udHexLen, numChars,
+        bodyN = pdu::decode_7bit_packed(udHex, udFullHexLen, numChars,
                                         bodyBuf, sizeof(bodyBuf));
         ESP_LOGI(TAG, "SMS: 7-bit decode (dcs=%u cmt_len=%u udBytes=%u → numChars=%u bodyN=%u)",
                  msg.dcs, msg.cmt_length, (unsigned)udBytes, (unsigned)numChars, (unsigned)bodyN);
@@ -1896,7 +1901,7 @@ static void sms_task(void* /*param*/) {
         // (含 lone continuation / 4+ byte sequence) → fallback UCS-2
         if (bodyN > 0 && !pdu::is_strict_utf8(bodyBuf, bodyN)) {
           ESP_LOGW(TAG, "SMS: 7-bit decode not strict UTF-8, fallback UCS-2");
-          bodyN = pdu::decode_body_field(udHex, udHexLen, bodyBuf, sizeof(bodyBuf));
+          bodyN = pdu::decode_body_field(udHex, udFullHexLen, bodyBuf, sizeof(bodyBuf));
           is7bit = false;
         }
       } else if (is8bitData) {
@@ -1915,7 +1920,7 @@ static void sms_task(void* /*param*/) {
           bodyBuf[bodyN++] = (char)((v(h0) << 4) | v(h1));
         }
       } else {
-        bodyN = pdu::decode_body_field(udHex, udHexLen, bodyBuf, sizeof(bodyBuf));
+        bodyN = pdu::decode_body_field(udHex, udFullHexLen, bodyBuf, sizeof(bodyBuf));
       }
       String phoneUtf8(phoneBuf, phoneN);
       String bodyUtf8(bodyBuf, bodyN);

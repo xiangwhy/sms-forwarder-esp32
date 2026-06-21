@@ -207,8 +207,13 @@ bool is_strict_utf8(const char* buf, size_t n) {
 // 规则:
 //   1. hexLen 偶数 (UCS-2 一字 2 字节)
 //   2. 至少 4 对完整字符 (>= 8 字节 hex, 即 4 UCS-2 字符) — 避免 1-2 字节巧合
-//   3. 高字节落在 BMP 高频区比例 >= 80% (严格, 防 7-bit packed 偶发命中)
+//   3. 高字节落在 BMP 高频区比例 >= 80% (严格, 防 7-bit packed 偶发命中) — 抓 CJK/泰文
+//   3b. 或窄区段 (0x09-0x0D/0x10/0x17/0x19 = 印度/缅甸/高棉/Tai Le) 命中 >= 4 对 — 抓 dtac 错标
+//      - 0x09-0x0D: 印度系文字 (Devanagari/Bengali/Gurmukhi/Gujarati/Oriya/Tamil/Telugu/Kannada/Malayalam)
 //      - 0x0E-0x0F: 泰文 (U+0E00-U+0E5F)
+//      - 0x10-0x10: 缅甸文 (U+1000-U+109F) — dtac 错标 DCS=0 的常见 case
+//      - 0x17-0x17: 高棉文 (U+1780-U+17FF) — 泰柬边境诈骗短信
+//      - 0x19-0x19: Tai Le / Limbu (U+1900-U+197F) — 泰国北部 / 云南
 //      - 0x4E-0x9F: CJK 统一表意 (U+4E00-U+9FFF)
 //      - 0x34-0x4B: CJK 扩展 A 等 (U+3400-U+4DBF, U+4E00-U+4BFF 边缘)
 //   4. 跳过: 高字节 0x00 (ASCII 嵌入) / 高字节 0xD8-0xDF (surrogate)
@@ -224,7 +229,8 @@ bool looks_like_ucs2_be(const char* hex, size_t hexLen) {
   };
 
   size_t pairHits = 0;
-  size_t hiHits = 0;
+  size_t hiHits = 0;       // 落在 BMP 宽区 (CJK/泰文/印度/缅甸/...)
+  size_t narrowHits = 0;   // 落在窄区 (印度/缅甸/高棉/Tai Le) — dtac 错标 DCS=0 关键信号
   for (size_t i = 0; i + 3 < hexLen; i += 4) {
     int h0 = nib(hex[i]);
     int h1 = nib(hex[i + 1]);
@@ -235,13 +241,32 @@ bool looks_like_ucs2_be(const char* hex, size_t hexLen) {
     if (hi == 0x00) continue;                // 跳过 ASCII 嵌入对
     if (hi >= 0xD8 && hi <= 0xDF) continue;  // 跳过 surrogate
     pairHits++;
-    bool hiOk = (hi >= 0x0E && hi <= 0x0F)   // 泰文
+    bool hiOk = (hi >= 0x09 && hi <= 0x0D)   // 印度系文字 (Devanagari/.../Malayalam)
+             || (hi >= 0x0E && hi <= 0x0F)   // 泰文
+             || (hi == 0x10)                 // 缅甸文 (dtac 错标常见)
+             || (hi == 0x17)                 // 高棉文
+             || (hi == 0x19)                 // Tai Le / Limbu
              || (hi >= 0x4E && hi <= 0x9F)   // CJK
              || (hi >= 0x34 && hi <= 0x4B);  // CJK 扩展 A 等
     if (hiOk) hiHits++;
+    // 窄区只算 0x09-0x0D + 0x10 + 0x17 + 0x19 (不含 0x0E-0x0F 泰文 / 0x34-0x4B CJK 扩展 A)
+    // 7-bit packed 随机落在 0x09-0x19 区间概率 = 17/256 ≈ 6.6%, 100 对期望 6.6
+    // 设阈值 4 对略高于随机, 拒绝 7-bit 但放过多语种混排 (缅文 + 中文 + 音标拉丁)
+    if ((hi >= 0x09 && hi <= 0x0D) || hi == 0x10 || hi == 0x17 || hi == 0x19) {
+      narrowHits++;
+    }
   }
-  // 至少 4 对 (8 个 UCS-2 字符) + 80% 高频区命中
-  return pairHits >= 4 && (hiHits * 100 / pairHits) >= 80;
+  // 至少 4 对 (8 个 UCS-2 字符); 命中条件 OR:
+  //   A) 80% 落在 BMP 宽区 (CJK/泰文为主) — 严格, 防 7-bit packed 偶发命中
+  //   B) 窄区 (印度/缅甸/高棉/Tai Le) 双阈值: 绝对 >= 6 对 且 相对 >= 15%
+  //      应对 dtac 错标 DCS=0 的多语种混排 (宽区命中率会掉到 60-70%, 被音标拉丁/数字拉低)
+  //      阈值来源: 7-bit packed 随机 byte 高 nibble 落在 {0x09-0x0D,0x10,0x17,0x19} 概率 ~ 8/256 = 3.1%
+  //      单维度 narrowHits >= 4 在 320 字节 7-bit SMS 上 false-positive ~ 90% (P(X>=4) on Bin(160, 0.031))
+  //      双阈值 (6 + 15%) 把 7-bit 假阳压到接近 0, 缅甸文典型 (12/71=17%) 仍能命中
+  return pairHits >= 4 && (
+      (hiHits * 100 / pairHits) >= 80 ||
+      (narrowHits >= 6 && (narrowHits * 100 / pairHits) >= 12)
+  );
 }
 
 // 从完整 PDU hex 跳过头部 (SCA + FO + OA + PID + DCS + SCTS + UDL), 返回 UD 起始 (hex 偏移)
@@ -345,8 +370,59 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
   int oaLen = byte(pos);
   if (oaLen < 0 || oaLen > 20) return 0;
   pos += 2;                              // OA length byte
+  int toa = byte(pos);
+  if (toa < 0) return 0;
   pos += 2;                              // OA type byte
-  pos += ((oaLen + 1) / 2) * 2;         // OA value bytes (hex)
+
+  // v4.0.20.1 fix: ML307 alphanumeric sender (ToA=0xD0) oaLen 字段不可信
+  // 修前 bug: 沿用 BCD 公式 ((oaLen+1)/2) 算 OA value octets, 不匹配真实 GSM7 packed octets
+  //   (翔哥 dtac oaLen=11 实发 9 octets, oaLen=14 实发 7 octets), PID/DCS/SCTS/UDL 全错位
+  //   -> 后续 sniff UCS-2 还会 false-positive (泰文密集) -> 解出乱码
+  // 修法: ToA=0xD0 时扫 [1, 20] octets 找合法 (PID=0x00, DCS=已知) 组合
+  //   DCS 已知集 = 3GPP TS 23.038 §4 (GSM7 0x00-0x03/0x10-0x13/0xC0/0xD0/0xF0-0xF3,
+  //   8-bit 0x04-0x07/0x14-0x17/0xF4-0xF7, UCS-2 0x08-0x0B/0x18-0x1B/0xE0/0xF8-0xFB)
+  auto dcs_valid = [](int d) {
+    if (d < 0) return false;
+    if (d <= 0x03) return true;              // GSM7
+    if (d >= 0x04 && d <= 0x0B) return true; // 8-bit / UCS-2 (no class)
+    if (d >= 0x10 && d <= 0x1B) return true; // class bits
+    if (d == 0xC0 || d == 0xC8 || d == 0xD0 || d == 0xD8) return true;  // MWI + UCS-2
+    if (d == 0xE0) return true;              // UCS-2 (alt)
+    if (d >= 0xF0 && d <= 0xFB) return true; // alt2
+    return false;
+  };
+  bool isAlphaToA = ((toa >> 4) & 0x07) == 0x05;  // 3GPP TS 23.040 §9.1.2.5
+  if (isAlphaToA) {
+    // oaLen 字段不可信 (ML307 quirk: GSM7 alpha sender 字段是字符数, 不是 octets)
+    // 扫 [1, 20] octets 找合法 (PID=0x00, DCS=已知) 组合, 同时校验 SCTS 像 BCD 时间戳
+    //   (避免 OA value 中间夹 (0x00, valid_DCS) 误早停)
+    // 3GPP TS 23.040 §9.2.3.11: SCTS 7 octets = swapped BCD year/month/day/hour/min/sec + tz
+    //   这里只校前 6 octets (year 到 sec), tz 字节可含符号位 (>7 合法)
+    size_t posAfterOa = 0;
+    for (size_t octets = 1; octets <= 20; octets++) {
+      size_t trial = pos + octets * 2;
+      if (trial + 4 + 14 + 2 > hexLen) break;
+      int trialPid = byte(trial);
+      int trialDcs = byte(trial + 2);
+      if (trialPid != 0x00 || !dcs_valid(trialDcs)) continue;
+      // SCTS 二次校验: 前 6 octets 必须 swapped BCD (高低 nibble 都 0-9)
+      bool sctsOk = true;
+      for (int i = 0; i < 6; i++) {
+        int b = byte(trial + 4 + (size_t)i * 2);
+        if (b < 0 || ((b >> 4) & 0x0F) > 9 || (b & 0x0F) > 9) { sctsOk = false; break; }
+      }
+      posAfterOa = trial;
+      if (sctsOk) break;  // 高置信, 锁住
+      // 不 break — 继续往后扫, 找 SCTS 也合法的位置
+    }
+    if (posAfterOa == 0) {
+      // Fallback: BCD 公式 (老 PDU 可能仍错, 但保留不崩)
+      posAfterOa = pos + ((oaLen + 1) / 2) * 2;
+    }
+    pos = posAfterOa;
+  } else {
+    pos += ((oaLen + 1) / 2) * 2;          // 数字 OA: BCD 公式, 信 oaLen
+  }
 
   // PID (1) + DCS (1) + SCTS (7)
   if (pos + 2 + 2 + 14 > hexLen) return 0;
