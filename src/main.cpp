@@ -74,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.21.1"   // v4.0.21.1: fix /api/recent body 含 raw 控制字符 (dtac 乱码产物) → JSON.parse SyntaxError → loadRecent catch → "加载失败"。sanitizeForJson helper, 保留 printable + tab, 其余 → 空格 / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽 / v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.22"     // v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)。main.cpp:1847-1859 udHexOff>0 直接信任 + cap udBytes 到 available, 不再 fallback udHexOff=0 全 body decode (SCA 字节污染 UCS-2 乱码)。UDH-aware + BCD fallback 修推 v4.0.23。3 fixture 跟 fix 一起 commit / v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽 / v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
@@ -1844,14 +1844,23 @@ static void sms_task(void* /*param*/) {
       if (bodyHexLen >= 4) {
         udHexOff = pdu::pdu_ud_offset_ex(msg.body_hex, bodyHexLen, &isUcs2, &is7bit, &udBytes);
       }
-      if (udHexOff > 0 && udHexOff + udBytes * 2 <= bodyHexLen) {
+      // v4.0.22: pdu_ud_offset_ex 算对 udOff 就信它, 别 safety check 拒绝
+      //   修前 bug: 'udHexOff + udBytes*2 <= bodyHexLen' 跟 pdu_ud_offset_ex 矛盾
+      //   强制 fallback udHexOff=0 全 body decode → SCA bytes 当 UCS-2 codepoint 输出乱码
+      //   真实场景: ML307 quirk UDL 填错 / 网络截短 → bodyLen < udOff + udBytes*2
+      //   修法: udHexOff>0 信任, cap udBytes 到 (bodyHexLen-udHexOff)/2 防越界, truncate log warn
+      if (udHexOff > 0) {
+        size_t availBytes = (bodyHexLen - udHexOff) / 2;
+        if (udBytes > availBytes) {
+          ESP_LOGW(TAG, "SMS: UD truncated by %u bytes (UDL=%u bodyAvail=%u)",
+                   (unsigned)(udBytes - availBytes), (unsigned)udBytes, (unsigned)availBytes);
+          udBytes = availBytes;  // cap, 防 read-past-end
+        }
         udHexLen = udBytes * 2;
-        // v4.0.20.2 fix: sniff 应该看 full UD (剩余 PDU hex), 不用 udBytes*2
-        //   udBytes 走 7-bit 公式 (UDL*7/8), 但 DCS=0 + 实际 UCS-2 时 udBytes 偏小
-        //   → sniff 在截短窗口上漏判末尾窄区字符, 缅甸文/印地文等混排会失败
+        // sniff 仍看 full UD (剩余 PDU hex), 跟 v4.0.20.2 fix 一致
         udFullHexLen = bodyHexLen - udHexOff;
       } else {
-        // PDU 格式错 / 太短 → 兜底用全 body 当 UD (跟之前行为对齐, 不退化)
+        // pdu_ud_offset_ex 真算不出 udOff (PDU 格式错 / 太短) → 兜底全 body decode (跟 v4.0.21.1 行为一致)
         udHexOff = 0;
         udBytes = bodyBytes;
         udHexLen = bodyHexLen;
