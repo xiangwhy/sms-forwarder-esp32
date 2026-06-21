@@ -258,11 +258,13 @@ bool looks_like_ucs2_be(const char* hex, size_t hexLen) {
   }
   // 至少 4 对 (8 个 UCS-2 字符); 命中条件 OR:
   //   A) 80% 落在 BMP 宽区 (CJK/泰文为主) — 严格, 防 7-bit packed 偶发命中
-  //   B) 窄区 (印度/缅甸/高棉/Tai Le) 双阈值: 绝对 >= 6 对 且 相对 >= 15%
+  //   B) 窄区 (印度/缅甸/高棉/Tai Le) 双阈值: 绝对 >= 6 对 且 相对 >= 12%
   //      应对 dtac 错标 DCS=0 的多语种混排 (宽区命中率会掉到 60-70%, 被音标拉丁/数字拉低)
-  //      阈值来源: 7-bit packed 随机 byte 高 nibble 落在 {0x09-0x0D,0x10,0x17,0x19} 概率 ~ 8/256 = 3.1%
-  //      单维度 narrowHits >= 4 在 320 字节 7-bit SMS 上 false-positive ~ 90% (P(X>=4) on Bin(160, 0.031))
-  //      双阈值 (6 + 15%) 把 7-bit 假阳压到接近 0, 缅甸文典型 (12/71=17%) 仍能命中
+  //      阈值来源: 7-bit packed byte 范围 0-0x7F, 落在 {0x09-0x0D,0x10,0x17,0x19} = 8/128 = 6.25%
+  //        Bin(160, 0.0625) 期望 10, P(X>=6) ≈ 80%, 单靠 6 绝对阈值放过多
+  //        12% 比例阈值是主防线 (7-bit 期望 6.25% < 12% 门槛, 假阳被压到接近 0)
+  //        6 绝对阈值是辅助 (排除 pairHits 巨大但比例低的 7-bit 巧合)
+  //        缅甸文典型 (12/71=17%) 仍能命中
   return pairHits >= 4 && (
       (hiHits * 100 / pairHits) >= 80 ||
       (narrowHits >= 6 && (narrowHits * 100 / pairHits) >= 12)
@@ -399,6 +401,7 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
     // 3GPP TS 23.040 §9.2.3.11: SCTS 7 octets = swapped BCD year/month/day/hour/min/sec + tz
     //   这里只校前 6 octets (year 到 sec), tz 字节可含符号位 (>7 合法)
     size_t posAfterOa = 0;
+    bool sctsFound = false;             // v4.0.20.3 fix: 区分 PID/DCS 命中 vs SCTS 命中, fallback 更准
     for (size_t octets = 1; octets <= 20; octets++) {
       size_t trial = pos + octets * 2;
       if (trial + 4 + 14 + 2 > hexLen) break;
@@ -412,11 +415,18 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
         if (b < 0 || ((b >> 4) & 0x0F) > 9 || (b & 0x0F) > 9) { sctsOk = false; break; }
       }
       posAfterOa = trial;
-      if (sctsOk) break;  // 高置信, 锁住
+      if (sctsOk) {
+        sctsFound = true;
+        break;                          // 高置信, 锁住
+      }
       // 不 break — 继续往后扫, 找 SCTS 也合法的位置
     }
     if (posAfterOa == 0) {
-      // Fallback: BCD 公式 (老 PDU 可能仍错, 但保留不崩)
+      // 1-20 octets 全无 (PID=0x00, DCS valid) → hex 太短 / 字段解析错, fallback BCD 公式
+      posAfterOa = pos + ((oaLen + 1) / 2) * 2;
+    } else if (!sctsFound) {
+      // 1-20 octets 全 (PID=0, DCS valid) 但 SCTS 全不 OK → 不信 trial (20 octets 也会错位)
+      //   fallback 老 BCD 公式, 错位概率比 20 octets trial 错位小 (老 PDU alpha sender 字段较准)
       posAfterOa = pos + ((oaLen + 1) / 2) * 2;
     }
     pos = posAfterOa;
