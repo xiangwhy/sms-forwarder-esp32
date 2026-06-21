@@ -746,7 +746,7 @@ static void csq_poll_task(void* /*param*/) {
 typedef struct {
   uint32_t ms;     // boot millis (与 uptime 对齐)
   char     phone[24];
-  char     body[160];
+  char     body[512];   // v4.0.21: 160→512, 容纳 5 段 concat SMS (5*153=765 UCS-2 chars UTF-8 编码后可达 2.3KB, 但实际 concat 7-bit/8-bit 153 bytes/段, 5 段拼接 765 字符, 512 字节够 4 段多; 内存 +11KB, RX_LOG_CAP=32 → 16KB total, RAM 够)
 } RxLogEntry;
 static RxLogEntry g_rxLog[RX_LOG_CAP] = {{0}};
 static volatile uint16_t g_rxLogHead  = 0;

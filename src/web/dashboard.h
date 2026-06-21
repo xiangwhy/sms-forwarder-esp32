@@ -78,7 +78,7 @@ header h1 .dot.bad{background:var(--err)}
 .history li:last-child{border-bottom:0}
 .history .ts{color:var(--muted)}
 .history .ph{color:var(--info)}
-.history .bd{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.history .bd{color:var(--text);white-space:pre-wrap;word-break:break-word;max-width:60ch;line-height:1.4}  /* v4.0.21: 取消 60 字符预览截断, 改 word-wrap + max-width 60ch (~480px) 让长短信可看全, 多行 li 自动撑高 */
 .history .st.ok{color:var(--accent)}
 .history .st.bad{color:var(--err)}
 .history .empty{text-align:center;color:var(--muted);padding:24px;grid-column:1/-1}
@@ -308,9 +308,10 @@ async function loadRecent(){
     const isNew = _recentHash && newHash !== _recentHash;
     ul.innerHTML = j.items.map((it, i) => {
       const ago = agoShort(it.ageMs);
-      const preview = it.body.length > 60 ? it.body.slice(0,60)+'…' : it.body;
       const flashCls = (isNew && i === 0) ? ' class="flash"' : '';
-      return `<li${flashCls}><span class="ts">${ago}</span><span class="ph">${escapeHtml(it.phone)}</span><span class="bd" title="${escapeHtml(it.body)}">${escapeHtml(preview)}</span></li>`;
+      // v4.0.21: 取消 60 字符预览截断, body 直接显示 + CSS word-wrap, 长短信看全
+      //   hover title 仍保留 full body (truncated 后 512B), 推送 pushplus 走 full body (line 1948)
+      return `<li${flashCls}><span class="ts">${ago}</span><span class="ph">${escapeHtml(it.phone)}</span><span class="bd" title="${escapeHtml(it.body)}">${escapeHtml(it.body)}</span></li>`;
     }).join('');
     _recentHash = newHash;
   } catch (e) {
