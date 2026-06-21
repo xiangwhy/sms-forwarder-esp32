@@ -74,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.20"     // v4.0.20: pdu_ud_offset_ex (ToA=0xD0 扫描 + SCTS 二次校验) + looks_like_ucs2_be 窄区双阈值 + sniff 用 udFullHexLen, dtac 缅甸文/泰文乱码 fix; v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽 / v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.21"     // v4.0.21: 主页最近接收 SMS 长短信完整显示 (RxLogEntry.body 160→512 + 取消 60 字符预览, CSS word-wrap); v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 + sniff udFullHexLen (dtac 缅甸文/泰文乱码 fix) / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽 / v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define NVS_QUEUE_LEN      32
