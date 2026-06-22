@@ -74,9 +74,10 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.22"     // v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)。main.cpp:1847-1859 udHexOff>0 直接信任 + cap udBytes 到 available, 不再 fallback udHexOff=0 全 body decode (SCA 字节污染 UCS-2 乱码)。UDH-aware + BCD fallback 修推 v4.0.23。3 fixture 跟 fix 一起 commit / v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽 / v4.0.13 STK SIM 卡 / v4.0.12 STK 控制台; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.23"     // 2026-06-22: 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
+#define PUSH_QUEUE_LEN     8   // 2026-06-22 保守优化: 16→8, 省 ~8.3KB; pushplus 推送慢, 8 缓冲够
 #define NVS_QUEUE_LEN      32
 #define AT_REPLY_BUF       512
 #define AT_LINE_BUF        512
@@ -93,7 +94,7 @@ static const char* TAG_USB = "USBH";
 
 // UDH 长短信
 #define MAX_UDH_REFS       4
-#define MAX_UDH_PARTS      8
+#define MAX_UDH_PARTS      4   // 2026-06-22 保守优化: 8→4, 省 ~8.4KB; >4 段长短信 silently drop (line 574 守卫)
 #define UDH_TIMEOUT_MS     60000
 
 // =================== 配置 ===================
@@ -742,11 +743,11 @@ static void csq_poll_task(void* /*param*/) {
  */
 // =================== 最近 SMS ring buffer (v4.0.7, dashboard 显示用, 与 STK 无关) ===================
 // 之前误放进下面 STK #if 0 块导致编译失败, 挪出来
-#define RX_LOG_CAP 32
+#define RX_LOG_CAP 16      // 2026-06-22 保守优化: 32→16, 省 ~8.6KB; dashboard 显示 16 条
 typedef struct {
   uint32_t ms;     // boot millis (与 uptime 对齐)
   char     phone[24];
-  char     body[512];   // v4.0.21: 160→512, 容纳 5 段 concat SMS (5*153=765 UCS-2 chars UTF-8 编码后可达 2.3KB, 但实际 concat 7-bit/8-bit 153 bytes/段, 5 段拼接 765 字符, 512 字节够 4 段多; 内存 +11KB, RX_LOG_CAP=32 → 16KB total, RAM 够)
+  char     body[320];   // 2026-06-22: 512→320; 153B raw * 2 hex = 306 chars, 320 够 1 段多
 } RxLogEntry;
 static RxLogEntry g_rxLog[RX_LOG_CAP] = {{0}};
 static volatile uint16_t g_rxLogHead  = 0;
@@ -829,7 +830,7 @@ static void tx_log_clear() {
 //   AT+STKTR 发送只在 stk_event_task 内, task 不跑 = 不发 = Proactive 暂停保持
 #if 1  // v4.0.11.12: 取消 STK 块 #if 0 (原 "STK Proactive 暂停 2026-06-19")
 
-#define STK_LOG_CAP 256
+#define STK_LOG_CAP 64     // 2026-06-22 保守优化: 256→64, 省 ~15.4KB (单点最大)
 #define STK_LOG_LEN 96
 typedef struct {
   uint32_t ms;
@@ -2924,7 +2925,7 @@ void setup() {
   g_atPrompt = xSemaphoreCreateBinary();
   g_cmgsJobDone = xSemaphoreCreateBinary();  // v4.0.11.10: 静态 done, 替原 xSemaphoreCreateBinary/delete 反复
   g_smsQ    = xQueueCreate(SMS_QUEUE_LEN, sizeof(SmsMsg));
-  g_pushQ   = xQueueCreate(SMS_QUEUE_LEN, sizeof(PushItem));
+  g_pushQ   = xQueueCreate(PUSH_QUEUE_LEN, sizeof(PushItem));
   g_urcQ    = xQueueCreate(16, URC_LINE_BUF);
   if (!g_atMutex || !g_atDone || !g_atPrompt || !g_cmgsJobDone || !g_smsQ || !g_pushQ || !g_urcQ) {
     ESP_LOGE(TAG, "FATAL: FreeRTOS primitive create failed");
@@ -3034,6 +3035,12 @@ void setup() {
   } else {
     ESP_LOGW(TAG, "WiFi not up, no boot notification");
   }
+
+  // 2026-06-22: heap 水位日志 — 监控 min_free, 提前预警 OOM
+  // 保守优化后预期 free 42K → 82K, min_free 在跑业务后会更低,持续观察
+  ESP_LOGW("MEM", "boot heap free=%u min_free=%u",
+    heap_caps_get_free_size(MALLOC_CAP_8BIT),
+    heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
 }
 
 void loop() {
