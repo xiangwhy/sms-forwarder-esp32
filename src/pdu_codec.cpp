@@ -340,10 +340,12 @@ size_t pdu_ud_offset(const char* hex, size_t hexLen, bool is7bit, size_t* outUdB
 // *outIsUcs2: caller 据此选 ucs2_hex_to_utf8 (UCS-2) / decode_7bit_packed (7-bit) / 原样 (8-bit)
 // *outIs7bit: DCS=0x00 才是真 7-bit; 其他按 8-bit/UCS-2 算 (octets=UDL)
 size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
-                       bool* outIsUcs2, bool* outIs7bit, size_t* outUdByteLen) {
+                       bool* outIsUcs2, bool* outIs7bit, size_t* outUdByteLen,
+                       bool* outUdhi) {
   if (outIsUcs2) *outIsUcs2 = false;
   if (outIs7bit) *outIs7bit = false;
   if (outUdByteLen) *outUdByteLen = 0;
+  if (outUdhi) *outUdhi = false;
   if (!hex || hexLen < 4) return 0;
 
   auto nib = [](char c) -> int {
@@ -365,7 +367,9 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
   size_t pos = 2 + (size_t)scaLen * 2;
 
   // FO
-  if (byte(pos) < 0) return 0;
+  int fo = byte(pos);
+  if (fo < 0) return 0;
+  bool udhi = (fo & 0x40) != 0;  // v4.0.24: UDHI bit 6, caller 据此决定是否调 pdu_udh_offset_ex
   pos += 2;
 
   // OA
@@ -465,6 +469,7 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
   if (outIs7bit) *outIs7bit = is7bit;
   if (outIsUcs2) *outIsUcs2 = isUcs2;
   if (outUdByteLen) *outUdByteLen = udByteLen;
+  if (outUdhi) *outUdhi = udhi;
 
   // 注: 不严格检查 UD 越界, 允许 truncated body (caller concat 测试 body 不一定填全 UD)
   // caller 据 outUdByteLen + hexLen 自行 decide UD 是否越界

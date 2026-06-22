@@ -65,9 +65,12 @@ size_t pdu_ud_offset(const char* hex, size_t hexLen, bool is7bit, size_t* outUdB
 //             caller 据此选 ucs2_hex_to_utf8 / decode_7bit_packed / 原样
 // *outIs7bit: DCS=0x00 才是真 7-bit; 其他按 8-bit/UCS-2 算 (octets=UDL)
 // *outUdByteLen: UD 字节数 (7-bit 按 ceil(UDL*7/8), 其他按 UDL)
+// *outUdhi: v4.0.24 fix — FO byte UDHI bit 6, caller 据此决定是否调 pdu_udh_offset_ex
+//           单条 SMS / stash 拼接后 body 第一字节是内容(泰文 0x0E→UDHL=14 误判), 只有 UDHI=1 才有真 UDH
 // 返回 0 = PDU 太短/格式错
 size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
-                       bool* outIsUcs2, bool* outIs7bit, size_t* outUdByteLen);
+                       bool* outIsUcs2, bool* outIs7bit, size_t* outUdByteLen,
+                       bool* outUdhi = nullptr);
 
 // 从完整 PDU 跳过 SCA+FO+OA+PID+DCS+SCTS+UDL+UDHL+UDH, 返回 UD 起点 (hex 偏移)
 // *outUdhByteLen: UDH 段总字节数 (UDHL byte 1 + IEs bytes = UDHL+1), 仅诊断用
