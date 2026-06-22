@@ -1699,6 +1699,37 @@ static void test_pdu_e2e_7bit_drop_body_not_strict_utf8() {
   CHECK(n == 0);
 }
 
+// Fixture F: v4.0.23 TDD red — UDL < UDH size → 丢 body (AOSP bufferLen<0 silent truncation 一致)
+//   DCS=0, FO UDHI=1, UDH 7 bytes (16-bit concat), UDL=5 (声明比 UDH 还小)
+//   v4.0.23: bufferLen<0 → 丢 body (AOSP 行为)
+//   v4.0.22 red: bufferLen=0 → decode 空 UD (0 bytes) → n=0 不 fail 但 v4.0.23 strict 显式 drop
+static void test_pdu_e2e_udl_lt_udh_drop_body() {
+  g_current = "E2E UDL<UDH size → body=\"\" (v4.0.23 strict-DCS drop, AOSP bufferLen<0)";
+  // DCS=0 7-bit, FO UDHI=1, UDH 7 bytes, UDL=5 (声明比 UDH 还小, ML307 quirk)
+  const char* body =
+    "07916649520080F0"  // SCA (8 bytes)
+    "40"                  // FO UDHI=1
+    "07"                  // oaLen=7
+    "91"                  // ToA=BCD
+    "8130793F"            // oaAddr (4 bytes)
+    "00"                  // PID
+    "00"                  // DCS=0 7-bit
+    "32153382890608"      // SCTS (7 bytes)
+    "05"                  // UDL=5 (< UDH size 7, 触发 bufferLen<0)
+    "050003BCB40301"      // UDH 7 bytes 16-bit concat
+    "C50038564800";       // UD 5 bytes (raw, 但 bufferLen<0 应全丢)
+  size_t bodyLen = std::strlen(body);
+
+  bool isUcs2 = false, is7bit = false;
+  char utf8[256] = {0};
+  size_t n = fixture_sniffer_decode(body, bodyLen, &isUcs2, &is7bit, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+
+  // v4.0.23 strict-DCS: bufferLen<0 → 丢 body (AOSP 行为, 显式 drop 标记)
+  // v4.0.22 red: 走 decode_body_field 即使 bufferLen<0 也尝试 → 输出可能非空 n>0 或 raw bytes, FAIL
+  CHECK(n == 0);
+}
+
 static void test_pdu_e2e_dtac_3seg_otp_5481_real_pdu() {
   g_current = "E2E dtac 3 段 concat OTP=5481 (refId=0xbcb4=48308) — 翔哥 boot #127 raw hex";
   // 翔哥 22:15 boot #127 dtac 3 段 concat 第 1 段原码 (188 hex = 94 bytes 简化版)
@@ -1975,6 +2006,8 @@ int main() {
   test_pdu_e2e_dtac_dcs255_drop_body();
   // v4.0.23 TDD red: 7-bit decode 不 strict UTF-8 → body="" (case 3)
   test_pdu_e2e_7bit_drop_body_not_strict_utf8();
+  // v4.0.23 TDD red: UDL<UDH size → body="" (case 4, AOSP bufferLen<0)
+  test_pdu_e2e_udl_lt_udh_drop_body();
   test_pdu_e2e_dtac_3seg_otp_5481_real_pdu();   // refId=0xbcb4=48308, OTP=5481, 3 段 concat
   test_pdu_e2e_dtac_1seg_otp_real_pdu();         // 单段 dtac OTP 短信
   test_pdu_e2e_dtac_concat_2seg_part1_real_pdu();// refId=0x5aa7=23207, total=2 seq=1, 第一段
