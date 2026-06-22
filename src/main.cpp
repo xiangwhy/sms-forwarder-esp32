@@ -74,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.23"     // 2026-06-22: 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.24"     // 2026-06-23: UCS-2/8-bit decode 路径 skip UDH concat IE 头 (main.cpp:1894 caller 加 pdu_udh_offset_ex, fix 翔哥 6/22 真机复现 dtacIR 9 段 concat 推送乱码 `Ԁλँ` prefix)/ v4.0.23 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define PUSH_QUEUE_LEN     8   // 2026-06-22 保守优化: 16→8, 省 ~8.3KB; pushplus 推送慢, 8 缓冲够
