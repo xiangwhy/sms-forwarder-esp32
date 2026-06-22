@@ -1639,7 +1639,8 @@ static size_t fixture_sniffer_decode(const char* body, size_t bodyLen,
 static void test_pdu_e2e_dtac_dcs255_drop_body() {
   g_current = "E2E dtac DCS=0xFF reserved (real DCS=0) → body=\"\" (v4.0.23 strict-DCS drop)";
   // 翔哥 boot #128 收到 1 条 dtac SMS, body 全 0x00/0xXX 异常字节 (Å=0xC5, V=0x56, 8=0x38, H=0x48, d=0x64...)
-  // 这是 [[dtac-gateway-anomaly]] 6/20 同源 case. 简化: SCA(8)+FO(1)+oaLen(1)+ToA(1)+oaAddr(4)+PID(1)+DCS(1)+SCTS(7)+UDL(1)+UD(?)=26 bytes=52 hex
+  // 这是 [[dtac-gateway-anomaly]] 6/20 同源 case. 简化 PDU = SCA(8)+FO(1)+oaLen(1)+ToA(1)+oaAddr(4)+PID(1)+DCS(1)+SCTS(7)+UDL(1)+UD(20) = 45 bytes = 90 hex
+  //   (注: 原 commit 注释 "26 bytes=52 hex" 算错, 实际 SCA 16 + FO 2 + oaLen 2 + ToA 2 + oaAddr 8 + PID 2 + DCS 2 + SCTS 14 + UDL 2 + UD 40 = 90 hex)
   const char* body =
     "07916649520080F0"  // SCA (8 bytes)
     "40"                  // FO UDHI=0 (1 byte)
@@ -1650,9 +1651,9 @@ static void test_pdu_e2e_dtac_dcs255_drop_body() {
     "FF"                  // DCS=0xFF reserved (TPDU 真相)
     "32153382890608"      // SCTS (7 bytes)
     "14"                  // UDL=20
-    "C50038560048006400"  // UD raw bytes 像 UCS-2 BE 异常 (ÅV8Hd)
-    "4100F800EC002100"    // UD raw bytes 续 (Aøì!)
-    "4300C60046003800";   // UD raw bytes 续 (CF8)
+    "C50038560048006400"  // UD bytes 1-10: 0xC5 0x00 0x38 0x56 0x00 0x48 0x00 0x64 0x00 0x00
+    "4100F800EC002100"    // UD bytes 11-20: 0x41 0x00 0xF8 0x00 0xEC 0x00 0x21 0x00 0x00 0x00
+    "4300C60046003800";   // UD bytes 21-30 (注: UDL=20 但 literal 30 bytes 多 10, v4.0.22 sniffer fallback 仍会跑)
   size_t bodyLen = std::strlen(body);
 
   bool isUcs2 = false, is7bit = false;
@@ -1673,9 +1674,11 @@ static void test_pdu_e2e_dtac_dcs255_drop_body() {
 static void test_pdu_e2e_7bit_drop_body_not_strict_utf8() {
   g_current = "E2E 7-bit decode not strict UTF-8 → body=\"\" (v4.0.23 strict-DCS drop)";
   // DCS=0 7-bit, raw UD bytes 高 septet 异常 (DTAC gateway 推错, [[dtac-gateway-anomaly]])
-  //   9 bytes PDU UD: 0xFF 0x10 0xFE 0x32 0x00 0x48 0x10 0xC5 0x56
-  //   7-bit decode: septetCount=10, numChars=cmt_length=10
-  //   packed decode → 含 lone continuation / overlong sequence → 不 strict UTF-8
+  //   9 bytes PDU UD: 0xFF 0x10 0xFE 0x32 0x00 0x48 0x10 0xC5 0x56 (9 bytes, UDL=10 septets)
+  //   7-bit decode: septetCount=10, numChars=10
+  //   packed decode: septets 解出 0x7F/0x08/0x7F/0x19/0x00/0x24/0x08/0x62/0x2A → 含 high byte 0x7F (单字节最高位 1, 不是合法 UTF-8 单字节)
+  //   → is_strict_utf8 fail → 丢 body (v4.0.23 strict-DCS)
+  //   v4.0.22 red: is_strict_utf8 fail → fallback UCS-2 decode → 把 9 bytes raw 当 UCS-2 codepoint 解 → 乱码 n>0
   const char* body =
     "07916649520080F0"  // SCA (8 bytes)
     "40"                  // FO UDHI=0
@@ -1700,9 +1703,10 @@ static void test_pdu_e2e_7bit_drop_body_not_strict_utf8() {
 }
 
 // Fixture F: v4.0.23 TDD red — UDL < UDH size → 丢 body (AOSP bufferLen<0 silent truncation 一致)
-//   DCS=0, FO UDHI=1, UDH 7 bytes (16-bit concat), UDL=5 (声明比 UDH 还小)
-//   v4.0.23: bufferLen<0 → 丢 body (AOSP 行为)
-//   v4.0.22 red: bufferLen=0 → decode 空 UD (0 bytes) → n=0 不 fail 但 v4.0.23 strict 显式 drop
+//   DCS=0, FO UDHI=1, UDH 7 bytes (UDHL=5 IEI=00 IEDL=03 refId=BCB4 total=03 seq=01, 16-bit concat)
+//   UDL=5 (声明比 UDH 7 字节还小, 触发 bufferLen=UDL-(UDHL+1+IE)=5-7=-2<0)
+//   v4.0.23: bufferLen<0 → 丢 body (AOSP 行为, 显式 drop flag)
+//   v4.0.22 red: 不显式 drop, pdu_ud_offset_ex 把 UDHL+UDH 7 字节当 UD 头, decode raw 5 bytes → n>0, FAIL (TDD red 命中)
 static void test_pdu_e2e_udl_lt_udh_drop_body() {
   g_current = "E2E UDL<UDH size → body=\"\" (v4.0.23 strict-DCS drop, AOSP bufferLen<0)";
   // DCS=0 7-bit, FO UDHI=1, UDH 7 bytes, UDL=5 (声明比 UDH 还小, ML307 quirk)
