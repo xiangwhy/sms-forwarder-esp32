@@ -1608,6 +1608,7 @@ static void test_stk_select_no_menu() {
 //   拼接后期望 UTF-8: "กรุณายืนยัน OTP ของคุณคือ 5481 และมีอายุการใช้งาน 15 นาที หากไม่ได้รับ SMS 2026-06-20 00:06"
 // v4.0.22 fixture helper: 模拟 main.cpp:1847-1859 sniffer fallback 决策
 //   (内联避免改 pdu_codec.cpp 公共 API, 跟 main.cpp 算法必须保持一致)
+// v4.0.24 update: 加 UDH skip (跟 main.cpp:1894 caller 加 dataHex 一致), 配套 fixture G/H/I TDD red
 static size_t fixture_sniffer_decode(const char* body, size_t bodyLen,
                                      bool* outIsUcs2, bool* outIs7bit,
                                      char* utf8, size_t utf8Max) {
@@ -1628,7 +1629,13 @@ static size_t fixture_sniffer_decode(const char* body, size_t bodyLen,
     udBytes = bodyLen / 2;
     udFullHexLen = bodyLen;
   }
-  return pdu::decode_body_field(body + udHexOff, udFullHexLen, utf8, utf8Max);
+  const char* udHex = body + udHexOff;
+  // v4.0.24: 加 UDH skip (跟 main.cpp caller 一致)
+  size_t udhByteLen = 0;
+  size_t udhSkipHex = pdu::pdu_udh_offset_ex(udHex, udFullHexLen, &udhByteLen);
+  const char* dataHex = udHex + udhSkipHex;
+  size_t dataHexLen = udFullHexLen - udhSkipHex;
+  return pdu::decode_body_field(dataHex, dataHexLen, utf8, utf8Max);
 }
 
 // Fixture D: v4.0.23 TDD red — DCS=0xFF reserved 触发 force_drop → body=""
@@ -1732,6 +1739,112 @@ static void test_pdu_e2e_udl_lt_udh_drop_body() {
   // v4.0.23 strict-DCS: bufferLen<0 → 丢 body (AOSP 行为, 显式 drop 标记)
   // v4.0.22 red: 走 decode_body_field 即使 bufferLen<0 也尝试 → 输出可能非空 n>0 或 raw bytes, FAIL
   CHECK(n == 0);
+}
+
+// =================== v4.0.24 TDD red: UCS-2/8-bit decode 路径加 UDH skip ===================
+// 翔哥 2026-06-22 真机复现 dtacIR +66813079348 9 段 concat SMS 全带 UDH prefix 乱码 (Ԁλँ/ं/ः/ऄ/अ)
+// 根因: main.cpp:1974 decode_body_field(udHex, udFullHexLen, ...) 从 UD 起点开始, 但没 skip UD 内部 UDH 头
+//        (concat IE `05 00 03 BB 09 NN` 6 bytes 被当 UCS-2 codepoint 输出成 `Ԁλँ` 字符)
+// 7-bit path (line 1941-1943 numChars -= 7) 已对, UCS-2/8-bit raw path 没通用 skip
+// 跟 [[dtac-gateway-anomaly]] 6/20 区分: gateway anomaly 是 gateway 推错编码 (raw bytes 异常),
+//   本 case 是 concat IE 头是正常 UDH, device UCS-2 decode path 不 skip UDH = 真 bug 要修
+// 跟 v4.0.23 strict-DCS 撤回 (ed6c21e) 区分: strict-DCS 删 sniff + 丢 body (行为破坏 PASS→FAIL),
+//   本 spec 不改 sniff + 加 UDH skip (行为修复 concat SMS 干净输出, 无 regression)
+// v4.0.24 fix: 加 pdu::pdu_udh_offset_ex helper, main.cpp UCS-2 + 8-bit raw path caller 加 UDH skip
+// TDD red: 跑 fixture_sniffer_decode (v4.0.23 行为, 无 UDH skip) → 期望 FAIL (UDH prefix 乱码)
+
+// Fixture G: v4.0.24 TDD red — concat 8-bit IE + UCS-2 → body 干净 (无 UDH prefix)
+//   简化 PDU: SCA(8)+FO(1)+oaLen(1)+ToA(1)+oaAddr(4)+PID(1)+DCS(1)+SCTS(7)+UDL(1)+UDH(6 8-bit IE)+UD(22 UCS-2 "Hello World")
+//   DCS=0x08 UCS-2, UDH = UDHL(05) + IEI(00) IEDL(03) refId(BB) total(09) seq(01)
+//   v4.0.24 fix 期望: decode 22 bytes UCS-2 → "Hello World" (11 chars, 11 UTF-8 bytes 全 ASCII), n=11
+//   v4.0.23 red: decode 28 bytes (UDH 6 + UD 22) → 14 chars `ԀλँHello World`, n=14, 含 `Ԁλँ` FAIL
+static void test_pdu_e2e_concat_8bit_ie_ucs2_skip_udh() {
+  g_current = "E2E concat 8-bit IE + UCS-2 → body 干净 (v4.0.24 UDH skip)";
+  const char* body =
+    "07916649520080F0"  // SCA (8 bytes)
+    "40"                  // FO UDHI=1
+    "07"                  // oaLen=7
+    "91"                  // ToA=international BCD
+    "8130793F"            // oaAddr (4 bytes)
+    "00"                  // PID
+    "08"                  // DCS=0x08 UCS-2
+    "32153382890608"      // SCTS (7 bytes)
+    "1C"                  // UDL=28 bytes (UDH 6 + UD 22)
+    "050003BB0901"        // UDH 6 bytes 8-bit concat IE (UDHL=5, IEI=00, IEDL=03, refId=BB, total=09, seq=01)
+    "00480065006C006C006F00200057006F0072006C0064";  // UD 22 bytes "Hello World" UCS-2 BE
+  size_t bodyLen = std::strlen(body);
+
+  bool isUcs2 = false, is7bit = false;
+  char utf8[256] = {0};
+  size_t n = fixture_sniffer_decode(body, bodyLen, &isUcs2, &is7bit, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+
+  // v4.0.24 fix 期望: decode 22 bytes UCS-2 = "Hello World" (n=11, 全 ASCII UTF-8 11 bytes)
+  // v4.0.23 red: decode 28 bytes UCS-2 = 14 chars `ԀλँHello World` (n=14, U+0500/U+03BB/U+0901 + 11 ASCII)
+  CHECK(isUcs2);
+  CHECK_EQ_INT(n, 11);
+  CHECK(memcmp(utf8, "Hello World", 11) == 0);
+}
+
+// Fixture H: v4.0.24 TDD red — concat 16-bit IE + UCS-2 → body 干净
+//   UDH 7 bytes: UDHL=06 + IEI=08 + IEDL=04 + refIdH=BB + refIdL=09 + total=09 + seq=01
+//   v4.0.24 fix 期望: decode 22 bytes UCS-2 → "Hello World" (n=11)
+//   v4.0.23 red: decode 29 bytes UCS-2 → 17 chars `Ԁλ...BB...` (n=17), FAIL
+static void test_pdu_e2e_concat_16bit_ie_ucs2_skip_udh() {
+  g_current = "E2E concat 16-bit IE + UCS-2 → body 干净 (v4.0.24 UDH skip)";
+  const char* body =
+    "07916649520080F0"
+    "40"
+    "07"
+    "91"
+    "8130793F"
+    "00"
+    "08"                  // DCS=UCS-2
+    "32153382890608"
+    "1D"                  // UDL=29 (UDH 7 + UD 22)
+    "060804BB090901"      // UDH 7 bytes 16-bit concat IE (UDHL=6, IEI=08, IEDL=04, refId=0xBB09, total=09, seq=01)
+    "00480065006C006C006F00200057006F0072006C0064";  // UD 22 bytes "Hello World" UCS-2 BE
+  size_t bodyLen = std::strlen(body);
+
+  bool isUcs2 = false, is7bit = false;
+  char utf8[256] = {0};
+  size_t n = fixture_sniffer_decode(body, bodyLen, &isUcs2, &is7bit, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+
+  CHECK(isUcs2);
+  CHECK_EQ_INT(n, 11);
+  CHECK(memcmp(utf8, "Hello World", 11) == 0);
+}
+
+// Fixture I: v4.0.24 regression — 单条 SMS (UDHL=0 无 UDH) + UCS-2 → 不变
+//   FO UDHI=0, UDL 直接是 UD bytes, 没 UDH 头
+//   v4.0.24 fix 期望: udhSkip=0, decode 跟 v4.0.23 一样 → "Hello World" (n=11), regression PASS
+//   v4.0.23 (red 但 PASS): decode 22 bytes UCS-2 = "Hello World" (n=11) 同样正确, 不需 fix
+//   注: 这 case 加是为防 v4.0.24 改 caller 加 skip 时把单条 SMS (UDHL=0) 也误 skip
+static void test_pdu_e2e_single_ucs2_no_udh_regression() {
+  g_current = "E2E 单条 UCS-2 无 UDH → body 干净 (v4.0.24 regression, UDHL=0 skip 0)";
+  const char* body =
+    "07916649520080F0"
+    "40"                  // FO UDHI=0 (无 UDH)
+    "07"
+    "91"
+    "8130793F"
+    "00"
+    "08"                  // DCS=UCS-2
+    "32153382890608"
+    "16"                  // UDL=22 (直接 UD bytes, 无 UDH 头)
+    "00480065006C006C006F00200057006F0072006C0064";  // UD 22 bytes "Hello World" UCS-2 BE
+  size_t bodyLen = std::strlen(body);
+
+  bool isUcs2 = false, is7bit = false;
+  char utf8[256] = {0};
+  size_t n = fixture_sniffer_decode(body, bodyLen, &isUcs2, &is7bit, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+
+  // v4.0.23 (red 但 PASS) + v4.0.24 fix 后 (PASS) 行为一致: decode 22 bytes UCS-2 = "Hello World"
+  CHECK(isUcs2);
+  CHECK_EQ_INT(n, 11);
+  CHECK(memcmp(utf8, "Hello World", 11) == 0);
 }
 
 static void test_pdu_e2e_dtac_3seg_otp_5481_real_pdu() {
@@ -2012,6 +2125,10 @@ int main() {
   test_pdu_e2e_7bit_drop_body_not_strict_utf8();
   // v4.0.23 TDD red: UDL<UDH size → body="" (case 4, AOSP bufferLen<0)
   test_pdu_e2e_udl_lt_udh_drop_body();
+  // v4.0.24 TDD red: UCS-2/8-bit decode 路径加 UDH skip (翔哥 6/22 真机复现 dtacIR concat)
+  test_pdu_e2e_concat_8bit_ie_ucs2_skip_udh();   // concat 8-bit IE + UCS-2 → body 干净
+  test_pdu_e2e_concat_16bit_ie_ucs2_skip_udh();  // concat 16-bit IE + UCS-2 → body 干净
+  test_pdu_e2e_single_ucs2_no_udh_regression();  // 单条 UCS-2 无 UDH → regression check
   test_pdu_e2e_dtac_3seg_otp_5481_real_pdu();   // refId=0xbcb4=48308, OTP=5481, 3 段 concat
   test_pdu_e2e_dtac_1seg_otp_real_pdu();         // 单段 dtac OTP 短信
   test_pdu_e2e_dtac_concat_2seg_part1_real_pdu();// refId=0x5aa7=23207, total=2 seq=1, 第一段

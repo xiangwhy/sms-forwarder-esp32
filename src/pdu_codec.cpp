@@ -542,6 +542,43 @@ size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen) {
   return udStart;
 }
 
+// v4.0.24: 从 UD 起点算 UDH 头长度, 返回 UD 真正数据起点 (hex 偏移)
+// 跟 pdu_udh_offset 平行 (后者从完整 PDU 跳 SCA+FO+OA+...+UDL+UDHL+UDH, 给 stash_udh_part 用)
+//  本函数从 UD 起点 (跟 pdu_ud_offset_ex 返回的 udHex 一致) 算, 给 sms_task decode path 用
+// 逻辑: 读 UDHL byte, 算 UDH 段总长 = UDHL + 1 (UDHL byte + IE bytes)
+// 跟 pdu_udh_offset 区别:
+//   - pdu_udh_offset 反查 concat IE pattern "0804"/"0003", 局限只对 concat SMS 有效 (单条没 IE pattern fallback)
+//   - pdu_udh_offset_ex 直接读 UDHL byte, 任何带 UDHI=1 的 PDU 都对 (concat / 多 IE / 自定义 IE)
+//   - 配套 main.cpp UCS-2/8-bit raw decode path caller (前 2 个 path 不收 IE pattern, 第 3 个 7-bit 减 7 septets)
+size_t pdu_udh_offset_ex(const char* udHex, size_t udHexLen, size_t* outUdhByteLen) {
+  if (outUdhByteLen) *outUdhByteLen = 0;
+  if (!udHex || udHexLen < 2 || !outUdhByteLen) return 0;
+
+  auto isH = [](char c) -> bool {
+    return (c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f');
+  };
+  auto nib = [](char c) -> int {
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='A'&&c<='F') return c-'A'+10;
+    if (c>='a'&&c<='f') return c-'a'+10;
+    return -1;
+  };
+
+  // 读 UDHL byte (udHex[0..2])
+  if (!isH(udHex[0]) || !isH(udHex[1])) return 0;
+  int udhl = (nib(udHex[0]) << 4) | nib(udHex[1]);
+  if (udhl <= 0) return 0;  // UDHL=0 = 单条 SMS 无 UDH (FO UDHI=0), caller 走无 skip 路径
+  if (udhl > 140) return 0;  // 3GPP §9.2.3.24 UDHL 上限 140 bytes
+
+  // UDH 段总字节数 = UDHL byte (1) + IE bytes (udhl)
+  size_t udhBytes = (size_t)udhl + 1;
+  size_t udhHexLen = udhBytes * 2;
+  if (udhHexLen > udHexLen) return 0;  // UDH 段比 UD 还长, PDU 格式错 (跟 AOSP bufferLen<0 一致)
+
+  *outUdhByteLen = udhBytes;
+  return udhHexLen;  // UD 真正数据起点 hex 偏移 (UDHL+IE 头之后)
+}
+
 // 从完整 PDU hex 跳过 SCA + FO, 返回 OA 起始 (hex 偏移)
 // *outIsAlpha: true=TON=alphanumeric (GSM7 packed), false=numeric (BCD nibble swap)
 // *outValueOctets: OA value 段 octet 数

@@ -1892,6 +1892,16 @@ static void sms_task(void* /*param*/) {
         udFullHexLen = bodyHexLen;
       }
       const char* udHex = msg.body_hex + udHexOff;
+      // v4.0.24 fix: UCS-2 / 8-bit raw decode 路径加 UDH skip (concat IE 字节被当 codepoint 输出)
+      //   7-bit path main.cpp:1941-1943 numChars-=7 已对 (UDH 占 packed 7 septets), 不动
+      //   sniff helper 不动 (跟 ed6c21e v4.0.23 strict-DCS 撤回决策一致)
+      //   配套 fixture G/H/I TDD red 验证 (test_pdu_codec.cpp)
+      //   翔哥 2026-06-22 真机复现 dtacIR 9 段 concat 全带 UDH prefix 乱码 (Ԁλँ/ं/ः/ऄ/अ) = 本 fix 触发 case
+      size_t udhByteLen = 0;
+      size_t udhSkipHex = pdu::pdu_udh_offset_ex(udHex, udFullHexLen, &udhByteLen);
+      const char* dataHex = udHex + udhSkipHex;       // skip UDHL+IE 后 UD 真正数据
+      size_t dataHexLen = udFullHexLen - udhSkipHex;
+      size_t dataByteLen = udhByteLen > 0 ? (udBytes - udhByteLen) : udBytes;
       // is7bit / isUcs2 已从 TPDU 真相 DCS 判定 (concat/partial path 无 PDU header → 全 false)
       bool is8bitData = !is7bit && !isUcs2;
       // v4.0.11 fix: concat/partial path (udHexOff=0) 强制走 fallback 启发式
@@ -1957,10 +1967,11 @@ static void sms_task(void* /*param*/) {
         }
       } else if (is8bitData) {
         // 8-bit raw: hex → raw bytes, 跳过非 hex 字符
-        ESP_LOGI(TAG, "SMS: 8-bit data (dcs=%u cmt_len=%u udBytes=%u)", msg.dcs, msg.cmt_length, (unsigned)udBytes);
+        // v4.0.24: udHex → dataHex (skip UDH concat IE 头), 防 IE bytes 当 raw 输出
+        ESP_LOGI(TAG, "SMS: 8-bit data (dcs=%u cmt_len=%u udBytes=%u udhSkip=%u)", msg.dcs, msg.cmt_length, (unsigned)udBytes, (unsigned)udhByteLen);
         bodyN = 0;
-        for (size_t i = 0; i + 1 < udHexLen && bodyN < sizeof(bodyBuf) - 1; i += 2) {
-          char h0 = udHex[i], h1 = udHex[i+1];
+        for (size_t i = 0; i + 1 < dataHexLen && bodyN < sizeof(bodyBuf) - 1; i += 2) {
+          char h0 = dataHex[i], h1 = dataHex[i+1];
           auto isH = [](char c){
             return (c>='0'&&c<='9')||(c>='A'&&c<='F')||(c>='a'&&c<='f');
           };
@@ -1971,7 +1982,9 @@ static void sms_task(void* /*param*/) {
           bodyBuf[bodyN++] = (char)((v(h0) << 4) | v(h1));
         }
       } else {
-        bodyN = pdu::decode_body_field(udHex, udFullHexLen, bodyBuf, sizeof(bodyBuf));
+        // v4.0.24: UCS-2 path udHex → dataHex (skip UDH concat IE 头),
+        //   防 concat IE `05 00 03 BB 09 NN` 6 bytes 被当 UCS-2 codepoint 输出成 `Ԁλँ` 等乱码
+        bodyN = pdu::decode_body_field(dataHex, dataHexLen, bodyBuf, sizeof(bodyBuf));
       }
       String phoneUtf8(phoneBuf, phoneN);
       String bodyUtf8(bodyBuf, bodyN);
