@@ -1666,6 +1666,39 @@ static void test_pdu_e2e_dtac_dcs255_drop_body() {
   CHECK(n == 0);  // v4.0.23 PASS, v4.0.22 FAIL (red)
 }
 
+// Fixture E: v4.0.23 TDD red — 7-bit decode 输出不 strict UTF-8 → 丢 body
+//   DCS=0 标 7-bit, 但 raw bytes 高 septet 异常 (sub-byte drift / 错位)
+//   v4.0.23: 7-bit decode 后 is_strict_utf8 fail → 丢 body (不再 fallback UCS-2)
+//   v4.0.22 red: is_strict_utf8 fail → fallback UCS-2 decode → 乱码 n>0 FAIL
+static void test_pdu_e2e_7bit_drop_body_not_strict_utf8() {
+  g_current = "E2E 7-bit decode not strict UTF-8 → body=\"\" (v4.0.23 strict-DCS drop)";
+  // DCS=0 7-bit, raw UD bytes 高 septet 异常 (DTAC gateway 推错, [[dtac-gateway-anomaly]])
+  //   9 bytes PDU UD: 0xFF 0x10 0xFE 0x32 0x00 0x48 0x10 0xC5 0x56
+  //   7-bit decode: septetCount=10, numChars=cmt_length=10
+  //   packed decode → 含 lone continuation / overlong sequence → 不 strict UTF-8
+  const char* body =
+    "07916649520080F0"  // SCA (8 bytes)
+    "40"                  // FO UDHI=0
+    "07"                  // oaLen=7
+    "91"                  // ToA=BCD
+    "8130793F"            // oaAddr (4 bytes)
+    "00"                  // PID
+    "00"                  // DCS=0 (7-bit default, TPDU 真相)
+    "32153382890608"      // SCTS (7 bytes)
+    "0A"                  // UDL=10 septets
+    "FF10FE32004810C556"; // UD 9 bytes raw (高 septet 异常)
+  size_t bodyLen = std::strlen(body);
+
+  bool isUcs2 = false, is7bit = false;
+  char utf8[256] = {0};
+  size_t n = fixture_sniffer_decode(body, bodyLen, &isUcs2, &is7bit, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+
+  // v4.0.23 strict-DCS: 7-bit decode 输出不 strict UTF-8 → 丢 body (bodyN=0)
+  // v4.0.22 red: fallback UCS-2 decode → 输出 9 字节 raw 当 UCS-2 字符 → n>0 FAIL
+  CHECK(n == 0);
+}
+
 static void test_pdu_e2e_dtac_3seg_otp_5481_real_pdu() {
   g_current = "E2E dtac 3 段 concat OTP=5481 (refId=0xbcb4=48308) — 翔哥 boot #127 raw hex";
   // 翔哥 22:15 boot #127 dtac 3 段 concat 第 1 段原码 (188 hex = 94 bytes 简化版)
@@ -1940,6 +1973,8 @@ int main() {
   //  这 3 case 期望 v4.0.22 fix 后跑绿
   // v4.0.23 TDD red: 翔哥 6/22 boot #128 抓的 1 条 dtac DCS=0xFF 异常 SMS → body="" (strict-DCS drop)
   test_pdu_e2e_dtac_dcs255_drop_body();
+  // v4.0.23 TDD red: 7-bit decode 不 strict UTF-8 → body="" (case 3)
+  test_pdu_e2e_7bit_drop_body_not_strict_utf8();
   test_pdu_e2e_dtac_3seg_otp_5481_real_pdu();   // refId=0xbcb4=48308, OTP=5481, 3 段 concat
   test_pdu_e2e_dtac_1seg_otp_real_pdu();         // 单段 dtac OTP 短信
   test_pdu_e2e_dtac_concat_2seg_part1_real_pdu();// refId=0x5aa7=23207, total=2 seq=1, 第一段
