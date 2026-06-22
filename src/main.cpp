@@ -1866,8 +1866,9 @@ static void sms_task(void* /*param*/) {
       //          pdu_ud_offset_ex 内部从 TPDU 读 DCS byte + reserved 时 sniff UD bytes
       bool is7bit = false, isUcs2 = false;
       size_t udHexOff = 0, udBytes = 0, udHexLen = 0, udFullHexLen = 0;
+      bool udhi = false;
       if (bodyHexLen >= 4) {
-        udHexOff = pdu::pdu_ud_offset_ex(msg.body_hex, bodyHexLen, &isUcs2, &is7bit, &udBytes);
+        udHexOff = pdu::pdu_ud_offset_ex(msg.body_hex, bodyHexLen, &isUcs2, &is7bit, &udBytes, &udhi);
       }
       // v4.0.22: pdu_ud_offset_ex 算对 udOff 就信它, 别 safety check 拒绝
       //   修前 bug: 'udHexOff + udBytes*2 <= bodyHexLen' 跟 pdu_ud_offset_ex 矛盾
@@ -1897,8 +1898,13 @@ static void sms_task(void* /*param*/) {
       //   sniff helper 不动 (跟 ed6c21e v4.0.23 strict-DCS 撤回决策一致)
       //   配套 fixture G/H/I TDD red 验证 (test_pdu_codec.cpp)
       //   翔哥 2026-06-22 真机复现 dtacIR 9 段 concat 全带 UDH prefix 乱码 (Ԁλँ/ं/ः/ऄ/अ) = 本 fix 触发 case
+      //   v4.0.24.1 fix: 加 udhi gate — 只有 FO UDHI bit=1 才真含 UDH 头, 防单条 SMS / stash 拼接
+      //     后第一字节内容(泰文 0x0E→UDHL=14)被误判 → 多 skip 15 bytes → 字节错位全乱码
       size_t udhByteLen = 0;
-      size_t udhSkipHex = pdu::pdu_udh_offset_ex(udHex, udFullHexLen, &udhByteLen);
+      size_t udhSkipHex = 0;
+      if (udhi) {
+        udhSkipHex = pdu::pdu_udh_offset_ex(udHex, udFullHexLen, &udhByteLen);
+      }
       const char* dataHex = udHex + udhSkipHex;       // skip UDHL+IE 后 UD 真正数据
       size_t dataHexLen = udFullHexLen - udhSkipHex;
       size_t dataByteLen = udhByteLen > 0 ? (udBytes - udhByteLen) : udBytes;

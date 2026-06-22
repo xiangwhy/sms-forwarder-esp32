@@ -1615,8 +1615,9 @@ static size_t fixture_sniffer_decode(const char* body, size_t bodyLen,
   *outIsUcs2 = false; *outIs7bit = false;
   size_t udBytes = 0;
   size_t udOff = 0;
+  bool udhi = false;
   if (bodyLen >= 4) {
-    udOff = pdu::pdu_ud_offset_ex(body, bodyLen, outIsUcs2, outIs7bit, &udBytes);
+    udOff = pdu::pdu_ud_offset_ex(body, bodyLen, outIsUcs2, outIs7bit, &udBytes, &udhi);
   }
   size_t udHexOff = 0, udFullHexLen = 0;
   if (udOff > 0) {
@@ -1630,9 +1631,12 @@ static size_t fixture_sniffer_decode(const char* body, size_t bodyLen,
     udFullHexLen = bodyLen;
   }
   const char* udHex = body + udHexOff;
-  // v4.0.24: 加 UDH skip (跟 main.cpp caller 一致)
+  // v4.0.24: 加 UDH skip (跟 main.cpp caller 一致, udhi gate 防单条 SMS 误判)
   size_t udhByteLen = 0;
-  size_t udhSkipHex = pdu::pdu_udh_offset_ex(udHex, udFullHexLen, &udhByteLen);
+  size_t udhSkipHex = 0;
+  if (udhi) {
+    udhSkipHex = pdu::pdu_udh_offset_ex(udHex, udFullHexLen, &udhByteLen);
+  }
   const char* dataHex = udHex + udhSkipHex;
   size_t dataHexLen = udFullHexLen - udhSkipHex;
   return pdu::decode_body_field(dataHex, dataHexLen, utf8, utf8Max);
@@ -1825,7 +1829,7 @@ static void test_pdu_e2e_single_ucs2_no_udh_regression() {
   g_current = "E2E 单条 UCS-2 无 UDH → body 干净 (v4.0.24 regression, UDHL=0 skip 0)";
   const char* body =
     "07916649520080F0"
-    "40"                  // FO UDHI=0 (无 UDH)
+    "00"                  // FO UDHI=0 SMS-DELIVER (单条无 UDH)
     "07"
     "91"
     "8130793F"
