@@ -108,14 +108,17 @@ struct Config {
   bool bootPush;   // 调试期可关 (v4.0.6+, 翔哥 2026-06-18 要求)
 };
 // v4.0.7: 凭据硬编默认 (翔哥 2026-06-19 要求: NVS 写入不可靠, 直接编译进固件)
-// NVS 优先, NVS 缺失时回落这里 → 设备永远能上电连上 REDACTED_SSID
+// 2026-06-22 安全审计: 硬编 "REDACTED_SSID" SSID + 真实 WiFi 密码推到 github 会泄露私人网络
+//   翔哥拍板改空字符串占位 — NVS 缺失时 ssid/pass 为空, 设备不会偷偷连任何 WiFi
+//   必须 BOOT 按钮触发 AP 模式用手机配网 (AP_PASSWORD 默认 12345678, AP_SSID_PREFIX 公开默认)
+//   配合 v4.0.6 P19 /api/factory wipe 流程: 擦 NVS 后用户走 BOOT 重配, 不再 fallback 到硬编凭据
 static Config g_cfg = {
-  "REDACTED_SSID",                           // ssid  — 硬编
-  "REDACTED_WIFI_PASS",                           // pass  — 硬编
+  "",                                   // ssid  — 空, 需走 BOOT/AP 模式配网 (翔哥 2026-06-22 决策)
+  "",                                   // pass  — 空, 需走 BOOT/AP 模式配网
   "",                                   // token — 留空, pushplus 不强求
   "",                                   // topic (空 = 个人推送)
-  "admin",                              // otaUser (默认)
-  "Admin@123",                          // otaPass (默认)
+  "",                                   // otaUser (空 = 走 web basic auth 之外的开放 POST /update; 配网时由 BOOT 模式设)
+  "",                                   // otaPass
   true                                  // bootPush — 默认开
 };
 
@@ -2765,9 +2768,9 @@ static void boot_button_task(void* /*param*/) {
   int lowCount = 0;          // 防抖计数器
   static bool bootDisabled = false;  // cfg hardcoded 时禁用 BOOT
   for (;;) {
-    // 检测 cfg 是否仍是 hardcoded 默认值, 是则禁用 BOOT 防死循环
-    bool cfgIsHardcoded = (strcmp(g_cfg.ssid, "REDACTED_SSID") == 0 &&
-                           strcmp(g_cfg.otaUser, "admin") == 0);
+    // 检测 cfg 是否仍是空默认 (2026-06-22: 硬编 REDACTED_SSID 字符串已删, 检测改成 ssid/otaUser 为空)
+    //   是 → 设备没配过网, 禁用 BOOT 防死循环, 强迫用户走 BOOT/AP 模式配网
+    bool cfgIsHardcoded = (g_cfg.ssid[0] == '\0' && g_cfg.otaUser[0] == '\0');
     if (cfgIsHardcoded) {
       if (!bootDisabled) {
         ESP_LOGW(TAG, "BOOT disabled: cfg matches hardcoded default (avoid GPIO0 卡死 loop)");
