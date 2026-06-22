@@ -132,10 +132,17 @@ DCS 严格判定后, 以下 4 种情况 → bodyN = 0 (丢 body, 空字符串):
 
 | Fixture | v4.0.22 期望 | v4.0.23 期望 |
 |---|---|---|
-| A: SCA 部分修 (UDH 字节污染) | SCA leak check + n>30 PASS | 改成 2 断言: (a) "no SCA leak" (v4.0.22 SCA 部分修), (b) "bodyN=0" (v4.0.23 丢 body 触发) |
+| A: SCA 部分修 (UDH 字节污染) | SCA leak check + n>30 PASS | **不变** (翔哥 2026-06-22 拍板撤回 spec 50bda13 决策 "改 2 断言"). C2 改后 fixture A 会变 n==0 FAIL (case 3 触发: UDH 7 字节污染 + 字节对齐偏移 → 7-bit decode 不 strict UTF-8 → drop body). 翔哥 接受 fixture A FAIL 留 **v4.0.24+** 修 |
 | B: 单段全绿 | udOff 信任 + 无 SCA leak | 不变 (7-bit decode 输出合法 UTF-8, body 正常) |
 | C: dtac/TRUE 2 段无 regression | udOff+udBytes*2==bodyLen 不触发 fallback | 不变 |
 | D/E/F (新) | (TDD red) | body="" PASS |
+
+**v4.0.23 烧板验证期望** (C2 + bump 后):
+- D/E/F 改前 fail, 改后 pass (TDD red → green)
+- A 改前 pass, 改后 **fail** (翔哥 接受, 留 v4.0.24+ 修)
+- B/C 不变 pass
+- 总 host test: **292 pass, 1 fail (fixture A)**
+- 风险监控: fixture A FAIL 跟 翔哥 2026-06-19 拍板的 v4.0.11.21 review 7 finding 同样 trade (功能稳不动)
 
 **Fixture A 期望调整决策**: 当前 v4.0.22 是 "SCA leak + n>30 PASS" (UDH 字节污染 fixture A 头 7 字符, 不可全绿). v4.0.23 删 sniff 后, fixture A 走 7-bit decode → UDH 字节 + 残余 UCS-2 BE 字节 → 不 strict UTF-8 → **丢 body (bodyN=0)**. 这跟 fixture A 原本"确认 SCA 不在 body 里" 的意图部分冲突 (原本验 "SCA leak 不在" + "body 部分可解", 现在验 "丢 body"). **决策**: fixture A 改成 2 个独立断言: (a) "no SCA leak" (跟 v4.0.22 一致, 确认 SCA 解析对), (b) "bodyN=0" (新加, 确认 v4.0.23 丢 body 触发). 这 2 个断言覆盖 v4.0.22 + v4.0.23 双行为.
 
