@@ -77,6 +77,20 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
 //   现版本直接返回 UD 起点, caller 直接用 udhOff 作为 partBody 偏移
 size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen);
 
+// v4.0.24: 从 UD 起点 (已 skip PDU header) 算 UDH 头长度, 返回 UD 真正数据起点 (hex 偏移)
+// *outUdhByteLen: UDH 段总字节数 (UDHL byte + IE bytes, 等于 (UDHL+1))
+// 输入: udHex = UD 起点 hex (跟 pdu_ud_offset_ex 返回的 udHex 一致), udHexLen = UD 段 hex 长度
+// 返回: UD 真正数据起点 hex 偏移 (skip UDH 头长度)
+//       0 = UDHL byte = 0 (单条 SMS 无 UDH) 或 PDU 太短 (UDHL byte 后 bytes 不够)
+//       caller 直接用 dataHex = udHex + retVal, dataHexLen = udHexLen - retVal
+// 配套 main.cpp:1973-1975 UCS-2 decode + main.cpp:1958-1972 8-bit raw path: 这 2 个 path
+//   之前从 udHex 直接解, 没 skip UDH concat IE 头 → IE `05 00 03 BB 09 NN` 6 bytes
+//   被当 UCS-2 codepoint 输出成 `Ԁλँ` 字符 (翔哥 2026-06-22 真机复现 dtacIR 9 段 concat case)
+//   加 UDH skip 后, IE 头不再被当 codepoint, concat SMS 输出干净
+// 7-bit path (main.cpp:1941-1943 numChars -= 7) 已对 (UDH 占 packed 7 septets), 不动
+// 配套 stash_udh_part (concat 拼接) 用 pdu_udh_offset (跟 pdu_udh_offset_ex 平行, 共存)
+size_t pdu_udh_offset_ex(const char* udHex, size_t udHexLen, size_t* outUdhByteLen);
+
 // 从完整 PDU (SCA+FO+OA+PID+...) hex 跳过 SCA+FO, 返回 OA 起始 (hex 偏移)
 // *outIsAlpha: true=TON=alphanumeric(GSM7 packed), false=numeric(BCD nibble swap)
 // *outValueOctets: OA value 段 octet 数 (= ceil(oaLen/2))
