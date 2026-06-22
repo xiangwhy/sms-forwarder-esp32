@@ -747,7 +747,7 @@ static void csq_poll_task(void* /*param*/) {
 typedef struct {
   uint32_t ms;     // boot millis (与 uptime 对齐)
   char     phone[24];
-  char     body[320];   // 2026-06-22: 512→320; 153B raw * 2 hex = 306 chars, 320 够 1 段多
+  char     body[320];   // 2026-06-22: 512→320; 153B raw * 2 hex = 306 chars, 320 够 1 段多。>303 字符截断时 rx_log_write 追加 "+N more" 提示
 } RxLogEntry;
 static RxLogEntry g_rxLog[RX_LOG_CAP] = {{0}};
 static volatile uint16_t g_rxLogHead  = 0;
@@ -761,8 +761,29 @@ static void rx_log_write(const char* phone, const char* body) {
   g_rxLog[idx].ms = millis();
   strncpy(g_rxLog[idx].phone, phone, sizeof(g_rxLog[idx].phone) - 1);
   g_rxLog[idx].phone[sizeof(g_rxLog[idx].phone) - 1] = 0;
-  strncpy(g_rxLog[idx].body, body, sizeof(g_rxLog[idx].body) - 1);
-  g_rxLog[idx].body[sizeof(g_rxLog[idx].body) - 1] = 0;
+
+  // 2026-06-22: 配合 RxLogEntry.body 512→320 的截断, 追加 "+N more" 提示
+  // 阈值表 (snprintf 自身截断不越界, RESERVE=16 字节 = "+4294967295 more\0" 最长 17 字节):
+  //   1 段 7-bit (160 字符)       → 完整显示
+  //   1 段 UCS-2 (210 字符 UTF-8) → 完整显示
+  //   2 段 7-bit (320 字符)        → "...+17 more"  (320-303=17 字符换 indicator, 多丢 16 字符 vs 静默)
+  //   2 段 UCS-2 (402 字符)        → "...+99 more"
+  //   3+ 段 (≥459 字符)            → "...+N more"
+  //   5+ 段 (≥765 字符)            → "...+462 more"
+  // push 流程走 SmsMsg.body_hex 不经这里, 此改动只影响 dashboard 显示
+  const size_t BODY_BUF = sizeof(g_rxLog[idx].body);   // 320
+  const size_t RESERVE  = 16;
+  size_t bodyLen = strlen(body);
+  if (bodyLen > BODY_BUF - 1 - RESERVE) {
+    size_t keep = BODY_BUF - 1 - RESERVE;  // 303
+    size_t dropped = bodyLen - keep;
+    memcpy(g_rxLog[idx].body, body, keep);
+    snprintf(g_rxLog[idx].body + keep, RESERVE + 1, "+%u more", (unsigned)dropped);
+  } else {
+    strncpy(g_rxLog[idx].body, body, BODY_BUF - 1);
+    g_rxLog[idx].body[BODY_BUF - 1] = 0;
+  }
+
   g_rxLogHead = (idx + 1) % RX_LOG_CAP;
   uint16_t cnt = g_rxLogCount;
   if (cnt < RX_LOG_CAP) g_rxLogCount = cnt + 1;
