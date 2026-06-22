@@ -2496,6 +2496,7 @@ static void handleApiScan(AsyncWebServerRequest* r) {
     o["rssi"]    = WiFi.RSSI(idx[i]);
     o["secured"] = (WiFi.encryptionType(idx[i]) != WIFI_AUTH_OPEN);
     o["current"] = (ssid == cur);
+    o["hidden"]  = (ssid.length() == 0);  // 2026-06-22: 隐藏 AP 在 Arduino WiFi 库以空字符串返回, 前端据此渲染 "(隐藏网络)" + disabled
   }
   WiFi.scanDelete();
   String out; serializeJson(doc, out);

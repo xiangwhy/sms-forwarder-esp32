@@ -211,7 +211,7 @@ async function scanWifi() {
     const arr = await r.json();
     const cur = document.getElementById('c_ssid').value;
     sel.innerHTML = '<option value="">— 选择扫描到的网络 —</option>'
-      + arr.map(n => {
+      + arr.filter(n => !n.hidden).map(n => {
         const tag = n.current ? ' ✓ 已连' : (n.secured ? ' 🔒' : ' 开放');
         return '<option value="' + n.ssid.replace(/"/g,'&quot;') + '"' + (n.ssid===cur?' selected':'') + '>'
           + n.ssid + ' · ' + n.rssi + ' dBm' + tag + '</option>';
