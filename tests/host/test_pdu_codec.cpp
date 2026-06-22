@@ -1631,6 +1631,41 @@ static size_t fixture_sniffer_decode(const char* body, size_t bodyLen,
   return pdu::decode_body_field(body + udHexOff, udFullHexLen, utf8, utf8Max);
 }
 
+// Fixture D: v4.0.23 TDD red — DCS=0xFF reserved 触发 force_drop → body=""
+//   翔哥 2026-06-22 真机复现 dtac +66813079348 boot #128 乱码 case (raw bytes 全 0x00/0xXX 异常)
+//   +CMT HEAD dcs=0xFF reserved (3GPP TS 23.038 §4 reserved), TPDU DCS byte=0x00 (7-bit, 标错)
+//   v4.0.23: pdu_ud_offset_ex 读 TPDU DCS=0x00 → is7bit=true → 7-bit decode → 不 strict UTF-8 → 丢 body
+//   v4.0.22 red: sniff bypass → 强 UCS-2 decode → 出乱码 (ÅV8HdAøì...) → 期望 fail
+static void test_pdu_e2e_dtac_dcs255_drop_body() {
+  g_current = "E2E dtac DCS=0xFF reserved (real DCS=0) → body=\"\" (v4.0.23 strict-DCS drop)";
+  // 翔哥 boot #128 收到 1 条 dtac SMS, body 全 0x00/0xXX 异常字节 (Å=0xC5, V=0x56, 8=0x38, H=0x48, d=0x64...)
+  // 这是 [[dtac-gateway-anomaly]] 6/20 同源 case. 简化: SCA(8)+FO(1)+oaLen(1)+ToA(1)+oaAddr(4)+PID(1)+DCS(1)+SCTS(7)+UDL(1)+UD(?)=26 bytes=52 hex
+  const char* body =
+    "07916649520080F0"  // SCA (8 bytes)
+    "40"                  // FO UDHI=0 (1 byte)
+    "07"                  // oaLen=7
+    "91"                  // ToA=international BCD
+    "8130793F"            // oaAddr (4 bytes)
+    "00"                  // PID
+    "FF"                  // DCS=0xFF reserved (TPDU 真相)
+    "32153382890608"      // SCTS (7 bytes)
+    "14"                  // UDL=20
+    "C50038560048006400"  // UD raw bytes 像 UCS-2 BE 异常 (ÅV8Hd)
+    "4100F800EC002100"    // UD raw bytes 续 (Aøì!)
+    "4300C60046003800";   // UD raw bytes 续 (CF8)
+  size_t bodyLen = std::strlen(body);
+
+  bool isUcs2 = false, is7bit = false;
+  char utf8[256] = {0};
+  size_t n = fixture_sniffer_decode(body, bodyLen, &isUcs2, &is7bit, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+
+  // v4.0.23 strict-DCS: TPDU DCS=0xFF reserved → 7-bit decode (因 pdu_ud_offset_ex 标 is7bit=true) →
+  //   不 strict UTF-8 (raw bytes 高 septet) → 丢 body (bodyN=0)
+  // v4.0.22 red: 走 UCS-2 fallback (sniff bypass) → 乱码 (ÅV8HdAøì...) → n > 0 FAIL
+  CHECK(n == 0);  // v4.0.23 PASS, v4.0.22 FAIL (red)
+}
+
 static void test_pdu_e2e_dtac_3seg_otp_5481_real_pdu() {
   g_current = "E2E dtac 3 段 concat OTP=5481 (refId=0xbcb4=48308) — 翔哥 boot #127 raw hex";
   // 翔哥 22:15 boot #127 dtac 3 段 concat 第 1 段原码 (188 hex = 94 bytes 简化版)
@@ -1903,6 +1938,8 @@ int main() {
   //  现状 v4.0.21.1: udHexOff + udBytes*2 > bodyLen 触发 fallback 用全 body decode, SCA 字节污染 → 乱码
   //  v4.0.22 fix: sniff 阶段读 BODY 实际 DCS + decode_body_field 接受 truncated UD (不污染 header)
   //  这 3 case 期望 v4.0.22 fix 后跑绿
+  // v4.0.23 TDD red: 翔哥 6/22 boot #128 抓的 1 条 dtac DCS=0xFF 异常 SMS → body="" (strict-DCS drop)
+  test_pdu_e2e_dtac_dcs255_drop_body();
   test_pdu_e2e_dtac_3seg_otp_5481_real_pdu();   // refId=0xbcb4=48308, OTP=5481, 3 段 concat
   test_pdu_e2e_dtac_1seg_otp_real_pdu();         // 单段 dtac OTP 短信
   test_pdu_e2e_dtac_concat_2seg_part1_real_pdu();// refId=0x5aa7=23207, total=2 seq=1, 第一段
