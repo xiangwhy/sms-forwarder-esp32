@@ -554,7 +554,12 @@ size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen) {
 // 跟 pdu_udh_offset 区别:
 //   - pdu_udh_offset 反查 concat IE pattern "0804"/"0003", 局限只对 concat SMS 有效 (单条没 IE pattern fallback)
 //   - pdu_udh_offset_ex 直接读 UDHL byte, 任何带 UDHI=1 的 PDU 都对 (concat / 多 IE / 自定义 IE)
-//   - 配套 main.cpp UCS-2/8-bit raw decode path caller (前 2 个 path 不收 IE pattern, 第 3 个 7-bit 减 7 septets)
+// v4.0.24.1: 加 ML307 stripped-UDHL guard (review finding #1)
+//   触发: FO UDHI=1 但首字节是 concat IEI (ML307 quirk — test_pdu_codec.cpp:131 test_udh_16bit_stripped_udhl 文档化)
+//   修前 bug v4.0.24: 函数读首字节当 UDHL, 16-bit concat stripped case 误读 IEI=0x08 当 UDHL=8 → 多 skip 3 bytes → 丢 UD 数据
+//   修法: 首字节 = 0x00 (8-bit IEI) 或 0x08 (16-bit IEI) + IEDL/total/seq 验证通过 → 假定 stripped → skip 5/6 bytes (IE only, 无 UDHL byte)
+//   验证 strict (防 port IE IEDL=0x04 误判): total ∈ [2,255] + seq ∈ [1,total]
+//   配套 main.cpp UCS-2/8-bit raw decode path caller (前 2 个 path 不收 IE pattern, 第 3 个 7-bit 减 7 septets)
 size_t pdu_udh_offset_ex(const char* udHex, size_t udHexLen, size_t* outUdhByteLen) {
   if (outUdhByteLen) *outUdhByteLen = 0;
   if (!udHex || udHexLen < 2 || !outUdhByteLen) return 0;
@@ -569,9 +574,37 @@ size_t pdu_udh_offset_ex(const char* udHex, size_t udHexLen, size_t* outUdhByteL
     return -1;
   };
 
-  // 读 UDHL byte (udHex[0..2])
   if (!isH(udHex[0]) || !isH(udHex[1])) return 0;
-  int udhl = (nib(udHex[0]) << 4) | nib(udHex[1]);
+  int firstByte = (nib(udHex[0]) << 4) | nib(udHex[1]);
+
+  // v4.0.24.1 stripped-UDHL guard: 首字节是 concat IEI + total/seq 验证通过
+  //   8-bit concat IEI=0x00 IEDL=0x03 → 5 bytes IE (skip 10 hex)
+  //   16-bit concat IEI=0x08 IEDL=0x04 → 6 bytes IE (skip 12 hex)
+  //   防 port IE (IEI=0x05 IEDL=0x04) 误判: 严格验证 total ∈ [2,255] + seq ∈ [1,total]
+  //   注: 16-bit strip 路径下 total/seq 位置: IEI(1) IEDL(1) refH(1) refL(1) total(1) seq(1) → total 在 udHex[8..9], seq 在 udHex[10..11]
+  if (firstByte == 0x00 && udHexLen >= 10
+      && isH(udHex[2]) && isH(udHex[3]) && isH(udHex[6]) && isH(udHex[7]) && isH(udHex[8]) && isH(udHex[9])) {
+    int iedl  = (nib(udHex[2]) << 4) | nib(udHex[3]);
+    int total = (nib(udHex[6]) << 4) | nib(udHex[7]);
+    int seq   = (nib(udHex[8]) << 4) | nib(udHex[9]);
+    if (iedl == 0x03 && total >= 2 && total <= 255 && seq >= 1 && seq <= total) {
+      *outUdhByteLen = 5;  // IEI + IEDL + ref + total + seq = 5 bytes
+      return 10;
+    }
+  }
+  if (firstByte == 0x08 && udHexLen >= 12
+      && isH(udHex[2]) && isH(udHex[3]) && isH(udHex[8]) && isH(udHex[9]) && isH(udHex[10]) && isH(udHex[11])) {
+    int iedl  = (nib(udHex[2]) << 4) | nib(udHex[3]);
+    int total = (nib(udHex[8]) << 4) | nib(udHex[9]);
+    int seq   = (nib(udHex[10]) << 4) | nib(udHex[11]);
+    if (iedl == 0x04 && total >= 2 && total <= 255 && seq >= 1 && seq <= total) {
+      *outUdhByteLen = 6;  // IEI + IEDL + refH + refL + total + seq = 6 bytes
+      return 12;
+    }
+  }
+
+  // 标准 UDHL byte 路径 (v4.0.24 原版)
+  int udhl = firstByte;
   if (udhl <= 0) return 0;  // UDHL=0 = 单条 SMS 无 UDH (FO UDHI=0), caller 走无 skip 路径
   if (udhl > 140) return 0;  // 3GPP §9.2.3.24 UDHL 上限 140 bytes
 

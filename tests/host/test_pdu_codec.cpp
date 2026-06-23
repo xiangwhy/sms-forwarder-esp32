@@ -1851,6 +1851,83 @@ static void test_pdu_e2e_single_ucs2_no_udh_regression() {
   CHECK(memcmp(utf8, "Hello World", 11) == 0);
 }
 
+// =================== v4.0.24.1 TDD red: ML307 stripped-UDHL guard ===================
+// review finding #1: pdu_udh_offset_ex 误读 IEI 当 UDHL (ML307 quirk — 剥 UDHL byte)
+// 现有 regression test test_udh_16bit_stripped_udhl/test_udh_8bit_stripped_udhl 测 parse_udh
+// (test_pdu_codec.cpp:131/143), 但 pdu_udh_offset_ex 没对应 fixture → 加 J/K 覆盖新 decode 路径
+// ML307 quirk: 部分固件剥 UDHL byte, body = SCA+FO+OA+PID+DCS+SCTS+UDL+IEI+IEDL+...+UD
+//   8-bit concat: IEI=0x00, IEDL=0x03, IE 5 bytes = "00 03 ref total seq"
+//   16-bit concat: IEI=0x08, IEDL=0x04, IE 6 bytes = "08 04 refH refL total seq"
+// pre-v4.0.24.1 fix 期望 FAIL:
+//   J (8-bit concat stripped): UDHL=0 → 函数返回 0 → skip 0 → decode 28 bytes 含 IE 5 → 14 chars `ԀλँHello World` FAIL (期望 "Hello World" 11 chars)
+//   K (16-bit concat stripped): UDHL=8 → 函数返回 18 → skip 9 bytes → 丢 UD 前 3 bytes → 仅解出部分 body FAIL
+// post-fix 期望 PASS: 函数识别 stripped → skip 5/6 bytes (IE only) → 解 "Hello World" 干净
+
+// Fixture J: v4.0.24.1 TDD red — ML307 剥 UDHL + 8-bit concat IE + UCS-2 → body 干净
+//   PDU: SCA(8)+FO(1 UDHI=1)+oaLen(1)+ToA(1)+oaAddr(4)+PID(1)+DCS(1)+SCTS(7)+UDL(1)+IE(5 8-bit concat, 无 UDHL byte)+UD(22 UCS-2)
+//   DCS=0x08 UCS-2, IE = "00 03 BB 09 01" (5 bytes, UDHL 被 ML307 剥)
+//   v4.0.24.1 fix 期望: 识别 stripped UDHL, skip 5 bytes (IE), decode 22 bytes UCS-2 → "Hello World" (n=11)
+//   v4.0.24 red: skip 0 → decode 28 bytes → 14 chars `ԀλँHello World` (n=14, U+0500=Ԁ + U+03BB=λ + U+0901=ँ + 11 ASCII) FAIL
+static void test_pdu_e2e_stripped_udhl_8bit_concat_ucs2() {
+  g_current = "E2E ML307 剥 UDHL + 8-bit concat IE + UCS-2 → body 干净 (v4.0.24.1 stripped-UDHL guard)";
+  const char* body =
+    "07916649520080F0"  // SCA (8 bytes)
+    "40"                  // FO UDHI=1 (concat 标志在, 但 ML307 剥了 UDHL byte)
+    "07"                  // oaLen=7
+    "91"                  // ToA=international BCD
+    "8130793F"            // oaAddr (4 bytes)
+    "00"                  // PID
+    "08"                  // DCS=0x08 UCS-2
+    "32153382890608"      // SCTS (7 bytes)
+    "1B"                  // UDL=27 bytes (IE 5 + UD 22) — 注意 UDL 不含 UDHL byte (ML307 quirk)
+    "0003BB0901"          // IE 5 bytes 8-bit concat (无 UDHL 前缀, IEI=00 IEDL=03 refId=BB total=09 seq=01)
+    "00480065006C006C006F00200057006F0072006C0064";  // UD 22 bytes "Hello World" UCS-2 BE
+  size_t bodyLen = std::strlen(body);
+
+  bool isUcs2 = false, is7bit = false;
+  char utf8[256] = {0};
+  size_t n = fixture_sniffer_decode(body, bodyLen, &isUcs2, &is7bit, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+
+  // v4.0.24.1 fix 期望: 识别 stripped UDHL, skip 5 bytes (IE), decode 22 bytes UCS-2 = "Hello World" (n=11)
+  // v4.0.24 red: decode 27 bytes UCS-2 = 14 chars `ԀλँHello World` (U+0500 Ԁ + U+03BB λ + U+0901 ँ + 11 ASCII) FAIL
+  CHECK(isUcs2);
+  CHECK_EQ_INT(n, 11);
+  CHECK(memcmp(utf8, "Hello World", 11) == 0);
+}
+
+// Fixture K: v4.0.24.1 TDD red — ML307 剥 UDHL + 16-bit concat IE + UCS-2 → body 干净
+//   IE = "08 04 BB 09 09 01" (6 bytes, UDHL 被 ML307 剥)
+//   v4.0.24.1 fix 期望: 识别 stripped UDHL, skip 6 bytes (IE), decode 22 bytes UCS-2 → "Hello World" (n=11)
+//   v4.0.24 red: 函数读 IEI=0x08 当 UDHL=8, skip 9 bytes (1 UDHL+8 IE) → 丢 UD 前 3 bytes → "lo World" (n=8) FAIL
+static void test_pdu_e2e_stripped_udhl_16bit_concat_ucs2() {
+  g_current = "E2E ML307 剥 UDHL + 16-bit concat IE + UCS-2 → body 干净 (v4.0.24.1 stripped-UDHL guard)";
+  const char* body =
+    "07916649520080F0"
+    "40"                  // FO UDHI=1
+    "07"
+    "91"
+    "8130793F"
+    "00"
+    "08"                  // DCS=UCS-2
+    "32153382890608"
+    "1C"                  // UDL=28 bytes (IE 6 + UD 22)
+    "0804BB090901"        // IE 6 bytes 16-bit concat (无 UDHL 前缀, IEI=08 IEDL=04 refId=BB09 total=09 seq=01)
+    "00480065006C006C006F00200057006F0072006C0064";  // UD 22 bytes "Hello World" UCS-2 BE
+  size_t bodyLen = std::strlen(body);
+
+  bool isUcs2 = false, is7bit = false;
+  char utf8[256] = {0};
+  size_t n = fixture_sniffer_decode(body, bodyLen, &isUcs2, &is7bit, utf8, sizeof(utf8) - 1);
+  utf8[n] = 0;
+
+  // v4.0.24.1 fix 期望: 识别 stripped UDHL, skip 6 bytes (IE), decode 22 bytes UCS-2 = "Hello World" (n=11)
+  // v4.0.24 red: 函数误读 IEI=0x08 当 UDHL=8, skip 9 bytes (UDHL byte + 8 IE bytes) → 丢 UD 前 3 bytes → 解出部分 body FAIL
+  CHECK(isUcs2);
+  CHECK_EQ_INT(n, 11);
+  CHECK(memcmp(utf8, "Hello World", 11) == 0);
+}
+
 static void test_pdu_e2e_dtac_3seg_otp_5481_real_pdu() {
   g_current = "E2E dtac 3 段 concat OTP=5481 (refId=0xbcb4=48308) — 翔哥 boot #127 raw hex";
   // 翔哥 22:15 boot #127 dtac 3 段 concat 第 1 段原码 (188 hex = 94 bytes 简化版)
@@ -2133,6 +2210,9 @@ int main() {
   test_pdu_e2e_concat_8bit_ie_ucs2_skip_udh();   // concat 8-bit IE + UCS-2 → body 干净
   test_pdu_e2e_concat_16bit_ie_ucs2_skip_udh();  // concat 16-bit IE + UCS-2 → body 干净
   test_pdu_e2e_single_ucs2_no_udh_regression();  // 单条 UCS-2 无 UDH → regression check
+  // v4.0.24.1 TDD red: ML307 stripped-UDHL guard (review finding #1)
+  test_pdu_e2e_stripped_udhl_8bit_concat_ucs2(); // ML307 剥 UDHL + 8-bit concat IE → body 干净
+  test_pdu_e2e_stripped_udhl_16bit_concat_ucs2();// ML307 剥 UDHL + 16-bit concat IE → body 干净
   test_pdu_e2e_dtac_3seg_otp_5481_real_pdu();   // refId=0xbcb4=48308, OTP=5481, 3 段 concat
   test_pdu_e2e_dtac_1seg_otp_real_pdu();         // 单段 dtac OTP 短信
   test_pdu_e2e_dtac_concat_2seg_part1_real_pdu();// refId=0x5aa7=23207, total=2 seq=1, 第一段

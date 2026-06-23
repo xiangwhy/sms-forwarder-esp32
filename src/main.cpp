@@ -74,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.24"     // 2026-06-23: UCS-2/8-bit decode 路径 skip UDH concat IE 头 (main.cpp:1894 caller 加 pdu_udh_offset_ex, fix 翔哥 6/22 真机复现 dtacIR 9 段 concat 推送乱码 `Ԁλँ` prefix)/ v4.0.23 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.24.1"   // 2026-06-23: review 8 finding 修 3 个 high/cleanup (pdu_udh_offset_ex ML307 stripped-UDHL guard + 7-bit fallback 改 dataHex + 删 dead dataByteLen, host test 305/3 PASS)/ v4.0.24 UCS-2/8-bit decode 路径 skip UDH concat IE 头 (main.cpp:1894 caller 加 pdu_udh_offset_ex, fix 翔哥 6/22 真机复现 dtacIR 9 段 concat 推送乱码 `Ԁλँ` prefix)/ v4.0.23 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define PUSH_QUEUE_LEN     8   // 2026-06-22 保守优化: 16→8, 省 ~8.3KB; pushplus 推送慢, 8 缓冲够
@@ -1900,6 +1900,9 @@ static void sms_task(void* /*param*/) {
       //   翔哥 2026-06-22 真机复现 dtacIR 9 段 concat 全带 UDH prefix 乱码 (Ԁλँ/ं/ः/ऄ/अ) = 本 fix 触发 case
       //   v4.0.24.1 fix: 加 udhi gate — 只有 FO UDHI bit=1 才真含 UDH 头, 防单条 SMS / stash 拼接
       //     后第一字节内容(泰文 0x0E→UDHL=14)被误判 → 多 skip 15 bytes → 字节错位全乱码
+      //   v4.0.24.1 fix: pdu_udh_offset_ex 加 ML307 stripped-UDHL guard (review finding #1)
+      //     + 7-bit fallback (line 1971) 也用 dataHex 不用 udHex (review finding #2)
+      //   + 删 dead `dataByteLen` 变量 (review finding #4)
       size_t udhByteLen = 0;
       size_t udhSkipHex = 0;
       if (udhi) {
@@ -1907,7 +1910,6 @@ static void sms_task(void* /*param*/) {
       }
       const char* dataHex = udHex + udhSkipHex;       // skip UDHL+IE 后 UD 真正数据
       size_t dataHexLen = udFullHexLen - udhSkipHex;
-      size_t dataByteLen = udhByteLen > 0 ? (udBytes - udhByteLen) : udBytes;
       // is7bit / isUcs2 已从 TPDU 真相 DCS 判定 (concat/partial path 无 PDU header → 全 false)
       bool is8bitData = !is7bit && !isUcs2;
       // v4.0.11 fix: concat/partial path (udHexOff=0) 强制走 fallback 启发式
@@ -1966,9 +1968,11 @@ static void sms_task(void* /*param*/) {
         // 兜底: GSM7 decode 输出必须是合法 UTF-8
         // DCS=0 但实际 UCS-2 (gateway 标错, 泰文 0E23...) 当 7-bit 解会出无效 UTF-8
         // (含 lone continuation / 4+ byte sequence) → fallback UCS-2
+        // v4.0.24.1 fix (review finding #2): fallback 也用 dataHex (跳过 UDH concat IE 头),
+        //   修前 bug: DCS=0 + UCS-2 concat 7-bit 解出 garbage → fallback 解 udHex → IE 字节当 codepoint 输出 `Ԁλँ` prefix
         if (bodyN > 0 && !pdu::is_strict_utf8(bodyBuf, bodyN)) {
           ESP_LOGW(TAG, "SMS: 7-bit decode not strict UTF-8, fallback UCS-2");
-          bodyN = pdu::decode_body_field(udHex, udFullHexLen, bodyBuf, sizeof(bodyBuf));
+          bodyN = pdu::decode_body_field(dataHex, dataHexLen, bodyBuf, sizeof(bodyBuf));
           is7bit = false;
         }
       } else if (is8bitData) {

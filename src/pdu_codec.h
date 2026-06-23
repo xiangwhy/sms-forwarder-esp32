@@ -86,6 +86,9 @@ size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen);
 // 返回: UD 真正数据起点 hex 偏移 (skip UDH 头长度)
 //       0 = UDHL byte = 0 (单条 SMS 无 UDH) 或 PDU 太短 (UDHL byte 后 bytes 不够)
 //       caller 直接用 dataHex = udHex + retVal, dataHexLen = udHexLen - retVal
+// v4.0.24.1: 加 ML307 stripped-UDHL guard (review finding #1)
+//   首字节是 concat IEI (0x00=8-bit / 0x08=16-bit) + IEDL/total/seq 验证通过 → 假定 ML307 剥 UDHL byte
+//   skip 5/6 bytes (IE only, 无 UDHL byte), caller 解出完整 UD 数据
 // 配套 main.cpp:1973-1975 UCS-2 decode + main.cpp:1958-1972 8-bit raw path: 这 2 个 path
 //   之前从 udHex 直接解, 没 skip UDH concat IE 头 → IE `05 00 03 BB 09 NN` 6 bytes
 //   被当 UCS-2 codepoint 输出成 `Ԁλँ` 字符 (翔哥 2026-06-22 真机复现 dtacIR 9 段 concat case)
