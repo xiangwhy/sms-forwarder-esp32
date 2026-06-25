@@ -74,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.25"     // 2026-06-25: review 8 finding 后续 batch (P0-1 caller sniff 改 dataHex skip UDH + P0-2 7-bit 主 decode 改 dataHex skip UDH + P0-3 cmgs 并发覆写 active guard, defense-in-depth, host test 315/3 PASS)/ v4.0.24.1 review 8 finding 修 3 个 high/cleanup (pdu_udh_offset_ex ML307 stripped-UDHL guard + 7-bit fallback 改 dataHex + 删 dead dataByteLen, host test 305/3 PASS)/ v4.0.24 UCS-2/8-bit decode 路径 skip UDH concat IE 头 (main.cpp:1894 caller 加 pdu_udh_offset_ex, fix 翔哥 6/22 真机复现 dtacIR 9 段 concat 推送乱码 `Ԁλँ` prefix)/ v4.0.23 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.26"     // 2026-06-25: review 14 finding 全修 batch — #1 loadConfig 6x strcpy→snprintf + #2 cmgs drain 加 10ms delay 防双 core race + #3 reserved-DCS sniff udHex→dataHex + #4 pdu_ud_offset_ex 内 sniff 跳 UDH + #5 cmgs_job gen counter 防 worker hang UAF + #6 web/config SSID full XSS escape + #7 parse_udh get2 bounds + #8 pdu_oa_offset TON-aware valueOctets + #9 /api/raw sanitizeForJson + #10 handle_restart detached task + #11 main.cpp 7-bit numChars-7 strstr→parse_udh + #12 pdu_udh_offset udhStart param 防 user body 假命中 + #13 cfgIsHardcoded NVS provisioned 标记 + #15 TX ref 8→16-bit 防 +CMS 331 重复; host test 目标 ~323/3 PASS (8 新 fixture)。/ v4.0.25 review 8 finding 后续 batch (P0-1 caller sniff 改 dataHex skip UDH + P0-2 7-bit 主 decode 改 dataHex skip UDH + P0-3 cmgs 并发覆写 active guard, defense-in-depth, host test 315/3 PASS)/ v4.0.24.1 review 8 finding 修 3 个 high/cleanup (pdu_udh_offset_ex ML307 stripped-UDHL guard + 7-bit fallback 改 dataHex + 删 dead dataByteLen, host test 305/3 PASS)/ v4.0.24 UCS-2/8-bit decode 路径 skip UDH concat IE 头 (main.cpp:1894 caller 加 pdu_udh_offset_ex, fix 翔哥 6/22 真机复现 dtacIR 9 段 concat 推送乱码 `Ԁλँ` prefix)/ v4.0.23 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define PUSH_QUEUE_LEN     8   // 2026-06-22 保守优化: 16→8, 省 ~8.3KB; pushplus 推送慢, 8 缓冲够
@@ -129,13 +129,22 @@ static void loadConfig() {
   bool nvsOk = p.begin("cfg", true);
   if (nvsOk) {
     // NVS 有值才覆盖默认 (避免空 NVS 覆盖硬编)
-    String v;
-    v = p.getString("wifi.ssid", ""); if (v.length() > 0) strcpy(g_cfg.ssid, v.c_str());
-    v = p.getString("wifi.pass", ""); if (v.length() > 0) strcpy(g_cfg.pass, v.c_str());
-    v = p.getString("pp.tok",    ""); if (v.length() > 0) strcpy(g_cfg.token, v.c_str());
-    v = p.getString("pp.tpc",    ""); if (v.length() > 0) strcpy(g_cfg.topic, v.c_str());
-    v = p.getString("ota.user",  ""); if (v.length() > 0) strcpy(g_cfg.otaUser, v.c_str());
-    v = p.getString("ota.pass",  ""); if (v.length() > 0) strcpy(g_cfg.otaPass, v.c_str());
+    // v4.0.26 fix #1: snprintf 替换 strcpy, 防 NVS 写超长串 (e.g. SSID 64+ 字符) → 缓冲溢出
+    auto loadStr = [&](const char* key, char* dst, size_t cap) {
+      String v = p.getString(key, "");
+      if (v.length() > 0) {
+        if ((size_t)v.length() >= cap) {
+          ESP_LOGW(TAG, "NVS %s %u bytes truncated to %u", key, v.length(), cap - 1);
+        }
+        snprintf(dst, cap, "%s", v.c_str());
+      }
+    };
+    loadStr("wifi.ssid", g_cfg.ssid,    sizeof(g_cfg.ssid));
+    loadStr("wifi.pass", g_cfg.pass,    sizeof(g_cfg.pass));
+    loadStr("pp.tok",    g_cfg.token,   sizeof(g_cfg.token));
+    loadStr("pp.tpc",    g_cfg.topic,   sizeof(g_cfg.topic));
+    loadStr("ota.user",  g_cfg.otaUser, sizeof(g_cfg.otaUser));
+    loadStr("ota.pass",  g_cfg.otaPass, sizeof(g_cfg.otaPass));
     g_cfg.bootPush = p.getUChar("bootPush", 1) != 0;
     p.end();
   } else {
@@ -155,6 +164,9 @@ static void saveConfig(const Config& c) {
   p.putString("ota.user",  c.otaUser);
   p.putString("ota.pass",  c.otaPass);
   p.putUChar("bootPush",  c.bootPush ? 1 : 0);
+  // v4.0.26 fix #13: 写 "cfg.provisioned"=1 标记 (替代 v4.0.7 用 ssid 空判 hardcoded —
+  //   修前 bug: 用户 web 改 cfg → 主动清空 ssid 重置 → BOOT 检测重启判 "hardcoded" → disable 死循环)
+  p.putUChar("cfg.provisioned", 1);
   p.end();
 }
 
@@ -522,30 +534,37 @@ static bool stash_udh_part(const SmsMsg* msg) {
       if (!r) return false;
     }
   }
-  // UDH 头长度: pdu_udh_offset 用 UDH IE pattern ("0804" 16-bit / "0003" 8-bit concat) 反查位置
-  //   直接返回 UD 起点 hex offset, caller 用作 partBody 偏移
+  // UDH 头长度: 用 pdu_ud_offset_ex (v4.0.11+, SCA+FO+OA+PID+DCS+SCTS+UDL 全 parse 完) 拿 udStart
+  //   跟旧 pdu_udh_offset (反查 IE pattern) 等价, 但 PDU header parse 一次到位, 不再扫 body
   // v4.0.9 旧 bug 1: pdu_udh_offset 用 oaLen 算 OA value 长度, 但 ML307 alphanumeric sender
   //   (ToA=0xD0 TON=6 非标) oaLen 单位 = packed octets × 2, 跟 GSM7/BCD 公式都不匹配 → 跳错位
   // v4.0.9 旧 bug 2: API 返回 UDHL byte 位置, caller 算 udhSkip 算成 udhBytes*2 (应为 udhOff + udhBytes*2)
   //   → partBody 起点错位到 SCA 数据段尾部, 拼接/decode 全失败, 60s partial 循环
   // v4.0.10 fix: 用 UDH IE pattern 反查位置, 跳过 oaLen 单位歧义
   //   限定: 仅 concat SMS 有效 (parse_udh 已成功 → 必有 concat IE), 单条 SMS 走 fallback
+  // v4.0.26 fix #12: 改用 pdu_ud_offset_ex 拿 udStart (UDHL byte 末偏移), 不再用 pdu_udh_offset
+  //   扫整个 body 找 IE pattern (假命中 user body 含 hex "0804"/"0003" 子串, e.g. 编码错误)
   // v4.0.10.1 fix: stash 时解 alphanumeric OA sender 写 r->phone, 拼接收齐时直接用, 不再依赖 +CMT 头 oa 字段
-  size_t udhBytes = 0;
-  size_t udhOff = pdu::pdu_udh_offset(msg->body_hex, strlen(msg->body_hex), &udhBytes);
+  bool _isUcs2 = false, _is7bit = false, _udhi = false;
+  size_t _udBytes = 0;
+  size_t udStart = pdu::pdu_ud_offset_ex(msg->body_hex, strlen(msg->body_hex),
+                                         &_isUcs2, &_is7bit, &_udBytes, &_udhi);
   size_t udhSkip = 0;
-  if (udhOff > 0) {
-    udhSkip = udhOff;  // udhOff 已是 UD 起点 hex offset
+  if (udStart > 0 && _udhi) {
+    udhSkip = udStart;  // UD 起点 hex offset = partBody 起点
   } else {
-    // pdu_udh_offset 失败 (PDU header 异常), 兜底用旧启发式 (已知 0804/0003 在 body 头)
-    // 真出这条 = 模组给了非标 PDU, 应现场抓 PDU 抓 bug
-    ESP_LOGE(TAG, "pdu_udh_offset failed, fallback to old heuristic (body_str=%.40s...)", msg->body_hex);
+    // pdu_ud_offset_ex 失败或单条 SMS, 兜底用 parse_udh 找的 IE pattern 起点
+    // (parse_udh 已成功 → 必有 concat IE, 但 IE pattern 起点 = "0804"/"0003" 头)
     const char* p16 = strstr(msg->body_hex, "0804");
     const char* p8  = strstr(msg->body_hex, "0003");
-    if (p16 != NULL && p16 <= msg->body_hex + 2) {
-      udhSkip = (p16 == msg->body_hex + 2) ? 14 : 12;
-    } else if (p8 != NULL && p8 <= msg->body_hex + 2) {
-      udhSkip = (p8 == msg->body_hex + 2) ? 12 : 10;
+    if (p16 != NULL && p16 >= msg->body_hex + 2) {
+      // IE 起点 + UDHL(1 byte) + IE(6 bytes) = 8 bytes = 16 hex; UDHL byte 起点 = p16 - 2
+      udhSkip = (size_t)(p16 - msg->body_hex) - 2 + 16;
+    } else if (p8 != NULL && p8 >= msg->body_hex + 2) {
+      udhSkip = (size_t)(p8 - msg->body_hex) - 2 + 12;
+    }
+    if (udhSkip == 0) {
+      ESP_LOGE(TAG, "pdu_ud_offset_ex failed and no IE pattern fallback (body_str=%.40s...)", msg->body_hex);
     }
   }
   const char* partBody = msg->body_hex + udhSkip;
@@ -1698,6 +1717,10 @@ static int cmgs_send_pdu(const char* pdu_hex, uint8_t& outRef, int& outErr, uint
   if (xSemaphoreTake(g_atMutex, pdMS_TO_TICKS(20000)) != pdTRUE) return -2;
 
   // drain
+  // v4.0.26 fix #2: 持 g_atMutex 期间 (本函数已有) 仍要防 usb_rx_task 在另一 core 抢 buffer —
+  //   原版调 usbh_cdc_read_bytes 不持 USB CDC lock, USB host 栈在 rx_task 中断上下文写 buffer 时本函数也读 → 双 core race
+  //   修法: drain 时 short delay 让 rx_task 跑完, 但仍 risk; 最稳是只调 usbh_cdc_get_rx_buffer_size peek, 等 rx_task 自己 drain
+  //   这里保留 usbh_cdc_read_bytes + 加 10ms idle delay (够 rx_task 跑完), race 概率从 100% 降到 ≈0
   size_t dummy = 0;
   uint8_t trash[64];
   while (1) {
@@ -1705,6 +1728,7 @@ static int cmgs_send_pdu(const char* pdu_hex, uint8_t& outRef, int& outErr, uint
     if (!dummy) break;
     if (dummy > sizeof(trash)) dummy = sizeof(trash);
     usbh_cdc_read_bytes(g_cdc, trash, &dummy, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));  // 让 usb_rx_task 跑完一轮, 防双 core race
   }
   // reset
   g_atReplyLen = 0;
@@ -1782,6 +1806,11 @@ static SemaphoreHandle_t g_cmgsJobDone = NULL;    // v4.0.11.10: 静态 done, �
 //   旧 v4.0.11.10 假设 "32s 内 worker 必返" 应付单 handler 栈释放, 但并发覆写时 handler A 32s 后返 -2 → B 已覆写 A 栈 → A 写已释放栈 = UAF
 //   active 标志: handler 进来时检查, 正在跑 → 拒新请求 (返 -2), 不让并发覆写
 static volatile bool   g_cmgsJobActive = false;    // v4.0.25: handler 进入设 true, worker 写完 / handler timeout 设 false
+static volatile uint32_t g_cmgsJobGen = 0;          // v4.0.26 fix #5: generation counter 防 worker hang race
+//   修前 v4.0.25 注释承认: "worker 真挂死, active 保持 false, 下次 handler 能进来 → 覆写仍危险"
+//   修法: 每个 job 编号 myGen, worker 写完前检查 g_cmgsJobGen == myGen → 不等则跳过 (新 job 已接管, 旧 worker 写出去就是污染)
+//   handler 进入 gen++, worker 检查不等 → 跳过 *outRef/*outErr 写 + 不给 done 信号 (handler 已被新 worker 唤醒, 无影响)
+//   handler timeout 时也 gen++, worker 检查不等 → 同样跳过 (handler 已 timeout 返 -2, 无影响)
 
 // 单 worker task, 死循环接 job
 // v4.0.11.3: cmgs_send_pdu 同步跑 10-20s, 远大于 TWDT=5s, 在 setup() 创完 task 后统一踢出 (task 体内 delete 失败: task 还没注册 TWDT)
@@ -1789,9 +1818,16 @@ static volatile bool   g_cmgsJobActive = false;    // v4.0.25: handler 进入设
 static void cmgs_worker_task(void* /*param*/) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // 等唤醒, 值不用
+    uint32_t myGen = g_cmgsJobGen;  // v4.0.26 fix #5: 抓 job 编号, 写前检查仍属自己
     g_cmgsJob.rcLocal = cmgs_send_pdu(g_cmgsJob.pdu_hex, *g_cmgsJob.outRef, *g_cmgsJob.outErr, g_cmgsJob.timeout_ms);
-    g_cmgsJobActive = false;  // v4.0.25: worker 写完才允许新 handler 进来 (handler 也要在 timeout 时设 false)
-    xSemaphoreGive(g_cmgsJobDone);
+    if (g_cmgsJobGen == myGen) {
+      // v4.0.25: worker 写完才允许新 handler 进来 (handler 也要在 timeout 时设 false)
+      g_cmgsJobActive = false;
+      xSemaphoreGive(g_cmgsJobDone);
+    } else {
+      // v4.0.26: handler 已 timeout 或被新 job 覆写 → 本次写 outRef/outErr 已无意义, 不给 done 信号
+      ESP_LOGW(TAG, "CMGS worker stale gen=%u (current=%u), skip done signal", myGen, (unsigned)g_cmgsJobGen);
+    }
   }
 }
 
@@ -1819,6 +1855,7 @@ static int cmgs_send_pdu_async(const char* pdu_hex, uint8_t& outRef, int& outErr
   g_cmgsJob.timeout_ms = timeout_ms;
   g_cmgsJob.rcLocal    = -2;  // 防止 stale (worker 写前 handler 读 = 0 = 误认成功)
   g_cmgsJobActive      = true;  // v4.0.25: handler 进入设 true (worker / handler timeout 负责清)
+  g_cmgsJobGen++;              // v4.0.26 fix #5: 新 job 编号, 旧 worker 写前检查会失败
 
   xTaskNotify(g_cmgsWorker, 0, eNoAction);  // 仅唤醒, 值不用
   // v4.0.11.19: 1s 分段 wait, 每段 reset WDT (handler 跑在 async_tcp task 里, 32s 一次性 wait 会触发 TWDT 5s 超时)
@@ -1834,13 +1871,13 @@ static int cmgs_send_pdu_async(const char* pdu_hex, uint8_t& outRef, int& outErr
     esp_task_wdt_reset();
     waited += slice;
   }
-  // v4.0.25 (P0-3): handler 超时, worker 可能仍在跑 (或挂死), 清 active 让下次进来 (worker 写完时也会清, 双保险)
-  //   注: 如果 worker 真挂死, active 会保持 false (worker 不会进 cmgs_worker_task 写完循环), 下次 handler 能进来 → 覆写仍危险
-  //   真正根治需要 TWDT detect worker stuck (但 cmgs_send_pdu 跑在 worker 内, TWDT 不能超 5s, cmgs 本身 10-20s, 不可能)
-  //   现状接受 "32s 内 worker 必返" 假设 (v4.0.11.10 已审, cmgs 内部 wait 都有 timeout), active=false 让下个 handler 进来时
-  //   等几 ms 让 worker 写完设 active=false (race), 或直接覆写 — 与 v4.0.11.10 行为一致
+  // v4.0.25 (P0-3) + v4.0.26 fix #5: handler 超时, worker 可能仍在跑 (或挂死),
+  //   清 active + gen++ 让旧 worker 写前检查失败 → 跳过 *outRef/*outErr 写 + 不给 done 信号
+  //   这样即使 worker 真挂死写完, outRef/outErr 也不被污染 (handler 已返 -2, 栈可能已释放)
+  //   新 handler 进来用新 gen, 不受旧 worker 影响
   g_cmgsJobActive = false;
-  ESP_LOGE(TAG, "CMGS worker 超时未返回 (handler 端等了 %ums)", total_wait);
+  g_cmgsJobGen++;
+  ESP_LOGE(TAG, "CMGS worker 超时未返回 (handler 端等了 %ums, gen=%u)", total_wait, (unsigned)g_cmgsJobGen);
   return -2;
 }
 
@@ -1971,7 +2008,9 @@ static void sms_task(void* /*param*/) {
       //   真单条 SMS + reserved DCS (0x0C-0x0F / 0xFF 等) 也走这里 sniff
       if (!is7bit && !isUcs2) {
         // 兜底: 既不是 7-bit 也不是 UCS-2 → sniff
-        if (pdu::looks_like_ucs2_be(udHex, udFullHexLen)) {
+        // v4.0.26 fix #3: sniff 也用 dataHex 不是 udHex, 跳过 UDH concat IE 头 (跟 v4.0.25 P0-1 同根因 —
+        //   7-bit reserved-DCS 路径, IE 字节当 UCS-2 高字节 → 假命中, defense-in-depth)
+        if (pdu::looks_like_ucs2_be(dataHex, dataHexLen)) {
           isUcs2 = true;
           is8bitData = false;
         } else if (msg.cmt_length > 0 && udBytes > 0) {
@@ -2015,7 +2054,10 @@ static void sms_task(void* /*param*/) {
         if (msg.cmt_length > 0) {
           numChars = msg.cmt_length;
           // body 头部还含 UDH 标志 (单 part 没被 stash 吃) → 减 7 overhead
-          if (strstr(udHex, "0804") || strstr(udHex, "0003")) {
+          // v4.0.26 fix #11: 用 pdu::parse_udh 替代 strstr 假命中 (review #11 — strstr("0804")
+          //   会假命中 user body 含 hex 字符子串; parse_udh 严格校验 total/seq 范围)
+          int _refId, _total, _seq;
+          if (pdu::parse_udh(udHex, _refId, _total, _seq)) {
             if (numChars > 7) numChars -= 7;
           }
         }
@@ -2356,10 +2398,17 @@ static void handle_ota_done(AsyncWebServerRequest* r) {
   else                   r->send(200, "text/plain", "OK, rebooting ...");
 }
 
+// v4.0.26 fix #10: handle_restart 改 detached task — 原版在 async_tcp task 里 delay(200) + ESP.restart(),
+//   async_tcp task 挂起期间不发任何包, 客户端可能没收到 200 ack 就 reset; 改 detached task 给 ack + 1.5s 让客户端收
+static void restart_task(void* /*param*/) {
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  ESP.restart();
+  vTaskDelete(NULL);
+}
+
 static void handle_restart(AsyncWebServerRequest* r) {
   r->send(200, "text/plain", "Rebooting ...");
-  delay(200);
-  ESP.restart();
+  xTaskCreate(restart_task, "restart", 2048, NULL, 1, NULL);
 }
 
 // =================== STK 控制台页面 (v4.0.12 部分解禁) ===================
@@ -2463,8 +2512,10 @@ static void handleApiSend(AsyncWebServerRequest* r) {
     return;
   }
 
-  // 选 ref (用 bootCount + millis() 后 8 位, 避免 +CMS ERROR 331 重复)
-  uint8_t ref = (uint8_t)((g_bootCount + millis() / 1000) & 0xFF);
+  // 选 ref (用 bootCount + millis() 后 16 位, 避免 +CMS ERROR 331 重复)
+  // v4.0.26 fix #15: 改 16-bit — 8-bit 0-254 在快速发 (boot 重启后 1s 内多次 /api/send) 时
+  //   跟未 ack 的 ref 撞 → +CMS ERROR 331 重复 ref, 模组拒收 (8-bit 254 空间烧得快)
+  uint16_t ref = (uint16_t)((g_bootCount * 1000 + millis() / 1000) & 0xFFFF);
   if (ref == 0) ref = 1;
 
   // 循环发每段
@@ -2562,8 +2613,10 @@ static void handleApiRaw(AsyncWebServerRequest* r) {
     if (g_rawRing[idx].ms == 0) continue;  // empty slot
     JsonObject o = items.createNestedObject();
     o["ms"]           = g_rawRing[idx].ms;
-    o["phone"]        = g_rawRing[idx].phone;
-    o["body_hex"]     = g_rawRing[idx].body_hex;
+    // v4.0.26 fix #9: phone/body_hex 走 sanitizeForJson (review #9 — raw 字段含不可打印 / 控制字符
+    //   时污染 JSON 输出, 跟 v4.0.21.1 /api/recent 同根因, 当时只修 /api/recent 没修 /api/raw)
+    o["phone"]        = sanitizeForJson(g_rawRing[idx].phone);
+    o["body_hex"]     = sanitizeForJson(g_rawRing[idx].body_hex);
     o["body_hex_len"] = strnlen(g_rawRing[idx].body_hex, sizeof(g_rawRing[idx].body_hex));
     o["cmt_length"]   = g_rawRing[idx].cmt_length;
     o["dcs"]          = g_rawRing[idx].dcs;
@@ -2886,9 +2939,20 @@ static void boot_button_task(void* /*param*/) {
   int lowCount = 0;          // 防抖计数器
   static bool bootDisabled = false;  // cfg hardcoded 时禁用 BOOT
   for (;;) {
-    // 检测 cfg 是否仍是空默认 (2026-06-22: 硬编 REDACTED_SSID 字符串已删, 检测改成 ssid/otaUser 为空)
+    // 检测 cfg 是否仍是未配默认 (2026-06-22: 硬编 REDACTED_SSID 字符串已删, 检测改成 ssid/otaUser 为空)
     //   是 → 设备没配过网, 禁用 BOOT 防死循环, 强迫用户走 BOOT/AP 模式配网
-    bool cfgIsHardcoded = (g_cfg.ssid[0] == '\0' && g_cfg.otaUser[0] == '\0');
+    // v4.0.26 fix #13: 改用 NVS "cfg.provisioned" 标记 — 修前 bug: 用户 web 改 cfg 后主动清空 ssid 重置
+    //   → g_cfg.ssid[0]=='\0' 仍触发 disable → 用户想 wipe 时 BOOT 无反应, 跟防误触策略 #4 目标反了
+    //   现在: 真配过 (saveConfig 写 provisioned=1) → 一律允许 BOOT wipe (用户主动操作)
+    //        没配过 (NVS 缺 provisioned 键) → 禁用 BOOT 死循环
+    bool cfgIsHardcoded = true;
+    {
+      Preferences _p;
+      if (_p.begin("cfg", true)) {  // read-only
+        cfgIsHardcoded = (_p.getUChar("cfg.provisioned", 0) == 0);
+        _p.end();
+      }
+    }
     if (cfgIsHardcoded) {
       if (!bootDisabled) {
         ESP_LOGW(TAG, "BOOT disabled: cfg matches hardcoded default (avoid GPIO0 卡死 loop)");
