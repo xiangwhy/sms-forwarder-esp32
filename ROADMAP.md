@@ -1,6 +1,6 @@
 # 路线图 (Roadmap)
 
-v4.0.23 代码已就绪 (2026-06-22, 待烧 — 翔哥拍板)。v4.0.5 → v4.0.23 期间改动:
+v4.0.25 已烧 (2026-06-25 当前生产, Boot #146)。v4.0.5 → v4.0.25 期间改动:
 
 - **内存优化** (4 缓冲 -40.7KB, heap 占用 85% → 66%, min_free 42K → 88K):
   - `STK_LOG_CAP` 256→64 (省 15.4KB, 单点最大)
@@ -25,7 +25,9 @@ v4.0.23 代码已就绪 (2026-06-22, 待烧 — 翔哥拍板)。v4.0.5 → v4.0.
 | 数据用量统计 | M | 翔哥 v4.0 不要,改主意可加 |
 | MQTT 集成 | M | 引 PubSubClient |
 | 国际化 (中英 UI) | M | |
-| v4.0.23 factory.bin 打包 + GitHub Release | S | 配合 v4.0.23 工厂首次烧录场景 |
+| v4.0.23 factory.bin 打包 | S | 配合工厂首次烧录场景 (代码已就绪, 工厂镜像待打包) |
+| v4.0.24.1 UCS-2 UDH skip + review fix | ✅ | 已合已 push 已 tag 已烧 (305/3 host test) |
+| v4.0.25 review fix batch 后续 (P0-1/2/3) | ✅ | 已合已 commit 已烧 (315/3 host test, defense-in-depth + 7-bit 主路径 dataHex + cmgs cancel guard) |
 | `MAX_UDH_REFS` 4→2 (再省 8.5KB) | S | 仅在 min_free 持续 < 30K 时再砍 |
 
 ## 远期想法
@@ -37,14 +39,16 @@ v4.0.23 代码已就绪 (2026-06-22, 待烧 — 翔哥拍板)。v4.0.5 → v4.0.
 
 ## 翔哥立刻能做的
 
-v4.0.23 内存稳定, **不用急开新版本**。如果某天:
+v4.0.25 已烧 (review fix batch 后续 + defense-in-depth), **不用急开新版本**。如果某天:
 - WiFi 挂想用 4G 推送 → 提 issue。v4.0.3 已删 RNDIS 死路径,**走 esp_eth 重做 RNDIS** 或换模组(WiFi 永断场景才能补)
 - 收到 4 段以上长短信仍异常 → 提 issue, 4 段以上 silently drop 是 v4.0.23 设计权衡 (UDH 内存省)
 - 想要其他 push 通道 / 关键词过滤 / MQTT → 提 issue, 我们加
 - min_free 持续 < 30K → 提 issue, 我们砍 `MAX_UDH_REFS` 4→2 再省 8.5KB
+- 5 段以上长短信 dtac gateway 仍乱码 → 提 issue, v4.0.25 修了 4 段以下 UCS-2/8-bit + ML307 stripped-UDHL + 7-bit 主路径, 但 5+ 段未覆盖
+- 并发 /api/send 撞 cmgs UAF → 提 issue, v4.0.25 加 active guard, 但 worker 真挂死仍可能 UAF (根治需 TWDT detect worker stuck, 当前接受 32s 内 worker 必返假设)
 
 ---
 
-**当前状态**: v4.0.22 仍生产 (Boot #128, 2026-06-22 烧)。v4.0.23 代码 HEAD 已就绪, 烧板等拍板。
+**当前状态**: v4.0.25 当前生产 (2026-06-25 烧, Boot #146, host test 315/3 PASS)。代码 HEAD = 当前生产, 无未烧 commit。
 **本地 build**: `pio run` 产物 `.pio/build/esp32-s3-devkitc-1/firmware.bin`
-**GitHub Release**: https://github.com/xiangwhy/sms-forwarder-esp32/releases/tag/v4.0.5 (v4.0.23 工厂镜像待打包)
+**GitHub Release**: https://github.com/xiangwhy/sms-forwarder-esp32/releases/tag/v4.0.24.1 (v4.0.25 工厂镜像待打包)
