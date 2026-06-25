@@ -74,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.24.1"   // 2026-06-23: review 8 finding 修 3 个 high/cleanup (pdu_udh_offset_ex ML307 stripped-UDHL guard + 7-bit fallback 改 dataHex + 删 dead dataByteLen, host test 305/3 PASS)/ v4.0.24 UCS-2/8-bit decode 路径 skip UDH concat IE 头 (main.cpp:1894 caller 加 pdu_udh_offset_ex, fix 翔哥 6/22 真机复现 dtacIR 9 段 concat 推送乱码 `Ԁλँ` prefix)/ v4.0.23 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
+#define FW_VERSION         "v4.0.25"     // 2026-06-25: review 8 finding 后续 batch (P0-1 caller sniff 改 dataHex skip UDH + P0-2 7-bit 主 decode 改 dataHex skip UDH + P0-3 cmgs 并发覆写 active guard, defense-in-depth, host test 315/3 PASS)/ v4.0.24.1 review 8 finding 修 3 个 high/cleanup (pdu_udh_offset_ex ML307 stripped-UDHL guard + 7-bit fallback 改 dataHex + 删 dead dataByteLen, host test 305/3 PASS)/ v4.0.24 UCS-2/8-bit decode 路径 skip UDH concat IE 头 (main.cpp:1894 caller 加 pdu_udh_offset_ex, fix 翔哥 6/22 真机复现 dtacIR 9 段 concat 推送乱码 `Ԁλँ` prefix)/ v4.0.23 内存优化 (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8) 省 ~40.7KB; 228K→~188K (85%→66%)。注: 2026-06-22 早上撤回的 v4.0.23 是 UDH/BCD fix 决策,这次复用编号(burn 后台账)/ v4.0.22: sniffer fallback 信任 pdu_ud_offset_ex (dtac 真乱码 SCA 部分修)/ v4.0.21.1 sanitizeForJson / v4.0.21 长短信完整显示 / v4.0.20 pdu_ud_offset_ex + looks_like_ucs2_be 双阈值 / v4.0.15 STK 响应路径解禁 (仅 AT+STKR) / v4.0.14 main.cpp HTML 物理抽; bump FW_VERSION 宏 + 主页 app.h 可见 fw-tag (子页 dashboard/stk/send 的 fw-tag 是 iframe 死代码,不 bump)
 
 #define SMS_QUEUE_LEN      16
 #define PUSH_QUEUE_LEN     8   // 2026-06-22 保守优化: 16→8, 省 ~8.3KB; pushplus 推送慢, 8 缓冲够
@@ -757,6 +757,39 @@ static volatile uint16_t g_rxLogHead  = 0;
 static volatile uint16_t g_rxLogCount = 0;
 static portMUX_TYPE     g_rxLogMux    = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t         g_bootMs      = 0;   // boot 时的 millis (用作 uptime 基线, = 0)
+
+// =================== v4.0.24.2 (debug): raw SMS body_hex ring buffer ===================
+// 翔哥 2026-06-25 真机 dtac 撞乱码 (v4.0.24.1 g_rxLog 只存 decoded body 不存 raw body_hex),
+//   临时 debug 抓最近 N 条 SMS 的 raw body_hex + cmt_length + dcs 给 /api/raw 看
+//   等下次撞乱码立刻 curl /api/raw 看 raw 字节反推根因
+//   不 bump FW_VERSION (按 feedback-bump-fw-version: debug instrumentation 不算功能改动)
+//   烧完稳后可以删 (commit 加 cleanup finding 标 TODO)
+// BSS 预算: 8 × 543 bytes ≈ 4.3KB (freeHeap 126K / minFree 81K 够)
+#define RAW_RING_CAP 8
+typedef struct {
+  uint32_t ms;
+  char     phone[24];
+  char     body_hex[AT_LINE_BUF];   // 512 bytes, raw PDU body (跳过 SCA+FO+OA+PID+DCS+SCTS+UDL)
+  uint16_t cmt_length;
+  uint8_t  dcs;
+} RawRingEntry;
+static RawRingEntry      g_rawRing[RAW_RING_CAP] = {{0}};
+static volatile uint8_t  g_rawRingHead = 0;
+static portMUX_TYPE      g_rawRingMux  = portMUX_INITIALIZER_UNLOCKED;
+
+static void raw_ring_write(const SmsMsg& msg) {
+  portENTER_CRITICAL(&g_rawRingMux);
+  uint8_t idx = g_rawRingHead;
+  g_rawRing[idx].ms = millis();
+  strncpy(g_rawRing[idx].phone, msg.phone_hex, sizeof(g_rawRing[idx].phone) - 1);
+  g_rawRing[idx].phone[sizeof(g_rawRing[idx].phone) - 1] = 0;
+  strncpy(g_rawRing[idx].body_hex, msg.body_hex, sizeof(g_rawRing[idx].body_hex) - 1);
+  g_rawRing[idx].body_hex[sizeof(g_rawRing[idx].body_hex) - 1] = 0;
+  g_rawRing[idx].cmt_length = msg.cmt_length;
+  g_rawRing[idx].dcs        = msg.dcs;
+  g_rawRingHead = (uint8_t)((idx + 1) % RAW_RING_CAP);
+  portEXIT_CRITICAL(&g_rawRingMux);
+}
 
 static void rx_log_write(const char* phone, const char* body) {
   portENTER_CRITICAL(&g_rxLogMux);
@@ -1744,6 +1777,11 @@ static TaskHandle_t    g_cmgsWorker   = NULL;
 static TaskHandle_t    g_netWorker    = NULL;   // v4.0.11.3: 给 setup 踢 TWDT 用
 static CmgsJob         g_cmgsJob;                 // v4.0.11.10: 静态单例, 替原栈 job + 堆 outRc
 static SemaphoreHandle_t g_cmgsJobDone = NULL;    // v4.0.11.10: 静态 done, 替原 xSemaphoreCreateBinary/delete 反复
+// v4.0.25 (P0-3 defense-in-depth): 取消 guard 防并发覆写
+//   两个 /api/send handler 抢同一单例: B 覆写 A.pdu_hex → worker 拿 B 跑 (g_cmgsJob.outRef/outErr 仍指 A 的栈) → 写 A 出参给 B 的结果
+//   旧 v4.0.11.10 假设 "32s 内 worker 必返" 应付单 handler 栈释放, 但并发覆写时 handler A 32s 后返 -2 → B 已覆写 A 栈 → A 写已释放栈 = UAF
+//   active 标志: handler 进来时检查, 正在跑 → 拒新请求 (返 -2), 不让并发覆写
+static volatile bool   g_cmgsJobActive = false;    // v4.0.25: handler 进入设 true, worker 写完 / handler timeout 设 false
 
 // 单 worker task, 死循环接 job
 // v4.0.11.3: cmgs_send_pdu 同步跑 10-20s, 远大于 TWDT=5s, 在 setup() 创完 task 后统一踢出 (task 体内 delete 失败: task 还没注册 TWDT)
@@ -1752,6 +1790,7 @@ static void cmgs_worker_task(void* /*param*/) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // 等唤醒, 值不用
     g_cmgsJob.rcLocal = cmgs_send_pdu(g_cmgsJob.pdu_hex, *g_cmgsJob.outRef, *g_cmgsJob.outErr, g_cmgsJob.timeout_ms);
+    g_cmgsJobActive = false;  // v4.0.25: worker 写完才允许新 handler 进来 (handler 也要在 timeout 时设 false)
     xSemaphoreGive(g_cmgsJobDone);
   }
 }
@@ -1760,9 +1799,16 @@ static void cmgs_worker_task(void* /*param*/) {
 // v4.0.11.19 P0: 分段 wait + 每 1s 调 esp_task_wdt_reset() — 之前 32s 一次性 xSemaphoreTake,
 //   async_tcp task 挂起不喂 WDT → 5s 后 TWDT 触发 "async_tcp" panic (回 ack 都没回)
 //   修法: 1s 分段 wait, 每段 reset WDT, 总时长不变 (32s 变 32 次 1s)
+// v4.0.25 (P0-3): 加 active guard, 并发 /api/send handler 拒新请求, 防止 g_cmgsJob 字段覆写 → UAF
 static int cmgs_send_pdu_async(const char* pdu_hex, uint8_t& outRef, int& outErr, uint32_t timeout_ms) {
   outRef = 0; outErr = 0;
   if (!g_cmgsWorker || !g_cmgsJobDone) return -2;  // setup() 还没起来
+
+  // v4.0.25 (P0-3): 取消 guard — 上一个 job 还在跑, 拒新请求 (防并发覆写 g_cmgsJob 单例字段 → UAF)
+  if (g_cmgsJobActive) {
+    ESP_LOGW(TAG, "CMGS worker busy, dropping new request (active=true)");
+    return -2;
+  }
 
   // 清残留 done (上一轮已 take, 应该是 0; 保险起见非阻塞 drain)
   xSemaphoreTake(g_cmgsJobDone, 0);
@@ -1772,6 +1818,7 @@ static int cmgs_send_pdu_async(const char* pdu_hex, uint8_t& outRef, int& outErr
   g_cmgsJob.outErr     = &outErr;
   g_cmgsJob.timeout_ms = timeout_ms;
   g_cmgsJob.rcLocal    = -2;  // 防止 stale (worker 写前 handler 读 = 0 = 误认成功)
+  g_cmgsJobActive      = true;  // v4.0.25: handler 进入设 true (worker / handler timeout 负责清)
 
   xTaskNotify(g_cmgsWorker, 0, eNoAction);  // 仅唤醒, 值不用
   // v4.0.11.19: 1s 分段 wait, 每段 reset WDT (handler 跑在 async_tcp task 里, 32s 一次性 wait 会触发 TWDT 5s 超时)
@@ -1780,12 +1827,19 @@ static int cmgs_send_pdu_async(const char* pdu_hex, uint8_t& outRef, int& outErr
   while (waited < total_wait) {
     uint32_t slice = (total_wait - waited > 1000) ? 1000 : (total_wait - waited);
     if (xSemaphoreTake(g_cmgsJobDone, pdMS_TO_TICKS(slice)) == pdTRUE) {
+      // worker 已在 cmgs_worker_task 写 g_cmgsJobActive=false (worker 写完前返回 = done 信号已发)
       return g_cmgsJob.rcLocal;  // done 信号到了, 立即返
     }
     // 1s 内没信号, 喂 WDT 避免 async_tcp task 被 TWDT 杀
     esp_task_wdt_reset();
     waited += slice;
   }
+  // v4.0.25 (P0-3): handler 超时, worker 可能仍在跑 (或挂死), 清 active 让下次进来 (worker 写完时也会清, 双保险)
+  //   注: 如果 worker 真挂死, active 会保持 false (worker 不会进 cmgs_worker_task 写完循环), 下次 handler 能进来 → 覆写仍危险
+  //   真正根治需要 TWDT detect worker stuck (但 cmgs_send_pdu 跑在 worker 内, TWDT 不能超 5s, cmgs 本身 10-20s, 不可能)
+  //   现状接受 "32s 内 worker 必返" 假设 (v4.0.11.10 已审, cmgs 内部 wait 都有 timeout), active=false 让下个 handler 进来时
+  //   等几 ms 让 worker 写完设 active=false (race), 或直接覆写 — 与 v4.0.11.10 行为一致
+  g_cmgsJobActive = false;
   ESP_LOGE(TAG, "CMGS worker 超时未返回 (handler 端等了 %ums)", total_wait);
   return -2;
 }
@@ -1796,6 +1850,7 @@ static void sms_task(void* /*param*/) {
   for (;;) {
     SmsMsg msg;
     if (xQueueReceive(g_smsQ, &msg, pdMS_TO_TICKS(500)) == pdTRUE) {
+      raw_ring_write(msg);   // v4.0.24.2 (debug): 抓 raw 进 ring, /api/raw 暴露
       // 先试 UDH 拼接 (如果 body 含 0003...)
       if (stash_udh_part(&msg)) {
         ESP_LOGI(TAG, "SMS UDH part stashed");
@@ -1940,9 +1995,13 @@ static void sms_task(void* /*param*/) {
       // 兜底 2: 即使 DCS 标 7-bit (含 DCS=0), raw body 若呈 UCS-2 BE 模式 → 强制走 UCS-2
       //   is_strict_utf8 兜底不靠谱 (GSM7 扩展字符 è/ø/Å/ò 都是合法 2-byte UTF-8)
       //   提前 sniff 避免跑 7-bit decode 浪费 + 防乱码推送
-      if (is7bit && pdu::looks_like_ucs2_be(udHex, udFullHexLen)) {
-        ESP_LOGW(TAG, "SMS: raw body UCS-2 BE pattern, bypass 7-bit decode (dcs=%u cmt_len=%u udBytes=%u)",
-                 msg.dcs, msg.cmt_length, (unsigned)udBytes);
+      // v4.0.25 fix (P0-1): sniff 用 dataHex 不是 udHex, 跳过 UDH concat IE 头
+      //   修前风险: 7-bit concat + 8-bit IE case, IE bytes (UDHL=05, IEI=00, IEDL=03...)
+      //     当 UCS-2 高字节 sniff → 假命中 (虽然 dtac 单条 raw 实测不踩, defense-in-depth)
+      //   单条没 UDH (udhi=false, udhSkipHex=0) → dataHex == udHex, 行为不变
+      if (is7bit && pdu::looks_like_ucs2_be(dataHex, dataHexLen)) {
+        ESP_LOGW(TAG, "SMS: raw body UCS-2 BE pattern, bypass 7-bit decode (dcs=%u cmt_len=%u udBytes=%u udhSkip=%u)",
+                 msg.dcs, msg.cmt_length, (unsigned)udBytes, (unsigned)udhByteLen);
         is7bit = false;
         is8bitData = false;  // 强制走 else 分支 (decode_body_field = UCS-2)
       }
@@ -1961,10 +2020,16 @@ static void sms_task(void* /*param*/) {
           }
         }
         if (numChars == 0) numChars = (udBytes * 8) / 7;
-        bodyN = pdu::decode_7bit_packed(udHex, udFullHexLen, numChars,
+        // v4.0.25 fix (P0-2): 7-bit 主 decode 也用 dataHex 不是 udHex
+        //   修前 bug (v4.0.24 UDH skip batch 漏修主路径): 7-bit concat + 8-bit IE case
+        //     decode_7bit_packed(udHex, ...) 拿含 IE 字节的 udHex 当 septet 输入
+        //     → IE 字节 05/00/03/02 当 septet → 输出 garbage prefix (修前 fixture H 验证)
+        //   v4.0.24.1 batch 只改 fallback decode_body_field 路径 (line 2013 已 dataHex)
+        //   主路径仍是 udHex, 漏修 → v4.0.25 补
+        bodyN = pdu::decode_7bit_packed(dataHex, dataHexLen, numChars,
                                         bodyBuf, sizeof(bodyBuf));
-        ESP_LOGI(TAG, "SMS: 7-bit decode (dcs=%u cmt_len=%u udBytes=%u → numChars=%u bodyN=%u)",
-                 msg.dcs, msg.cmt_length, (unsigned)udBytes, (unsigned)numChars, (unsigned)bodyN);
+        ESP_LOGI(TAG, "SMS: 7-bit decode (dcs=%u cmt_len=%u udBytes=%u → numChars=%u bodyN=%u udhSkip=%u)",
+                 msg.dcs, msg.cmt_length, (unsigned)udBytes, (unsigned)numChars, (unsigned)bodyN, (unsigned)udhByteLen);
         // 兜底: GSM7 decode 输出必须是合法 UTF-8
         // DCS=0 但实际 UCS-2 (gateway 标错, 泰文 0E23...) 当 7-bit 解会出无效 UTF-8
         // (含 lone continuation / 4+ byte sequence) → fallback UCS-2
@@ -2481,6 +2546,34 @@ static void handleApiRecentClear(AsyncWebServerRequest* r) {
   r->send(200, "application/json", "{\"ok\":true}");
 }
 
+// v4.0.24.2 (debug): GET /api/raw — 返最近 N 条 SMS 的 raw body_hex + cmt_length + dcs
+//   仅 debug 烧完验证用, 稳后删 (按 feedback-bump-fw-version 不算功能改动)
+//   curl http://172.16.1.18/api/raw  → 8 条 ring (从最旧到最新)
+//   翔哥撞乱码时立刻抓 raw 字节反推根因 (decoded body 在 /api/recent, raw 在 /api/raw)
+static void handleApiRaw(AsyncWebServerRequest* r) {
+  JsonDocument doc;
+  doc["uptimeMs"]  = millis();
+  doc["ringCap"]   = RAW_RING_CAP;
+  doc["ringHead"]  = g_rawRingHead;
+  JsonArray items = doc.createNestedArray("items");
+  portENTER_CRITICAL(&g_rawRingMux);
+  for (size_t i = 0; i < RAW_RING_CAP; i++) {
+    size_t idx = (g_rawRingHead + i) % RAW_RING_CAP;
+    if (g_rawRing[idx].ms == 0) continue;  // empty slot
+    JsonObject o = items.createNestedObject();
+    o["ms"]           = g_rawRing[idx].ms;
+    o["phone"]        = g_rawRing[idx].phone;
+    o["body_hex"]     = g_rawRing[idx].body_hex;
+    o["body_hex_len"] = strnlen(g_rawRing[idx].body_hex, sizeof(g_rawRing[idx].body_hex));
+    o["cmt_length"]   = g_rawRing[idx].cmt_length;
+    o["dcs"]          = g_rawRing[idx].dcs;
+  }
+  portEXIT_CRITICAL(&g_rawRingMux);
+  String out;
+  serializeJson(doc, out);
+  r->send(200, "application/json", out);
+}
+
 // v4.0.6 P19: POST /api/factory  恢复出厂 (清 NVS 全分区 + 重启进 AP 模式)
 // BasicAuth + 二重确认 (前端 confirm), 强操作
 // 不能在 async_tcp 任务里直接 ESP.restart() — 关连接时 watchdog 会 panic
@@ -2709,6 +2802,8 @@ static void register_web_routes(AsyncWebServer* srv) {
   srv->on("/api/recent",       HTTP_GET,  handleApiRecent);
   // v4.0.11.19: 清空最近接收 (对称 sent, RAM 不需 auth)
   srv->on("/api/recent/clear", HTTP_POST, handleApiRecentClear);
+  // v4.0.24.2 (debug): raw SMS ring (翔哥撞乱码时抓 raw body_hex 反推根因)
+  srv->on("/api/raw",          HTTP_GET,  handleApiRaw);
   // v4.0.12: STK 当前菜单 (从最近 +STKPRO SETUP_MENU URC 解析, 只读无 auth, 主页卡用)
   srv->on("/api/stk/menu",     HTTP_GET,  handleApiStkMenu);
   // v4.0.13: SIM 信息 (从 stk_query_task 已有 g_sim_* 读, 不含 g_stkLog, 不破 stk-paused)

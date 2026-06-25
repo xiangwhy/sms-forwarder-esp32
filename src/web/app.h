@@ -39,7 +39,7 @@ html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,
   <div class="app-header">
     <h1><span id="status-dot" class="dot"></span>SMS Forwarder</h1>
     <div style="display:flex;align-items:center;gap:10px">
-      <span class="fw-tag">FW v4.0.24.1</span>
+      <span class="fw-tag">FW v4.0.25</span>
       <a href="javascript:doRestart()" class="btn-restart" title="重启设备">↻ 重启</a>
     </div>
   </div>
