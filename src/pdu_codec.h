@@ -78,7 +78,10 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
 // 配套 stash_udh_part: 用于切出 concat SMS part 的纯 UD body (剥 UDH 头)
 // 修前 bug: 旧版本返回 UDHL byte 位置 + 让 caller 算 udhSkip = udhOff + udhBytes*2,容易算错 (v4.0.9)
 //   现版本直接返回 UD 起点, caller 直接用 udhOff 作为 partBody 偏移
-size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen);
+// v4.0.26 fix #12: 加 udhStart 参数限定扫描起点 (review #12 — 旧版扫整个 PDU 找 "0804"/"0003",
+//   user body 含 hex 字符子串时假命中; 现 caller 传 SCA+FO+OA+PID+DCS+SCTS+UDL 末 hex offset 进来,
+//   函数只在 UDHL 位置 + 1 byte 之后扫 IE pattern, 不污染 user body)
+size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t udhStart, size_t* outUdhByteLen);
 
 // v4.0.24: 从 UD 起点 (已 skip PDU header) 算 UDH 头长度, 返回 UD 真正数据起点 (hex 偏移)
 // *outUdhByteLen: UDH 段总字节数 (UDHL byte + IE bytes, 等于 (UDHL+1))

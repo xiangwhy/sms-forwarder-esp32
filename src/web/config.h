@@ -209,12 +209,16 @@ async function scanWifi() {
     const r = await fetch('/api/scan');
     if (!r.ok) throw new Error('HTTP '+r.status);
     const arr = await r.json();
+    // v4.0.26 fix #6: full XSS escape (review #6 — 旧版只替 " → &quot;, 漏 < > & ' U+2028 U+2029,
+    //   SSID 含 `<script>` 或 ' onerror 时 innerHTML 注入; 翔哥真机 SSID 是 ASCII 但 gateway 反射时不可控)
+    const esc = s => String(s).replace(/[&<>"'  ]/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;',' ':'\\u2028',' ':'\\u2029'}[c]));
     const cur = document.getElementById('c_ssid').value;
     sel.innerHTML = '<option value="">— 选择扫描到的网络 —</option>'
       + arr.filter(n => !n.hidden).map(n => {
         const tag = n.current ? ' ✓ 已连' : (n.secured ? ' 🔒' : ' 开放');
-        return '<option value="' + n.ssid.replace(/"/g,'&quot;') + '"' + (n.ssid===cur?' selected':'') + '>'
-          + n.ssid + ' · ' + n.rssi + ' dBm' + tag + '</option>';
+        return '<option value="' + esc(n.ssid) + '"' + (n.ssid===cur?' selected':'') + '>'
+          + esc(n.ssid) + ' · ' + n.rssi + ' dBm' + tag + '</option>';
       }).join('');
     sel.onchange = () => { if (sel.value) document.getElementById('c_ssid').value = sel.value; };
     hint.style.color = 'var(--accent)';

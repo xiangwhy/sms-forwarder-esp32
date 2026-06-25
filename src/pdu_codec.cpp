@@ -102,24 +102,32 @@ bool parse_udh(const char* line, int& refId, int& total, int& seq) {
     p = strstr(line, "0003");
     if (!p) return false;
   }
-  auto get2 = [](const char* q)->int {
+  size_t lineLen = strlen(line);
+  const char* end = line + lineLen;
+  // v4.0.26 fix #7: get2 加越界 guard + hex 字符校验 (review #7 — short/truncated hex 时 OOB read)
+  auto get2 = [](const char* q, const char* e)->int {
+    if (q == NULL || q + 2 > e) return -1;
+    auto isH = [](char c){ return (c>='0'&&c<='9')||(c>='A'&&c<='F')||(c>='a'&&c<='f'); };
+    if (!isH(q[0]) || !isH(q[1])) return -1;
     char b[3] = { q[0], q[1], 0 };
     return strtol(b, NULL, 16);
   };
   if (is16) {
     // 16-bit: refH=p[4..5], refL=p[6..7], total=p[8..9], seq=p[10..11]
-    int refH = get2(p + 4);
-    int refL = get2(p + 6);
-    int tot  = get2(p + 8);
-    int sq   = get2(p + 10);
+    int refH = get2(p + 4, end);
+    int refL = get2(p + 6, end);
+    int tot  = get2(p + 8, end);
+    int sq   = get2(p + 10, end);
+    if (refH < 0 || refL < 0 || tot < 0 || sq < 0) return false;
     refId = (refH << 8) | refL;
     total = tot;
     seq   = sq;
   } else {
     // 8-bit (per 3GPP TS 23.040 §9.2.3.24, no padding after IEDL):
-    int ref = get2(p + 4);
-    int tot = get2(p + 6);
-    int sq  = get2(p + 8);
+    int ref = get2(p + 4, end);
+    int tot = get2(p + 6, end);
+    int sq  = get2(p + 8, end);
+    if (ref < 0 || tot < 0 || sq < 0) return false;
     refId = ref;
     total = tot;
     seq   = sq;
@@ -457,10 +465,18 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
   size_t udByteLen = is7bit ? ((size_t)udl * 7 + 7) / 8 : (size_t)udl;
 
   // DCS reserved / 未知 (0x10-0x1F, 0x20-0xFF, 0x0C-0x0F 等) 时 sniff UD
+  // v4.0.26 fix #4: 跳 UDH concat IE 头 (跟 main.cpp:1977 caller fix 同根因 —
+  //   sniffed UD 含 IE 字节如 0x05/0x00/0x03 假命中 UCS-2 BE 模式, 误判 reserved DCS)
   if (!is7bit && !isUcs2) {
-    if (pos + udByteLen * 2 <= hexLen && udByteLen >= 4) {
-      // 把 UD 当 UCS-2 BE 试解 + sniff 高字节
-      if (looks_like_ucs2_be(hex + pos, udByteLen * 2)) {
+    size_t udhiOff = pos;
+    size_t udhiBytes = 0;
+    if (udhi) {
+      size_t skip = pdu_udh_offset_ex(hex + pos, udByteLen * 2, &udhiBytes);
+      if (skip > 0) udhiOff = pos + skip;
+    }
+    if (udhiOff + udByteLen * 2 <= hexLen && udByteLen >= 4) {
+      // 把 UD (skip UDH) 当 UCS-2 BE 试解 + sniff 高字节
+      if (looks_like_ucs2_be(hex + udhiOff, udByteLen * 2)) {
         isUcs2 = true;
       }
     }
@@ -490,9 +506,16 @@ size_t pdu_ud_offset_ex(const char* hex, size_t hexLen,
 //   - 读 UDHL byte 算 UDH 段总长, UD 起点 = UDHL 位置 + (UDHL+1)*2
 //
 //   局限: 只对 concat SMS 有效 (单条 SMS 没 UDH IE pattern)。单条走 fallback。
-size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen) {
+size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t udhStart, size_t* outUdhByteLen) {
   if (outUdhByteLen) *outUdhByteLen = 0;
   if (!hex || hexLen < 4 || !outUdhByteLen) return 0;
+  // v4.0.26 fix #12: udhStart = UDHL byte 起点 (caller 算 SCA+FO+OA+PID+DCS+SCTS+UDL 末位置)
+  //   函数只在 udhStart + 1 byte (UDHL 字节 + IE 起点) 之后扫 IE pattern, 不污染 user body
+  //   udhStart 为 0 = caller 没传 UDHL 位置, 兼容老 caller (整 body 扫, 但 stash_udh_part 唯一 caller 已改)
+  if (udhStart >= hexLen) return 0;
+  // 从 UDHL byte 末 (udhStart + 2 hex chars) 开始扫 IE pattern
+  size_t scanStart = udhStart + 2;
+  if (scanStart + 4 > hexLen) return 0;
 
   auto isH = [](char c) -> bool {
     return (c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f');
@@ -513,7 +536,7 @@ size_t pdu_udh_offset(const char* hex, size_t hexLen, size_t* outUdhByteLen) {
   // 找 concat UDH IE: "0804" (16-bit, IEI=08 + IEDL=04) 或 "0003" (8-bit, IEI=00 + IEDL=03)
   const char* udhIe = NULL;
   size_t udhIeLen = 0;  // IE 段总长 (UDHL+IE) = 2+IEI+IEDL+...
-  for (size_t i = 0; i + 4 <= hexLen; i += 2) {
+  for (size_t i = scanStart; i + 4 <= hexLen; i += 2) {
     if (hex[i]=='0' && hex[i+1]=='8' && hex[i+2]=='0' && hex[i+3]=='4') {
       udhIe = hex + i;
       // UDHL byte 在 udhIe 之前 2 hex chars
@@ -658,7 +681,14 @@ size_t pdu_oa_offset(const char* hex, size_t hexLen, bool* outIsAlpha, size_t* o
   int toa = byte(pos);
   if (toa < 0) return 0;
   pos += 2;  // ToA byte
-  size_t valueOctets = ((size_t)oaLen + 1) / 2;
+  // v4.0.26 fix #8: TON-aware valueOctets —
+  //   alphanumeric (TON=0b101): oaLen = chars, value = packed GSM7 octets (oaLen 字段不可信, ML307 写错;
+  //     实际 floor(octets*8/7) 反算; 这里保守取 oaLen 字符 → 至少 ceil(oaLen*7/8) octets)
+  //   numeric (其它): oaLen = digits, value = ceil(N/2) BCD octets
+  bool isAlpha = ((toa >> 4) & 0x07) == 0x05;
+  size_t valueOctets = isAlpha
+    ? ((size_t)oaLen * 7 + 7) / 8   // GSM7 7→8 bits: chars → packed octets
+    : ((size_t)oaLen + 1) / 2;     // BCD: nibbles → octets
   if (pos + valueOctets * 2 > hexLen) return 0;
   pos += valueOctets * 2;  // value
 
