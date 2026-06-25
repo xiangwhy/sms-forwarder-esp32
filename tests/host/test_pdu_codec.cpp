@@ -279,6 +279,83 @@ static void test_looks_like_ucs2_myanmar() {
   CHECK(pdu::looks_like_ucs2_be(hex, 392));
 }
 
+// === v4.0.25 batch P0-1 fixture G: DCS=0 实际 UCS-2 BE (ML307 错标) sniff ===
+// 翔哥 2026-06-25 真机 dtac 抓 raw, DCS=0 (gateway 标错) 但 raw body 是 UCS-2 BE 泰文 + ASCII
+// 真因: v4.0.24.1 batch 的 caller line 1977 sniff 在 is7bit branch, 但 DCS=0 → is7bit=true
+//   → 走 7-bit decode → garbage (但 line 1977 应该能 fire, hiHits=100%)
+//   → defense-in-depth: caller 顶部加 sniff, 防 line 1951 `!is7bit && !isUcs2` 跳过
+// fixture G: looks_like_ucs2_be 在 dtac raw udHex 上 return true (helper 正确性)
+//   16 个 0x0E 泰文 pair → hiHits=16, pairHits=16, hiHits*100/16=100% → return true
+static void test_looks_like_ucs2_dcs0_actual_ucs2_thai() {
+  g_current = "looks_like_ucs2_be: DCS=0 实际 UCS-2 BE 泰文 + ASCII (dtac 真机 raw 2026-06-25) → true (P0-1 fixture G)";
+  // 翔哥 /api/raw 抓的完整 PDU, DCS=0x00 (错标 7-bit) UD 实为 23 对 UCS-2 BE:
+  //   16 对 0x0E 泰文 + 7 对 0x00 ASCII ":1305023"
+  // fixture 简化: 直接测 sniff 在 udHex 上 fire (helper 正确性), 不进 caller
+  const char* udHex =
+    "0E230E2B0E310E2A0E220E370E190E220E310E190E020E2D0E070E040E380E13"
+    "003A003100330035003000320033";
+  size_t udHexLen = std::strlen(udHex);
+  CHECK_EQ_INT(udHexLen, 92);  // 46 bytes × 2 hex
+
+  // sniff: 23 对中 16 个 0x0E hiOk + 7 个 0x00 skip
+  // pairHits=16, hiHits=16, hiHits*100/16=100% ≥ 80% → return true
+  // (caller line 1977 应 fire, 设 isUcs2=true → 走 UCS-2 解码分支)
+  CHECK(pdu::looks_like_ucs2_be(udHex, udHexLen));
+}
+
+// === v4.0.25 batch P0-2 fixture H: 7-bit concat 8-bit IE decode_7bit_packed 改 dataHex ===
+// 翔哥 2026-06-25 真机 dtac 撞 dtac 7-bit concat 短信, v4.0.24 加 UDH skip 但 7-bit 主 decode 漏改 dataHex
+//   decode_7bit_packed(udHex, ...) 拿含 8-bit IE 字节的 udHex 当 septet 输入 → garbage `Ԁλँ` prefix
+// 修法: caller 改用 dataHex = udHex + udhSkipHex (line 1998), fixture H 验 helper 在正确 dataHex 输入下输出 user text
+// helper 本身无 UDH skip 概念, fixture 是 caller contract: udhSkip 算对 + dataHex 内容对 + decode 输出对
+static void test_7bit_concat_8bit_ie_skip_udh_datahex() {
+  g_current = "decode_7bit_packed: 7-bit concat 8-bit IE (skip UDH) dataHex → 'Hello' (无 IE garbage prefix, P0-2 fixture H)";
+  // 8-bit concat IE + UDHL standard case: UDHL=5 IEI=00 IEDL=03 ref=02 total=02 seq=01
+  // pdu_udh_offset_ex 走标准路径: UDHL=5 → 6 bytes UDH (UDHL byte + 5 IE bytes) = 12 hex
+  // body "Hello" 7-bit packed: C8329BFD06 (5 chars = 5 bytes packed)
+  const char* udHex = "050003020201C8329BFD06";  // 12 hex UDH + 10 hex body
+  size_t udHexLen = 22;
+
+  // 走标准 UDHL 路径 (首字节 0x05 不是 0x00/0x08 stripped-UDHL IEI)
+  size_t udhByteLen = 0;
+  size_t udhSkipHex = pdu::pdu_udh_offset_ex(udHex, udHexLen, &udhByteLen);
+  CHECK_EQ_INT(udhSkipHex, 12);
+  CHECK_EQ_INT(udhByteLen, 6);
+
+  // dataHex = udHex + 12 (skip UDHL+5 bytes IE)
+  const char* dataHex = udHex + udhSkipHex;
+  char buf[32];
+  size_t n = pdu::decode_7bit_packed(dataHex, udHexLen - udhSkipHex, 5, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 5);
+  CHECK_EQ_STR(std::string(buf, n), "Hello");
+  // 修前 bug: udHex 当 septet 输入, IE 字节 05 00 03 02 02 01 → garbage prefix
+  //   decode_7bit_packed(udHex, 22, 5) → 不是 "Hello", 含 Ԁλँ prefix
+  // 修后 (改 dataHex): decode_7bit_packed(dataHex, 10, 5) → "Hello" 干净
+}
+
+// === v4.0.25 batch P0-2 fixture H.5: stripped-UDHL 8-bit concat 7-bit path ===
+// ML307 stripped-UDHL quirk: UDHL byte 被剥, concat IEI=00 直接打头
+// pdu_udh_offset_ex 走 stripped-UDHL guard: skip 5 bytes IE only (udhSkipHex=10)
+// 同样 dataHex = udHex + 10, decode_7bit_packed 输出 user text 无 IE prefix
+static void test_7bit_concat_8bit_ie_stripped_udhl_datahex() {
+  g_current = "decode_7bit_packed: 7-bit concat 8-bit IE stripped-UDHL (skip 5 bytes IE) dataHex → 'Hi' (P0-2 fixture H.5)";
+  // stripped-UDHL case: "00 03 02 02 01" + "C834" (Hi 7-bit packed)
+  // v4.0.24.1 stripped-UDHL guard: IEI=0x00 IEDL=0x03 + total/seq 验证 → skip 5 bytes
+  const char* udHex = "0003020201C834";
+  size_t udHexLen = 14;
+
+  size_t udhByteLen = 0;
+  size_t udhSkipHex = pdu::pdu_udh_offset_ex(udHex, udHexLen, &udhByteLen);
+  CHECK_EQ_INT(udhSkipHex, 10);   // 5 bytes IE only (UDHL byte 被剥)
+  CHECK_EQ_INT(udhByteLen, 5);    // 5 bytes IE (没 UDHL byte)
+
+  const char* dataHex = udHex + udhSkipHex;
+  char buf[16];
+  size_t n = pdu::decode_7bit_packed(dataHex, udHexLen - udhSkipHex, 2, buf, sizeof(buf));
+  CHECK_EQ_INT(n, 2);
+  CHECK_EQ_STR(std::string(buf, n), "Hi");
+}
+
 // === v4.0.6 短信发送 (双向): ucs2_encode + sms_split_for_send ===
 static void test_ucs2_encode_ascii() {
   g_current = "ucs2_encode: 'Hi' (2 ASCII) → '00480069' (4 hex 字符)";
@@ -2216,6 +2293,14 @@ int main() {
   test_pdu_e2e_dtac_3seg_otp_5481_real_pdu();   // refId=0xbcb4=48308, OTP=5481, 3 段 concat
   test_pdu_e2e_dtac_1seg_otp_real_pdu();         // 单段 dtac OTP 短信
   test_pdu_e2e_dtac_concat_2seg_part1_real_pdu();// refId=0x5aa7=23207, total=2 seq=1, 第一段
+
+  // v4.0.25 batch TDD red:
+  //   P0-1 fixture G: DCS=0 实际 UCS-2 BE dtac raw (caller 顶部 sniff defense-in-depth)
+  //   P0-2 fixture H: 7-bit concat 8-bit IE (caller decode_7bit_packed 改 dataHex skip UDH)
+  //   P0-2 fixture H.5: stripped-UDHL case (ML307 quirk)
+  test_looks_like_ucs2_dcs0_actual_ucs2_thai();
+  test_7bit_concat_8bit_ie_skip_udh_datahex();
+  test_7bit_concat_8bit_ie_stripped_udhl_datahex();
 
   // v4.0.15: STK select 校验
   test_stk_select_normal();
