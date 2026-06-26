@@ -1,6 +1,6 @@
 # 路线图 (Roadmap)
 
-v4.0.25 当前生产 (2026-06-25 Boot #146)。v4.0.26 审完待烧 (HEAD f887b34, 329/6 host test PASS)。v4.0.5 → v4.0.26 期间改动:
+v4.0.27 当前生产 (2026-06-26 烧, 真机验证通过)。v4.0.5 → v4.0.27 期间改动:
 
 - **内存优化** (4 缓冲 -40.7KB, heap 占用 85% → 66%, min_free 42K → 88K):
   - `STK_LOG_CAP` 256→64 (省 15.4KB, 单点最大)
@@ -28,7 +28,7 @@ v4.0.25 当前生产 (2026-06-25 Boot #146)。v4.0.26 审完待烧 (HEAD f887b34
 | v4.0.23 factory.bin 打包 | S | 配合工厂首次烧录场景 (代码已就绪, 工厂镜像待打包) |
 | v4.0.24.1 UCS-2 UDH skip + review fix | ✅ | 已合已 push 已 tag 已烧 (305/3 host test) |
 | v4.0.25 review fix batch 后续 (P0-1/2/3) | ✅ | 已合已 commit 已烧 (315/3 host test, defense-in-depth + 7-bit 主路径 dataHex + cmgs cancel guard) |
-| v4.0.26 HEAD-wide 10-angle review 14 finding 全修 | ✅ | 已合 (f887b34), 待烧 (329/6 host test, #1 strcpy/#2 cmgs race/#3 #4 sniff caller of caller/#5 cmgs gen counter/#6 SSID XSS/#7 parse_udh OOB/#8 oa_offset TON-aware/#9 /api/raw sanitize/#10 restart task/#11 strstr 假命中/#12 pdu_udh_offset udhStart/#13 NVS provisioned/#15 TX ref 16-bit) |
+| v4.0.26 HEAD-wide 10-angle review 14 finding 全修 | ✅ | 已合 (f887b34) + 2 patch (#8 回退 + stash UDH skip), v4.0.27 已烧已验 (326/3 host test) |
 | `MAX_UDH_REFS` 4→2 (再省 8.5KB) | S | 仅在 min_free 持续 < 30K 时再砍 |
 
 ## 远期想法
@@ -53,6 +53,6 @@ v4.0.26 审完待烧 (HEAD-wide 10-angle review 14 finding 全修), **等翔哥�
 
 ---
 
-**当前状态**: v4.0.25 当前生产 (2026-06-25 烧, Boot #146, host test 315/3 PASS)。代码 HEAD = v4.0.26 (2026-06-25 审完待烧, host test 329/6 PASS, commit f887b34)。
+**当前状态**: v4.0.27 当前生产 (2026-06-26 烧, host test 326/3 PASS, 真机 Verify/True App/dtac 全验 PASS)。
 **本地 build**: `pio run` 产物 `.pio/build/esp32-s3-devkitc-1/firmware.bin`
-**GitHub Release**: https://github.com/xiangwhy/sms-forwarder-esp32/releases/tag/v4.0.24.1 (v4.0.25/v4.0.26 工厂镜像待打包)
+**GitHub Release**: https://github.com/xiangwhy/sms-forwarder-esp32/releases/tag/v4.0.27

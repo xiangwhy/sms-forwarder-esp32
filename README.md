@@ -6,9 +6,10 @@ ESP32-S3 + USB 4G 模组 + pushplus 推送的 SMS 转发器。
 [![License](https://img.shields.io/badge/license-proprietary-red)]()
 [![Platform](https://img.shields.io/badge/platform-ESP32--S3-blue)]()
 
-**当前生产**: v4.0.25 (2026-06-25 烧, Boot #146)
-**代码 HEAD**: **v4.0.26** (2026-06-25 审完待烧)
-- **v4.0.26 (HEAD-wide 10-angle review 14 finding 全修)**: #1 loadConfig 6x strcpy → snprintf + #2 cmgs drain 加 10ms delay 防双 core race + #3 reserved-DCS sniff `udHex` → `dataHex` + #4 `pdu_ud_offset_ex` 内 sniff 跳 UDH + #5 cmgs_job `g_cmgsJobGen` counter 防 worker hang UAF + #6 web/config.h SSID full XSS escape + #7 `parse_udh` get2 bounds + #8 `pdu_oa_offset` TON-aware valueOctets + #9 `/api/raw` sanitizeForJson + #10 `handle_restart` detached task + #11 main.cpp 7-bit `numChars-=7` strstr → `parse_udh` + #12 `pdu_udh_offset` udhStart param + #13 cfgIsHardcoded NVS `cfg.provisioned` 标记 + #15 TX ref 8→16-bit, host test **329/6 PASS** (9 新 fixture)
+**当前生产**: v4.0.27 (2026-06-26 烧)
+**代码 HEAD**: **v4.0.27** (2026-06-26 真机验证通过)
+- **v4.0.27 (v4.0.26 + 2 patch)**: v4.0.26 review 14 finding 全修 + v4.0.26.1 回退 #8 TON-aware valueOctets（真机 Verify@@òD£ 乱码，ML307 oaLen 单位 = packed octets×2 非标准，BCD 公式碰巧正确）+ v4.0.26.2 stash_udh_part UDHL+UDH 没跳过（True App 2 段 concat 乱码，pdu_ud_offset_ex 返回 UD 段起始不是 UD 数据起始，读 UDHL byte 加 (UDHL+1)*2 跳过 UDH），host test **326/3 PASS**
+- **v4.0.26 (HEAD-wide 10-angle review 14 finding 全修)**: #1 loadConfig 6x strcpy → snprintf + #2 cmgs drain 加 10ms delay 防双 core race + #3 reserved-DCS sniff `udHex` → `dataHex` + #4 `pdu_ud_offset_ex` 内 sniff 跳 UDH + #5 cmgs_job `g_cmgsJobGen` counter 防 worker hang UAF + #6 web/config.h SSID full XSS escape + #7 `parse_udh` get2 bounds + #8 `pdu_oa_offset` TON-aware valueOctets（后回退）+ #9 `/api/raw` sanitizeForJson + #10 `handle_restart` detached task + #11 main.cpp 7-bit `numChars-=7` strstr → `parse_udh` + #12 `pdu_udh_offset` udhStart param + #13 cfgIsHardcoded NVS `cfg.provisioned` 标记 + #15 TX ref 8→16-bit
 - **v4.0.25 (review fix batch 后续 + defense-in-depth)**: P0-1 caller sniff `udHex` → `dataHex` (skip UDH IE 字节污染 sniff) + P0-2 7-bit 主 decode `udHex` → `dataHex` (修 v4.0.24 UDH skip batch 漏修主路径,7-bit concat + 8-bit IE case garbage prefix) + P0-3 cmgs cancel-on-overwrite guard (`volatile bool g_cmgsJobActive` 防并发 /api/send handler 覆写 g_cmgsJob 单例 → UAF),host test **315/3 PASS** (新 fixture G/H/H.5)
 - **v4.0.24 + v4.0.24.1**: UCS-2/8-bit decode 路径 skip UDH concat IE 头 (修 dtac gateway 9 段 concat 推送乱码 `Ԁλँ` prefix) + UDH skip 加 udhi gate (防单条 SMS 首字节误判 UDHL) + ML307 stripped-UDHL guard (8-bit IEI=0x00 + 16-bit IEI=0x08 strict total/seq 验证, 防 port IE 误判) + 7-bit fallback 改 dataHex + 删 dead `dataByteLen` + 加 ESP_LOGW + 加 fixture J/K stripped-UDHL TDD red, host test **305/3 PASS**
 - **v4.0.23 内存优化**: 4 缓冲 -40.7KB (STK_LOG 256→64 / UDH 8→4 / RX_LOG 32×512→16×320 / pushQ 16→8), heap 占用 85% → 66%, min_free 42K → 88K
@@ -75,8 +76,9 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 
 | Release | 下载 |
 |---|---|
-| **v4.0.26** (HEAD, 2026-06-25 审完待烧, 329/6 host test PASS) | 待打包 (本地 build: `pio run` 产物 `.pio/build/esp32-s3-devkitc-1/firmware.bin`) |
-| v4.0.25 (当前生产, 2026-06-25 烧, Boot #146, 已被 v4.0.26 替代) | 待打包 (代码已就绪) |
+| **v4.0.27** (当前生产, 2026-06-26 烧) | 待打包 (本地 build: `pio run` 产物 `.pio/build/esp32-s3-devkitc-1/firmware.bin`) |
+| v4.0.26 (2026-06-25 审完, 被 v4.0.27 替代) | 待打包 (代码已就绪) |
+| v4.0.25 (2026-06-25 烧, Boot #146, 已被 v4.0.26 替代) | 待打包 (代码已就绪) |
 | **v4.0.24.1** (review fix batch, 已被 v4.0.25 替换) | [v4.0.24.1 GitHub Release](https://github.com/xiangwhy/sms-forwarder-esp32/releases/tag/v4.0.24.1) |
 | **v4.0.23** (内存优化, 已被 v4.0.24.1 替换, Boot #135) | 待打包 (代码已就绪) |
 | v4.0.5 (GitHub Release 最新) | [v4.0.5.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.5/v4.0.5.factory.bin) |
@@ -84,5 +86,5 @@ pio run -t upload --upload-port /dev/cu.usbserial-XXXX
 | v4.0.1 | [v4.0.1.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0.1/v4.0.1.factory.bin) |
 | v4.0 | [v4.0.factory.bin](https://github.com/xiangwhy/sms-forwarder-esp32/releases/download/v4.0/v4.0.factory.bin) |
 
-> **注**: v4.0.26 工厂镜像 .factory.bin 暂无, OTA 升级走 `pio run` 产物 `firmware.bin` 通过 `/update` 端点。当前生产 = v4.0.25 (Boot #146), v4.0.26 待烧。
+> **注**: v4.0.27 工厂镜像 .factory.bin 暂无, OTA 升级走 `pio run` 产物 `firmware.bin` 通过 `/update` 端点。当前生产 = v4.0.27。
 
