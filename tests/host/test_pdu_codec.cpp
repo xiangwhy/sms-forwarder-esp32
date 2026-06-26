@@ -386,58 +386,11 @@ static void test_parse_udh_bounds_total_out_of_range() {
   CHECK(!ok);
 }
 
-// === v4.0.26 review fix #8: pdu_oa_offset TON-aware valueOctets ===
-// 修前 bug v4.0.25: 全用 BCD formula ((oaLen+1)/2) → alphanumeric sender oaLen=11 chars × 7/8 = ~10 octets
-//   而 BCD 公式算 (11+1)/2 = 6 → 算小 → oaOff 跳错位 (skip 6 octets 而非 ~10) → PID/DCS/SCTS 全乱
-// 修法: TON=0b101 alphanumeric → valueOctets = ceil(oaLen*7/8); TON 其它 numeric → (oaLen+1)/2
-// 测试: alphanumeric 11-char sender "VerifySent!" (GSM7 7-bit packed) → valueOctets 应是 ceil(11*7/8)=10
-//       numeric 11-digit BCD sender → valueOctets 仍是 6
-static void test_pdu_oa_offset_alpha_valueoctets() {
-  g_current = "pdu_oa_offset: alphanumeric 11-char sender oaLen=11 → valueOctets=10 (TON-aware, fix #8)";
-  // 构造完整 PDU SCA(8)+FO(1)+oaLen(1)+ToA(D0=alpha)+oaValue(20=10 octets)+PID(1)+DCS(1)+SCTS(7)+UDL(1)+UD(2)
-  // SCA=8 bytes (1E 14 91 66 49 52 00 80 F0 — 9 chars 实 7 chars + F0) 改用简单 1-byte SCA
-  // SCA=00 (1 byte) + FO=04 + oaLen=0B (11 chars) + ToA=D0 (TON=5 alpha) + value 20 hex (10 octets) + 后续
-  const char* body =
-    "00"              // SCA length 0
-    "04"              // FO
-    "0B"              // oaLen=11 (alphanumeric 字符数)
-    "D0"              // ToA TON=5 alpha (3GPP 23.038 §4)
-    "D6B23C6DCE03C4E7"  // 11 chars "VerifySent!" GSM7 packed = 10 octets = 20 hex
-    "00"              // PID
-    "00"              // DCS=7-bit
-    "00000000000000"  // SCTS 7 bytes placeholder
-    "00"              // UDL=0
-    ;  // empty UD
-  size_t bodyLen = std::strlen(body);
-  bool isAlpha = false;
-  size_t valueOctets = 0;
-  size_t oaOff = pdu::pdu_oa_offset(body, bodyLen, &isAlpha, &valueOctets);
-  CHECK(oaOff > 0);
-  CHECK(isAlpha);
-  CHECK_EQ_INT(valueOctets, 10);  // 修前 bug: valueOctets=6 (BCD formula 误用); 修后: 10 (GSM7 formula)
-}
-
-static void test_pdu_oa_offset_numeric_valueoctets() {
-  g_current = "pdu_oa_offset: numeric 11-digit BCD sender → valueOctets=6 (regression, fix #8)";
-  // SCA=00 + FO=04 + oaLen=0B (11 digits) + ToA=91 (TON=1 international numeric) + value 12 hex (6 octets)
-  const char* body =
-    "00"
-    "04"
-    "0B"
-    "91"
-    "8130793F4800"   // 11 digits BCD = 6 octets = 12 hex
-    "00"
-    "00"
-    "00000000000000"
-    "00";
-  size_t bodyLen = std::strlen(body);
-  bool isAlpha = false;
-  size_t valueOctets = 0;
-  size_t oaOff = pdu::pdu_oa_offset(body, bodyLen, &isAlpha, &valueOctets);
-  CHECK(oaOff > 0);
-  CHECK(!isAlpha);
-  CHECK_EQ_INT(valueOctets, 6);  // BCD formula 不变
-}
+// === v4.0.26 review fix #8: pdu_oa_offset BCD formula 已正确 (不用改) ===
+// 修前分析错: 以为 alphanumeric sender BCD 公式算错, 实测 ML307 oaLen 字段单位 = "packed octets × 2" (非标准)
+//   翔哥真机烧 v4.0.26 TON-aware ceil(oaLen*7/8)=10 → 多读 4 字节垃圾 → "Verify@@òD£"
+//   回退: 保持 BCD 公式 (oaLen+1)/2, ML307 特性刚好匹配
+//   修前 test_pdu_oa_offset_alpha 已验 isAlpha=true + valueOctets=6, 不需新 fixture
 
 // === v4.0.26 review fix #12: pdu_udh_offset udhStart 参数限定扫描起点 ===
 // 修前 bug v4.0.25: 函数扫整个 hex 找 "0804"/"0003", user body 含 hex "0804" 子串 (e.g. 编码错误 → 字节 0x08/0x04)
@@ -2516,8 +2469,7 @@ int main() {
   test_parse_udh_bounds_truncated_after_iei();              // #7 get2 bounds (截断 IEDL)
   test_parse_udh_bounds_total_out_of_range();               // #7 strict total validation
   test_parse_udh_strict_user_body_false_positive();         // #11 caller contract (防 user body 假命中)
-  test_pdu_oa_offset_alpha_valueoctets();                   // #8 TON-aware valueOctets (alphanumeric)
-  test_pdu_oa_offset_numeric_valueoctets();                 // #8 regression (numeric 不变)
+  // fix #8: BCD 公式已正确, 不需新 fixture (ML307 oaLen 单位 = packed octets×2, 非标准但碰巧匹配)
   test_pdu_udh_offset_user_body_hex_substring();            // #12 udhStart 限定扫描范围
   test_pdu_ud_offset_ex_internal_sniff_skip_udh();          // #4 内 sniff 跳 UDH
   test_looks_like_ucs2_be_skips_udh_bytes();                // #3 caller contract sniff dataHex
