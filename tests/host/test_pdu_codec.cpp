@@ -424,13 +424,13 @@ static void test_pdu_udh_offset_user_body_hex_substring() {
   size_t bodyLen = std::strlen(body);
 
   // 计算 udhStart = SCA+FO+OA+PID+DCS+SCTS+UDL 末 hex 偏移 = 2+2+2+2+12+2+2+14+2 = 40
-  size_t udhStart = 40;  // UDL byte (2 hex) 末位置 = UDHL byte 起点
+  size_t udhStart = 40;  // UDHL byte 起点 (SCA 2 + FO 2 + OA 4+12 + PID 2 + DCS 2 + SCTS 14 + UDL 2 = 40)
   size_t udhBytes = 0;
   size_t udhOff = pdu::pdu_udh_offset(body, bodyLen, udhStart, &udhBytes);
-  // 期望: 修后 udhOff=52 (UD 起点 = UDHL byte 40 + UDH 段 12 hex chars = 52),
-  //   udhBytes=6 (UDHL=5 + 5 IE bytes, 函数读 udhlPos-2 的 "08" IEDL=0x04 → udhl=5)
-  // 修前 (无 udhStart): 函数扫整个 body, 命中 user body 内 "08 04" (在 pos 56-57) → udhOff 指向错位位置
-  CHECK_EQ_INT(udhOff, 52);  // UD 真正起点 (UDHL + 5 IE bytes 之后)
+  // PDU 布局: UDHL=05 在 pos 40, IEI=08 IEDL=04 在 pos 42, ref/total/seq 在 pos 44-50
+  //   IE pattern "0804" 在 pos 42, UDHL = 42-2 = 40
+  //   UDHL=5 → UDH 段 6 bytes = 12 hex → UD 数据起点 = 40 + 12 = 52
+  CHECK_EQ_INT(udhOff, 52);  // UD 真正数据起点 (UDHL 40 + UDH 段 12 hex)
   CHECK_EQ_INT(udhBytes, 6); // UDHL=5 + IE=5 → 6 bytes
 }
 

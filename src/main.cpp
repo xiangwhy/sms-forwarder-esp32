@@ -551,7 +551,24 @@ static bool stash_udh_part(const SmsMsg* msg) {
                                          &_isUcs2, &_is7bit, &_udBytes, &_udhi);
   size_t udhSkip = 0;
   if (udStart > 0 && _udhi) {
-    udhSkip = udStart;  // UD 起点 hex offset = partBody 起点
+    // v4.0.26 fix: pdu_ud_offset_ex 返回 UD 段起始 (UDHL 字节位置, 不是 UD 数据起始)
+    //   stash 需要跳过整个 UDH (UDHL + IE bytes) 才到真正的 user data
+    //   读 UDHL byte 算 UDH 段总长 = (UDHL+1) bytes = (UDHL+1)*2 hex chars
+    size_t udhlPos = udStart;
+    auto isH = [](char c){ return (c>='0'&&c<='9')||(c>='A'&&c<='F')||(c>='a'&&c<='f'); };
+    if (udhlPos + 2 <= strlen(msg->body_hex) && isH(msg->body_hex[udhlPos]) && isH(msg->body_hex[udhlPos+1])) {
+      char b[3] = { msg->body_hex[udhlPos], msg->body_hex[udhlPos+1], 0 };
+      int udhl = (int)strtol(b, NULL, 16);
+      if (udhl > 0 && udhl <= 140) {
+        size_t udhBytes = (size_t)udhl + 1;
+        udhSkip = udStart + udhBytes * 2;  // 跳过 UDHL byte + IE bytes → user data 起点
+      }
+    }
+    if (udhSkip == 0) {
+      // UDHL 解析失败, 兜底只跳 UD 段起始 (至少不跳过头)
+      ESP_LOGW(TAG, "stash_udh: UDHL parse failed at pos %u, fallback to udStart", (unsigned)udStart);
+      udhSkip = udStart;
+    }
   } else {
     // pdu_ud_offset_ex 失败或单条 SMS, 兜底用 parse_udh 找的 IE pattern 起点
     // (parse_udh 已成功 → 必有 concat IE, 但 IE pattern 起点 = "0804"/"0003" 头)
