@@ -681,14 +681,12 @@ size_t pdu_oa_offset(const char* hex, size_t hexLen, bool* outIsAlpha, size_t* o
   int toa = byte(pos);
   if (toa < 0) return 0;
   pos += 2;  // ToA byte
-  // v4.0.26 fix #8: TON-aware valueOctets —
-  //   alphanumeric (TON=0b101): oaLen = chars, value = packed GSM7 octets (oaLen 字段不可信, ML307 写错;
-  //     实际 floor(octets*8/7) 反算; 这里保守取 oaLen 字符 → 至少 ceil(oaLen*7/8) octets)
-  //   numeric (其它): oaLen = digits, value = ceil(N/2) BCD octets
-  bool isAlpha = ((toa >> 4) & 0x07) == 0x05;
-  size_t valueOctets = isAlpha
-    ? ((size_t)oaLen * 7 + 7) / 8   // GSM7 7→8 bits: chars → packed octets
-    : ((size_t)oaLen + 1) / 2;     // BCD: nibbles → octets
+  // v4.0.26 fix #8: 保持 BCD 公式 (oaLen+1)/2 — 修前尝试 TON-aware ceil(oaLen*7/8)
+  //   算错: ML307 alphanumeric sender oaLen 字段单位 = "packed octets × 2" (非标准, 跟 3GPP §9.1.2.5 不同)
+  //   翔哥真机烧 v4.0.26 后号码显示 "Verify@@òD£" = ceil(11*7/8)=10 octets 多读了 4 字节垃圾
+  //   老公式 (oaLen+1)/2=6 碰巧正确 (oaLen=11 → (11+1)/2=6, 跟 6 octets 实际值一致)
+  //   注: pdu_codec.h 注释 "alphanumeric 时实际 nchars = floor(octets*8/7)" 已正确, 不改
+  size_t valueOctets = ((size_t)oaLen + 1) / 2;
   if (pos + valueOctets * 2 > hexLen) return 0;
   pos += valueOctets * 2;  // value
 
