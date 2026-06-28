@@ -74,7 +74,7 @@ static const char* TAG_USB = "USBH";
 
 #define AP_SSID_PREFIX     "SMS-Forwarder"
 #define AP_PASSWORD        "12345678"
-#define FW_VERSION         "v4.0.27"     // 2026-06-26: v4.0.26.1 回退 #8 TON-aware valueOctets (真机 Verify@@òD£ 乱码, ML307 oaLen 单位 = packed octets×2 非标准, BCD 公式碰巧正确) + v4.0.26.2 stash_udh_part UDHL+UDH 没跳过 (True App 2段 concat 乱码, pdu_ud_offset_ex 返回 UD 段起始不是 UD 数据起始, 读 UDHL byte 加 (UDHL+1)*2 跳过 UDH); host test 326/3 PASS
+#define FW_VERSION         "v4.0.28"     // 2026-06-28: UDH_TIMEOUT_MS 60s→120s (dtac 2段 concat 短信网络投递间隔 62s 超 60s timeout → 每段被当 partial 单独显示)
 
 #define SMS_QUEUE_LEN      16
 #define PUSH_QUEUE_LEN     8   // 2026-06-22 保守优化: 16→8, 省 ~8.3KB; pushplus 推送慢, 8 缓冲够
@@ -95,7 +95,7 @@ static const char* TAG_USB = "USBH";
 // UDH 长短信
 #define MAX_UDH_REFS       4
 #define MAX_UDH_PARTS      4   // 2026-06-22 保守优化: 8→4, 省 ~8.4KB; >4 段长短信 silently drop (line 574 守卫)
-#define UDH_TIMEOUT_MS     60000
+#define UDH_TIMEOUT_MS     120000
 
 // =================== 配置 ===================
 struct Config {
