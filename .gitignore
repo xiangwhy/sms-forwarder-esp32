@@ -1,32 +1,22 @@
 # PIO 编译缓存
 .pio/
 .vscode/
+build/
 
-# 旧版本文件
-README_v3.6.md
-README_v3.6.md.bak
-sms_forwarder_v3.6.ino
-sms_forwarder_v3.6.ino.bak
-CODE_REVIEW_v3.6.4.md
-# ESP-IDF 缓存,每次 pio run 重新拉
+# ESP-IDF 缓存
 managed_components/
-# PIO 自动生成
 dependencies.lock
-# v3.6 旧脚本,新版本不需
-setup_components.sh
-# 临时备份
-src/main.cpp.v4.0
 
 # macOS
 .DS_Store
 *.swp
 
-# host test CMake build (tests/host/ 源码在, build 重新生成)
+# host test build
 tests/host/build/
 
-# factory.bin 由 PIO 自动生成, 通过 GitHub Release 分发, 不入 git
+# factory.bin 由 GitHub Release 分发
 *.factory.bin
 firmware.factory.bin
 
-# playwright-cli 临时目录
+# playwright-cli
 .playwright-cli/
