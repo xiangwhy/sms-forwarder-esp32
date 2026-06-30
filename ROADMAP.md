@@ -1,6 +1,6 @@
 # 路线图
 
-v4.0.28 当前代码 HEAD, v4.0.27 当前生产 (2026-06-26 烧, 真机验证通过)。
+v4.0.28 当前生产 (2026-06-30 烧)。
 
 ## v4.1 — 候选 (等翔哥拍)
 
@@ -36,6 +36,6 @@ v4.0.28 当前代码 HEAD, v4.0.27 当前生产 (2026-06-26 烧, 真机验证通
 
 ---
 
-**当前状态**: v4.0.28 HEAD, v4.0.27 生产。host test 326/3 PASS。
+**当前状态**: v4.0.28 生产 (2026-06-30 烧)。host test 326/3 PASS。
 **本地 build**: `pio run` → `.pio/build/esp32-s3-devkitc-1/firmware.bin`
 **GitHub Release**: https://github.com/xiangwhy/sms-forwarder-esp32/releases

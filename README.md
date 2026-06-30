@@ -5,7 +5,7 @@ ESP32-S3 + USB 4G 模组 (ML307) + pushplus 推送的 SMS 转发器。
 [![Release](https://img.shields.io/github/v/release/xiangwhy/sms-forwarder-esp32)](https://github.com/xiangwhy/sms-forwarder-esp32/releases)
 [![Platform](https://img.shields.io/badge/platform-ESP32--S3-blue)]()
 
-**当前生产**: v4.0.28 (代码 HEAD, 待烧)
+**当前生产**: v4.0.28 (2026-06-30 烧)
 
 4G 卡收到 SMS → 自动推送到 pushplus 微信 / 公众号。
 
